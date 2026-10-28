@@ -62,7 +62,8 @@ to the GPU ([#117](https://github.com/Revivedx/SavageWindRecomp/issues/117)).
    extracted game (`exefs/` and `romfs/`, version 1.9.0, see below) and choose **Set up game files**. It checks the
    version, copies the files and recompiles the game code on your machine - once (about 6
    minutes for the game code with a 12-thread CPU, plus the copy and the optional shader precompilation). Your own
-   files aren't changed. When it's done the game starts.
+   files aren't changed. When it's done the game starts. For the DLC (from the next release), see
+   [The DLC](#the-dlc).
 3. From then on Savage Wind goes straight into the game. The settings, including the text and voice languages,
    are in the game's Options (pause menu > System > Options, or Options on the title screen).
 4. **Savage Wind Configuration** (`Savage Wind Configuration.exe` on Windows, the AppImage's **Savage Wind
@@ -106,7 +107,9 @@ To back up your progress or move it to another Savage Wind installation, close t
   console:
   - the **ExeFS** of that version (`main`, `main.npdm`, `rtld`, `sdk`, `subsdk0`)
   - the **RomFS** with that update applied (base game and update merged)
-- DLC: not supported yet (planned, see the roadmap); the title screen's Downloadable Content entry is hidden until then.
+- Optional, from the next release (Alpha 4; on the `test` branch now): the DLC, *The Master Trials* and *The
+  Champions' Ballad*, from your own copy: the **RomFS** of each of the two DLC, version 3.0 (see
+  [The DLC](#the-dlc) below).
 - Windows 10 or later or Linux, on x86-64 (a CPU with SSE4.2; without AVX2 / FMA the game code runs in a slower
   compatible mode), and a GPU with Vulkan 1.3.
 
@@ -120,6 +123,29 @@ extracted/
 
 The `main` module's build id tells the exact version; `python tools/sw_probe.py` (it reads `extracted/exefs`)
 prints it and what the recompiler will find there.
+
+### The DLC
+
+Keep each DLC's RomFS in a folder of its own, next to the game's files or anywhere else:
+
+```
+my-game-files/
+  exefs/
+  romfs/
+  dlc1/   the first DLC's RomFS (about 7,000 files, 1.4 GB)
+  dlc2/   the second DLC's RomFS (only System/AocVersion.txt)
+```
+
+- **With the game:** choose `my-game-files` at the first setup, and the DLC is set up together with the game.
+- **Later:** in Savage Wind Configuration's game files page, choose the folder with the DLC folders and set up. The
+  DLC is added to the game files already set up, without building the game code again.
+
+The setup tells the game's RomFS (it has `System/Version.txt`) from a DLC's (`System/AocVersion.txt`), so the folder
+names don't matter. It copies them as `aoc1/` and `aoc2/` into the data folder. The game files page shows the DLC set
+up (for example "1 + 2 (3.0)") and removes it; your saves stay.
+
+Set up both DLC: the first holds the data of both, the second only its version, and the game uses the DLC only when
+it finds both. Then the title screen shows Master Mode and "DLC Ver.3.0".
 
 ## Status
 
@@ -156,6 +182,7 @@ Estimates of where each part stands. "Tested in game" is how much of the game ha
 | 🔧 | **Button icons for your device** | ![80%](https://progress-bar.xyz/80/?width=150&style=square&progress_color=5cb85c) | The game's button prompts show your bound keys and mouse buttons, or Xbox / PlayStation / Nintendo buttons, switching with the device you use |
 | ✅ | **Variable refresh rate (VRR)** | ![100%](https://progress-bar.xyz/100/?width=150&style=square&progress_color=5cb85c) | Video > VSync: On lets G-SYNC and FreeSync displays show every frame as soon as it's ready, a little under the refresh rate; Fast (the default), Adaptive and Off too. Tried on a VRR display |
 | 🔧 | **Tested in game** | ![50%](https://progress-bar.xyz/50/?width=150&style=square&progress_color=f0ad4e) | The Shrine of Resurrection, the Great Plateau, and a walk through every region on a 100% save file. The main quests and the Divine Beasts aren't tested yet, so expect bugs there: [report what breaks](https://github.com/Revivedx/SavageWindRecomp/issues/new/choose) |
+| 🔧 | **DLC** | ![80%](https://progress-bar.xyz/80/?width=150&style=square&progress_color=5cb85c) | *The Master Trials* and *The Champions' Ballad* from your own copy, set up with the game files or later ([The DLC](#the-dlc)), from the next release: Master Mode, the Trial of the Sword and the Travel Medallion work on a 100% save. The Champions' Ballad isn't played through yet |
 | 🔧 | **Linux** | ![90%](https://progress-bar.xyz/90/?width=150&style=square&progress_color=5cb85c) | Builds and runs on x86-64 (from LAS Recomp); a steady 144 fps on an RTX 3070 Ti with a Ryzen 5 7600X, and no Linux-only issues so far |
 | 🔧 | **AMD FSR 3 + frame generation** | ![60%](https://progress-bar.xyz/60/?width=150&style=square&progress_color=f0ad4e) | Video > Frame generation (AMD FSR 3): a frame made between each two the game draws, about twice the frames on screen, with the HUD kept sharp. Motion vectors from depth and the camera, and Link's own; enemies and animals can still leave a faint smear. Smooth with VSync and G-SYNC. Works on Windows; Linux and the Steam Deck aren't tried yet. Only frame generation for now: FSR 3 upscaling is next |
 | 🗺️ | **NVIDIA DLSS (RTX)** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned, after FSR 3; under NVIDIA's own SDK license |
@@ -169,7 +196,7 @@ Estimates of where each part stands. "Tested in game" is how much of the game ha
 | 🗺️ | **Mods** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned |
 | 🗺️ | **Accessibility and assists** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned: text size, colour-blind filters and toggles in place of held buttons; enemy and Link health, damage dealt and taken, weapon durability and stamina use on screen; optional assists: infinite stamina, health or weapon durability, arrows and rupees, no damage at all, no fall damage, health that refills over time, nearby enemies defeated at once, and multipliers for weapon durability, stamina use, damage dealt and taken, and walking, running, climbing, swimming and gliding speed |
 | 🗺️ | **Teleport with bookmarks** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned: save places and travel back to them |
-| 🗺️ | **DLC** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Later |
+| 🗺️ | **Achievements** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned: achievements from your save's progress, from start to finish ([#236](https://github.com/Revivedx/SavageWindRecomp/pull/236)) |
 | 🗺️ | **amiibo rewards without figures** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned |
 
 ✅ done · 🔧 in progress · 🗺️ roadmap
@@ -187,7 +214,7 @@ Steam Deck) also aims and tilts by motion. Keyboard and mouse defaults:
 | Interact / confirm (A) | E | Attack (Y) | Left click |
 | Shield / lock on (ZL) | Right click | Bow (ZR) | F |
 | Rune (L) | Q | Throw (R) | R |
-| Look (right stick press) | Middle click | D-pad | Arrow keys |
+| Look (right stick press) | Middle click | Weapons / shields / runes / whistle (d-pad) | 1 / 2 / 3 / 4 |
 | Inventory (Plus) | Tab | Map (Minus) | M |
 | Tilt the controller (hold, motion puzzles) | T + mouse | | |
 
