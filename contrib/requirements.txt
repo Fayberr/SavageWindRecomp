@@ -1,0 +1,4 @@
+# Match the versions pinned by upstream's generator helper.
+capstone==5.0.9
+unicorn==2.1.4
+lz4==4.4.5
