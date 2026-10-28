@@ -375,7 +375,21 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     else if (format_supports(vf, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     VkImageCreateFlags flags = 0;
     if (!depthfmt) flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // format views (NVN texture views, raw sRGB views)
-    if (type == VK_IMAGE_TYPE_2D && layers >= 6 && tw == th && samples == 1) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    // Square 2D arrays of 6 layers or more are made cube compatible (cube views of them can come). On AMD's own driver
+    // only cubemaps, cube arrays and arrays of whole cubes (6n layers) are: BOTW's terrain material arrays (512x512 and
+    // 1024x1024 BC1, 83 layers, all levels) were cube compatible too, and on AMD's Windows driver (an RX 580, a 7800 XT)
+    // rocks, cliffs, ground and grass, all of which sample those arrays, got rainbow blocks that came and went with the
+    // mip level sampled, and nowhere else (#59). The cube flag changes how AMD lays such an image out; NVIDIA and RADV
+    // draw it right, and keep the rule they had. SAVAGEWIND_CUBE_ALL=1: every square array of 6+ layers, on any driver;
+    // SAVAGEWIND_CUBE_STRICT=1: only 6n layers and cube targets, on any driver (testing).
+    static int cube_strict = -1;
+    if (cube_strict < 0) {
+        cube_strict = getenv("SAVAGEWIND_CUBE_ALL") ? 0 : getenv("SAVAGEWIND_CUBE_STRICT") ? 1 : g_vk.amd_proprietary;
+        LOG("[vk] cube-compatible arrays: %s\n", cube_strict ? "cube targets and 6n layers only" : "every square array of 6+ layers");
+    }
+    if (type == VK_IMAGE_TYPE_2D && layers >= 6 && tw == th && samples == 1 &&
+        (!cube_strict || t->target == 8 || t->target == 9 || layers % 6 == 0))
+        flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     b->slices_renderable = type == VK_IMAGE_TYPE_3D && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     if (b->slices_renderable) flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;  // (Vulkan 1.1) 2D views of slices
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = type, .format = vf,
@@ -401,6 +415,7 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL));
         depthfmt = false;
     }
+    b->cube_ok = (ci.flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) != 0;
     static uint64_t serials;
     b->serial = __atomic_add_fetch(&serials, 1, __ATOMIC_RELAXED);
     b->format = vf;
@@ -847,6 +862,32 @@ static void upload_scaled(VkCommandBuffer cb, TexBackend *b, VkSpan s, VkBufferI
     vk_defer_image(img, mem);
 }
 
+// (debugging) SAVAGEWIND_DEBUG_MIP_COLOURS=1: every level of a mipmapped texture the CPU fills is one solid colour, by
+// level (0 red, 1 green, 2 blue, 3 yellow, 4 magenta, 5 cyan, 6 white, 7 and smaller grey), so a screenshot shows which
+// level each surface samples. BC1-BC5 and 4-byte formats (RGBA8 and the like); others stay as they are.
+static void debug_mip_colour(uint8_t *p, uint32_t nvn_fmt, uint32_t bpb, uint64_t nblocks, uint32_t lv) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_DEBUG_MIP_COLOURS") != NULL;
+    if (!on) return;
+    static const uint8_t rgb[8][3] = {{255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 0}, {255, 0, 255}, {0, 255, 255},
+                                      {255, 255, 255}, {128, 128, 128}};
+    const uint8_t *c = rgb[lv < 7 ? lv : 7];
+    uint16_t c565 = (uint16_t)((c[0] >> 3) << 11 | (c[1] >> 2) << 5 | (c[2] >> 3));
+    uint8_t blk[16] = {0}, bc1[8] = {(uint8_t)c565, (uint8_t)(c565 >> 8), (uint8_t)c565, (uint8_t)(c565 >> 8), 0, 0, 0, 0};
+    VkFormat vf = fmt_of(nvn_fmt).vf;
+    switch (vf) {
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: memcpy(blk, bc1, 8); break;
+    case VK_FORMAT_BC2_UNORM_BLOCK: case VK_FORMAT_BC2_SRGB_BLOCK: memset(blk, 0xFF, 8); memcpy(blk + 8, bc1, 8); break;
+    case VK_FORMAT_BC3_UNORM_BLOCK: case VK_FORMAT_BC3_SRGB_BLOCK: blk[0] = blk[1] = 255; memcpy(blk + 8, bc1, 8); break;
+    case VK_FORMAT_BC4_UNORM_BLOCK: blk[0] = blk[1] = c[0]; break;
+    case VK_FORMAT_BC5_UNORM_BLOCK: blk[0] = blk[1] = c[0]; blk[8] = blk[9] = c[1]; break;
+    default:
+        if (bpb != 4 || is_bc_or_astc(vf)) return;
+        blk[0] = c[0]; blk[1] = c[1]; blk[2] = c[2]; blk[3] = 255;
+    }
+    for (uint64_t i = 0; i < nblocks; i++) memcpy(p + i * bpb, blk, bpb);
+}
+
 // Guest memory -> image for the levels in level_mask (bit per level), every layer or slice.
 static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
     const FormatInfo *fi = t->layout.fmt;
@@ -910,6 +951,7 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
                         l.block_height_log2, l.block_depth_log2, path);
                 }
             }
+            if (t->layout.levels > 1) debug_mip_colour(lin, t->format, fi->bpb, (uint64_t)l.wb * l.hb * l.d, lv);
             if (expand) {  // RGB8 -> RGBA8
                 uint8_t *o = s.ptr;
                 uint64_t n = (uint64_t)l.wb * l.hb * l.d;
@@ -1271,11 +1313,12 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
         return vk_image_view(b, want, fmt, lv0, nlv, ly0, 1, sw, aspect);
     if (want == VK_IMAGE_VIEW_TYPE_2D_ARRAY && (have == VK_IMAGE_VIEW_TYPE_2D || have == VK_IMAGE_VIEW_TYPE_CUBE))
         return vk_image_view(b, want, fmt, lv0, nlv, ly0, have == VK_IMAGE_VIEW_TYPE_CUBE ? nly : 1, sw, aspect);
-    if (want == VK_IMAGE_VIEW_TYPE_CUBE && have == VK_IMAGE_VIEW_TYPE_2D_ARRAY && b->layers >= 6 && b->width == b->height)
+    if (want == VK_IMAGE_VIEW_TYPE_CUBE && have == VK_IMAGE_VIEW_TYPE_2D_ARRAY && b->layers >= 6 && b->width == b->height &&
+        b->cube_ok)
         return vk_image_view(b, want, fmt, lv0, nlv, ly0 + 6 <= b->layers ? ly0 : 0, 6, sw, aspect);
     // a cube read as a cube array of one (BOTW's 64x64 R11G11B10 light probes): it was black
     if (want == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY && (have == VK_IMAGE_VIEW_TYPE_CUBE || have == VK_IMAGE_VIEW_TYPE_2D_ARRAY) &&
-        b->layers >= 6 && b->width == b->height)
+        b->layers >= 6 && b->width == b->height && b->cube_ok)
         return vk_image_view(b, want, fmt, lv0, nlv, 0, b->layers / 6 * 6, sw, aspect);
     if (want == VK_IMAGE_VIEW_TYPE_1D_ARRAY && have == VK_IMAGE_VIEW_TYPE_1D)
         return vk_image_view(b, want, fmt, lv0, nlv, 0, 1, sw, aspect);
