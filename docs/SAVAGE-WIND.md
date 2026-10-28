@@ -1508,9 +1508,13 @@ memory are 64-byte aligned (they were 4: clang's aligned SSE stores faulted).
   range; the pixels inside both (him, and a strip of ground at his feet) take the motion of his centre on screen
   between the two frames. His limbs and what he holds are still the optical flow's. `SAVAGEWIND_FG_MV_DEBUG=1` paints
   the box (red) and the pixels taken as him (yellow) into the motion vectors (dump them with
-  `SAVAGEWIND_FG_INPUTS_AT=<n>`); `SAVAGEWIND_FG_NO_LINK=1` leaves him out. Other moving things (enemies, horses,
-  animals) would need per-object vectors: each draw's previous transform, which the translated vertex shaders could
-  output from the previous frame's constant buffers kept per draw. Not done.
+  `SAVAGEWIND_FG_INPUTS_AT=<n>`); `SAVAGEWIND_FG_NO_LINK=1` leaves him out. That is the fallback now: with frame generation on, the per-object
+  motion vectors (`mvec.c`, from PR #194: every scene draw matched with the previous frame's and run again on its
+  inputs, jitter taken out) are made too, and frame generation takes them when they are this frame's and at the
+  depth's size (their .xy are clip-space NDC differences: FSR's motion vector scale (-w / 2, h / 2), as for the FSR 3
+  upscaler). Link running, enemies and animals then interpolate without the double image; it costs ~5% of the
+  presented frames (no limit, 2560x1440, RTX 3060: 145 presented against 153 with the camera's vectors).
+  `SAVAGEWIND_FG_CAMERA_VECTORS=1`: the camera's and Link's box only (A/B).
 - The HUD-less image: BOTW composites the scene into a linear 10-bit image of the final size (A2B10G10R10), draws the
   HUD into that, then copies it sRGB-encoded into the 8-bit image it presents. The composite's target is copied right
   after the composite (`scene_composite`, the draw `scene_post` also uses), before the next draw, the HUD's first,
