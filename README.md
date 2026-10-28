@@ -143,8 +143,15 @@ The setup tells the game's RomFS (it has `System/Version.txt`) from a DLC's (`Sy
 names don't matter. It copies them as `aoc1/` and `aoc2/` into the data folder. The game files page shows the DLC set
 up (for example "1 + 2 (3.0)") and removes it; your saves stay.
 
-Set up both DLC: the first holds the data of both, the second only its version, and the game uses the DLC only when
-it finds both. Then the title screen shows Master Mode and "DLC Ver.3.0".
+The DLC are optional: the whole game plays without them. What you get depends on what you set up:
+
+| Set up | What you get |
+|---|---|
+| No DLC | The whole game, as on a console without the DLC |
+| Only the first or only the second DLC | The whole game, without DLC content: the game uses the DLC only when it finds both |
+| Both DLC | The whole game plus Master Mode, the Trial of the Sword, the Travel Medallion and The Champions' Ballad; the title screen shows "DLC Ver.3.0" |
+
+Both are needed for the DLC content because the first holds the data of both and the second only its version.
 
 ## Status
 
