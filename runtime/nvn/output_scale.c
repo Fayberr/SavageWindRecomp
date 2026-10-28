@@ -70,11 +70,11 @@ void output_scale(double dw, double dh, bool reshape_allowed, OutScale *o) {
     if (forced < 0) forced = getenv("SAVAGEWIND_SCALE") ? atof(getenv("SAVAGEWIND_SCALE")) : 0;
     if (wide_test < 0) wide_test = getenv("SAVAGEWIND_WIDE_TEST") ? atof(getenv("SAVAGEWIND_WIDE_TEST")) : 0;
     double shape = wide_test > 0 ? wide_test : (dw / dh) / (16.0 / 9.0);
-    // Wider windows only (a narrower one, 16:10 or 4:3, keeps the 16:9 picture with bars above and below: the HUD's
-    // texture generation doesn't follow a taller view). The start screen and its menus, a 16:9 layout over 16:9
-    // pictures with no world to show more of, keep it too, and so does the loading screen (#98: widened, its tip went
-    // to the window's edges and its logo stayed in the 16:9 middle).
-    bool reshape = reshape_allowed && shape > 1.005 && !framepace_title_ui() && !framepace_loading_ui();
+    // A wider window (21:9, 32:9) sees more to the sides, a taller one (16:10, 4:3: shape < 1) more above and below
+    // (#125); the HUD keeps its 16:9 layout in the middle either way. The start screen and its menus, a 16:9 layout
+    // over 16:9 pictures with no world to show more of, keep the 16:9 picture with bars, and so does the loading screen
+    // (#98: widened, its tip went to the window's edges and its logo stayed in the 16:9 middle).
+    bool reshape = reshape_allowed && fabs(shape - 1.0) > 0.005 && !framepace_title_ui() && !framepace_loading_ui();
     if (!reshape) shape = 1.0;
     // render height in units of the Switch's 1080 lines: the window's (Metal: divided by the upscaler's factor)
 #ifdef __APPLE__
@@ -107,8 +107,13 @@ void output_scale(double dw, double dh, bool reshape_allowed, OutScale *o) {
     // while one is up the picture's 16:9 middle is shown, with bars, exactly as on a 16:9 screen (the views stay
     // widened, so nothing is made again; vulkan/exec.c hud_patch stretches their full-width backgrounds to match).
     if (reshape && wide_test <= 0 && framepace_menu_ui()) {
-        o->crop[0] = (1 - 1 / shape) / 2, o->crop[2] = 1 / shape, o->vw = dw / shape;
-        o->vx = (dw - o->vw) / 2;
+        if (shape > 1) {
+            o->crop[0] = (1 - 1 / shape) / 2, o->crop[2] = 1 / shape, o->vw = dw / shape;
+            o->vx = (dw - o->vw) / 2;
+        } else {  // (a taller window: the 16:9 band in the middle, bars above and below)
+            o->crop[1] = (1 - shape) / 2, o->crop[3] = shape, o->vh = dh * shape;
+            o->vy = (dh - o->vh) / 2;
+        }
     }
     g_view_shape = (float)o->shape;
     // Video > Field of view: in play only (cutscenes and talks keep the game's framing), eased over about 1/4 s so
@@ -135,7 +140,8 @@ float output_view_shape(void) { return g_view_shape; }
 // The game's perspective views, as each one's matrix is built (tools/patches.py _persp_matrix: sead's
 // PerspectiveProjection; tan_fovy = tan(fovy / 2) at +0xac, aspect at +0xb0, as float bits; near at +0x98). Every 16:9
 // view is widened to the window's shape, as every 16:9 render target is (vulkan/textures.c): a wider window sees more
-// to the sides, the vertical view kept. The HUD's and menus' layers are 16:9 views too, so they keep their shape in
+// to the sides, the vertical view kept; a taller one (16:10, 4:3) more above and below, the horizontal view kept
+// (tan(fovy / 2) / shape, #125). The HUD's and menus' layers are 16:9 views too, so they keep their shape in
 // the middle. The field of view scales the world's
 // camera only: its far plane is 25000 (its near plane moves with the camera's distance), the HUD's layers', the
 // menus' 3D models' and the start screen's are 10000. SAVAGEWIND_LOG_PROJ=1: each kind of view the first time.
@@ -209,6 +215,7 @@ void rt_persp(uint64_t proj, uint32_t *tan_fovy, uint32_t *aspect) {
     float fov = g_fov, shape = g_view_shape;
     if (fov != 1 && nf[1] > 10001) t = tanf(fminf(atanf(t) * fov, 1.4f));  // (under 160 degrees)
     a *= shape;
+    if (shape < 1) t /= shape;  // (a taller window: the horizontal view kept, more above and below)
     memcpy(tan_fovy, &t, 4), memcpy(aspect, &a, 4);
     if (world) output_world_proj_set(t, a, nf[0], nf[1]);
     if (world && wide_fix && (*tan_fovy != set_t || *aspect != set_a)) {  // (the world's camera: written back)
@@ -238,21 +245,26 @@ void rt_frustum(uint64_t proj, float *f) {
     f[0] = lr[0], f[1] = lr[1], f[2] = tb[0], f[3] = tb[1];
     float w = lr[1] - lr[0], h = tb[0] - tb[1], shape = g_view_shape;
     if (shape == 1 || h == 0 || fabsf(fabsf(w / h) - 16.0f / 9.0f) >= 0.01f) return;
-    float c = (lr[0] + lr[1]) / 2;
-    f[0] = c + (lr[0] - c) * shape, f[1] = c + (lr[1] - c) * shape;
+    if (shape > 1) {
+        float c = (lr[0] + lr[1]) / 2;
+        f[0] = c + (lr[0] - c) * shape, f[1] = c + (lr[1] - c) * shape;
+    } else {  // (a taller window: top and bottom moved out)
+        float c = (tb[0] + tb[1]) / 2;
+        f[2] = c + (tb[0] - c) / shape, f[3] = c + (tb[1] - c) / shape;
+    }
 }
 
 // A perspective view's offset (x, y: fractions of its width and height, as float bits; tools/patches.py
-// _persp_matrix_offset), for a view rt_persp widens: the same distance in its 16:9 part (x / shape), so what the game
-// moves to a side lines up with the 16:9 layout around it.
+// _persp_matrix_offset), for a view rt_persp widens: the same distance in its 16:9 part (x / shape; on a taller window
+// y x shape), so what the game moves to a side lines up with the 16:9 layout around it.
 void rt_persp_offset(uint64_t proj, uint32_t *x, uint32_t *y) {
-    (void)y;
-    float a, ox, shape = g_view_shape;
+    float a, o, shape = g_view_shape;
     memcpy(&a, (const void *)(uintptr_t)(proj + 0xb0), 4);
     if (shape == 1 || fabsf(a - 16.0f / 9.0f) >= 0.01f) return;
-    memcpy(&ox, x, 4);
-    ox /= shape;
-    memcpy(x, &ox, 4);
+    uint32_t *v = shape > 1 ? x : y;  // (a taller window: the vertical one, a fraction of the taller height)
+    memcpy(&o, v, 4);
+    o = shape > 1 ? o / shape : o * shape;
+    memcpy(v, &o, 4);
 }
 
 void output_scale_screen(double sw, double sh, int iw, int ih, OutScale *o) {

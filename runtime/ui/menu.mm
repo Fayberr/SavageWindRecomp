@@ -608,8 +608,8 @@ static void tab_display(void) {
         }
         char desc[600];
         snprintf(desc, sizeof desc, tr("The size of the game's window, or of the screen in fullscreen. Only the sizes your "
-                                       "display can show: its own first, then grouped by shape. A shape wider than 16:9 "
-                                       "is filled with Fill wide screens on; any other keeps 16:9 with bars.\n\nYour display: %d x %d."), desk.w, desk.h);
+                                       "display can show: its own first, then grouped by shape. Any shape other than 16:9 "
+                                       "is filled with Fill wide screens on; off, it keeps 16:9 with bars.\n\nYour display: %d x %d."), desk.w, desk.h);
         bool picked;
         if (opt_list("Window size", &cur, names, n, def, desc, &picked)) {  // (past either end: the other one)
             g_settings.window_w = list[cur].w, g_settings.window_h = list[cur].h;
@@ -620,9 +620,10 @@ static void tab_display(void) {
     {   // Fill wide screens (runtime/nvn/output_scale.c rt_persp)
         bool wv = g_settings.wide_view;
         if (opt_toggle("Fill wide screens", &wv, true,
-                       "On a window or screen wider than 16:9 (21:9, 32:9) the game shows more to the sides instead "
-                       "of black bars. The HUD stays 16:9 in the middle; the pause menu, the map and the start "
-                       "screen are shown 16:9."))
+                       "On a window or screen that isn't 16:9 the game shows more of the world instead of black bars: "
+                       "to the sides when it's wider (21:9, 32:9), above and below when it's taller (16:10, 4:3). "
+                       "The HUD stays 16:9 in the middle; the pause menu, the map and the start screen are shown "
+                       "16:9."))
             g_settings.wide_view = wv;
     }
     {   // Field of view (runtime/nvn/output_scale.c rt_persp)

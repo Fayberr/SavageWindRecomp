@@ -2225,6 +2225,14 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         for (int i = 0; i < 32; i++)
             if (c->out_attr_mask & (1u << i)) sp(&s, "  v%d = vec4(0, 0, 0, 1);\n", i);
         if (info->writes_point_size) sp(&s, "  gl_PointSize = 0.0f;\n");
+        // A point list whose shader writes no size: NVN's 1.0. Without maintenance5 (AMD's and Intel's Windows drivers
+        // in 0.3.1, every GPU in Alpha 2) Vulkan leaves that size undefined, and the validation layer flags it: BOTW
+        // draws 64 such points into an 8x8 RGBA32F linear target the CPU reads back. NVIDIA draws 1.0 anyway; what
+        // AMD's driver draws is unknown (#59). SAVAGEWIND_DEBUG_POINT_SIZE=<px>: that size instead (testing).
+        else if (key && key->point_size) {
+            const char *e = getenv("SAVAGEWIND_DEBUG_POINT_SIZE");
+            sp(&s, "  gl_PointSize = %.1ff;\n", e && atof(e) > 0 ? atof(e) : 1.0);
+        }
     }
     for (int i = 0; i < 256; i++)
         if (c->reg_used[i]) sp(&s, "  uint r%d = 0u;\n", i);
@@ -2319,7 +2327,7 @@ const char *maxwell_translator_id(void) { return TRANSLATOR_ID; }
 // Whether a translation depends on more than the binary and the key (debugging switches): not to be cached.
 bool maxwell_translation_uncacheable(void) {
     return maxwell_dbg_code || maxwell_dbg_vs || getenv("SAVAGEWIND_SAVE_MSL") || getenv("SAVAGEWIND_NO_DISCARD") ||
-           getenv("SAVAGEWIND_XLATE_NO_STRUCTURE");
+           getenv("SAVAGEWIND_XLATE_NO_STRUCTURE") || getenv("SAVAGEWIND_DEBUG_POINT_SIZE");
 }
 
 // ---- structured control flow (GLSL). Shaders whose branches nest become if / else and do / while in address order

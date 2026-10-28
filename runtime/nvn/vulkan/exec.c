@@ -732,6 +732,7 @@ static struct {
     bool prim_restart;
     uint32_t restart_index;
     bool depth_clamp;
+    bool rasterizer_discard;  // nvnCommandBufferSetRasterizerDiscard: draw() skips draws (no transform feedback here)
     uint64_t copy_row_stride, copy_image_stride;
 } st;
 
@@ -1157,6 +1158,166 @@ static void feedback_layout_move(VkCommandBuffer cb, TexBackend *b, bool to_loop
     b->in_feedback_layout = to_loop;
 }
 
+// Whether a view of format f may be sampled with depth comparison (a shadow sampler): its format features in Vulkan
+// 1.3 (VkFormatProperties3) carry SAMPLED_IMAGE_DEPTH_COMPARISON. Depth formats do; colour formats may not (an RTX
+// 3060 gives it to neither R16_UNORM nor R32_SFLOAT, nor does AMD). SAVAGEWIND_DEPTH_TWIN_ALL=1: taken as missing for
+// every colour format (test).
+static bool format_depth_compare(VkFormat f) {
+    static VkFormat known[16];
+    static int8_t ok[16];
+    static int n;
+    for (int i = 0; i < n; i++)
+        if (known[i] == f) return ok[i];
+    VkFormatProperties3 p3 = {.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+    VkFormatProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, .pNext = &p3};
+    vkGetPhysicalDeviceFormatProperties2(g_vk.phys, f, &p2);
+    bool r = (p3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT) != 0;
+    if (getenv("SAVAGEWIND_DEPTH_TWIN_ALL")) r = false;
+    if (n < 16) known[n] = f, ok[n++] = r;
+    LOG("[shadow] format %d under a shadow sampler: depth comparison %s\n", f, r ? "supported" : "not supported");
+    return r;
+}
+
+// Colour images sampled with depth comparison (a shadow sampler). BOTW does that with the sun cascades' half-size R16
+// copy (water, terrain and the other forward-shaded surfaces, at Shadow resolution Console) and with a 4x4 R32_SFLOAT
+// array some compute passes get in their shadow slot. Where the format lacks the feature (above) that is undefined
+// (VUID-vkCmd{Draw,DrawIndexed,Dispatch}-None-06479) and may read as wrong shadows (#59, AMD). Such an image gets a
+// depth twin of the same size and values (R16_UNORM -> D16_UNORM, R32_SFLOAT -> D32_SFLOAT: the same bits), copied
+// through a buffer outside any render pass, and its shadow readers sample the twin:
+// - the shadow copy: after every pass that draws into it (depth_twin_after_pass, from vk_end_pass);
+// - in a compute pass: right before the dispatch, which is outside any render pass (depth_twin_sample).
+// A draw reads the twin as the last such pass left it. SAVAGEWIND_NO_DEPTH_TWIN=1: off (the colour image, as before).
+typedef struct {
+    uint64_t serial;  // (the source image: TexBackend.serial)
+    VkImage img;
+    VmaAllocation mem;
+    VkImageView view[2];  // 2D, 2D array
+    uint32_t w, h, layers;
+    VkFormat fmt;
+} DepthTwin;
+static DepthTwin depth_twins[8];
+static unsigned depth_twin_next;
+
+static bool depth_twin_off(void) {
+    static int off = -1;
+    if (off < 0) off = getenv("SAVAGEWIND_NO_DEPTH_TWIN") != NULL;
+    return off;
+}
+
+static VkFormat depth_twin_format(const TexBackend *b) {
+    if (!b || !b->image || (b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || b->samples > 1 || b->depth > 1) return VK_FORMAT_UNDEFINED;
+    VkFormat df = b->format == VK_FORMAT_R32_SFLOAT ? VK_FORMAT_D32_SFLOAT
+                : b->format == VK_FORMAT_R16_UNORM  ? VK_FORMAT_D16_UNORM : VK_FORMAT_UNDEFINED;
+    return df && !format_depth_compare(b->format) ? df : VK_FORMAT_UNDEFINED;
+}
+
+static DepthTwin *depth_twin_find(const TexBackend *b) {
+    uint32_t layers = b->layers ? b->layers : 1;
+    for (int i = 0; i < 8; i++) {
+        DepthTwin *t = &depth_twins[i];
+        if (t->img && t->serial == b->serial && t->w == b->width && t->h == b->height && t->layers == layers) return t;
+    }
+    return NULL;
+}
+
+// b's twin (made the first time) with b's current contents copied into it; cb is outside any render pass
+static DepthTwin *depth_twin_update(VkCommandBuffer cb, TexBackend *b) {
+    VkFormat df = depth_twin_format(b);
+    if (depth_twin_off() || !df) return NULL;
+    uint32_t bpp = df == VK_FORMAT_D32_SFLOAT ? 4 : 2, layers = b->layers ? b->layers : 1;
+    uint64_t bytes = (uint64_t)b->width * b->height * layers * bpp;
+    if (bytes > (64u << 20)) return NULL;
+    // one staging buffer for every copy, grow-only (one it replaces may still be in use by the pending submission: it
+    // stays allocated, a few times at most)
+    static VkBuffer buf;
+    static VmaAllocation bmem;
+    static uint64_t cap;
+    if (bytes > cap) {
+        uint64_t want = cap ? cap * 2 : 1u << 16;
+        while (want < bytes) want *= 2;
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = want,
+                                 .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo bai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VkBuffer nb;
+        VmaAllocation nm;
+        if (vmaCreateBuffer(g_vk.vma, &bi, &bai, &nb, &nm, NULL) != VK_SUCCESS) return NULL;
+        buf = nb, bmem = nm, cap = want;
+    }
+    DepthTwin *t = depth_twin_find(b);
+    if (!t) {
+        t = &depth_twins[depth_twin_next++ & 7];
+        if (t->img) {
+            for (int k = 0; k < 2; k++)
+                if (t->view[k]) vk_defer_view(t->view[k]);
+            vk_defer_image(t->img, t->mem);
+        }
+        *t = (DepthTwin){.serial = b->serial, .w = b->width, .h = b->height, .layers = layers, .fmt = df};
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = df,
+                                .extent = {b->width, b->height, 1}, .mipLevels = 1, .arrayLayers = layers,
+                                .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateImage(g_vk.vma, &ci, &ai, &t->img, &t->mem, NULL) != VK_SUCCESS) {
+            *t = (DepthTwin){0};
+            return NULL;
+        }
+        for (int k = 0; k < 2; k++) {
+            VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->img,
+                                        .viewType = k ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, .format = df,
+                                        .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, k ? layers : 1}};
+            if (vkCreateImageView(g_vk.dev, &vi, NULL, &t->view[k]) != VK_SUCCESS) t->view[k] = VK_NULL_HANDLE;
+        }
+        static int nlog;
+        if (nlog++ < 8)
+            LOG("[shadow] a %ux%ux%u %s image sampled with depth comparison: through a %s copy\n", b->width, b->height,
+                layers, bpp == 4 ? "R32_SFLOAT" : "R16_UNORM", bpp == 4 ? "D32" : "D16");
+    }
+    VkBufferImageCopy r = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers},
+                           .imageExtent = {b->width, b->height, 1}};
+    VkMemoryBarrier2 m0 = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                           .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT};
+    VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = 0,
+                                .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                .image = t->img, .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, layers}};
+    VkDependencyInfo d0 = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &m0,
+                           .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &ib};
+    vkCmdPipelineBarrier2(cb, &d0);  // (the source's writes, and the twin's earlier readers, before the copies)
+    vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &r);
+    VkMemoryBarrier2 m1 = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                           .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                           .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
+    VkDependencyInfo d1 = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &m1};
+    vkCmdPipelineBarrier2(cb, &d1);
+    r.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    vkCmdCopyBufferToImage(cb, buf, t->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    VkMemoryBarrier2 m2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                           .srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo d2 = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &m2};
+    vkCmdPipelineBarrier2(cb, &d2);  // (the twin for its readers; the buffer and the source for later writes)
+    return t;
+}
+
+static TexBackend *pass_twin;  // (the pass in progress draws into the shadow copy: its twin made again after it)
+static void depth_twin_after_pass(VkCommandBuffer cb) {
+    if (pass_twin) depth_twin_update(cb, pass_twin);
+    pass_twin = NULL;
+}
+
+// The view a shadow sampler of the shader's textype reads for colour image b: its depth twin, or VK_NULL_HANDLE (b's
+// own). update: bring the twin up to date first (a compute pass: outside any render pass).
+static VkImageView depth_twin_sample(TexBackend *b, int textype, bool update) {
+    if (depth_twin_off() || (textype != TEXTYPE_2D && textype != TEXTYPE_2D_ARRAY) || !depth_twin_format(b))
+        return VK_NULL_HANDLE;
+    DepthTwin *t = update ? depth_twin_update(vk_cmd(), b) : depth_twin_find(b);
+    return t ? t->view[textype == TEXTYPE_2D_ARRAY ? 1 : 0] : VK_NULL_HANDLE;
+}
+
 static void vk_end_pass_at(int line);
 void vk_end_pass(void) { vk_end_pass_at(0); }
 #define vk_end_pass() vk_end_pass_at(__LINE__)
@@ -1170,6 +1331,7 @@ static void vk_end_pass_at(int line) {
     pass_nfbl = 0;
     for (int i = 0; i < pass_nblock; i++) vk_block_flush(vk_cmd(), pass_block[i]);
     pass_nblock = 0;
+    depth_twin_after_pass(vk_cmd());  // (the shadow copy just drawn: its depth twin)
     for (int i = 0; i < pass_nlinear; i++) readback_schedule(vk_cmd(), pass_linear[i], &pass_linear_view[i], pass_linear_has_view[i]);
     pass_nlinear = 0;
     // (debug frame) what the pass drew: its targets, as begin_pass recorded them (st.rt may name the next pass's)
@@ -1397,7 +1559,7 @@ static VkRect2D scissor_rect(void) {
     int x = st.scissor[0][0], y = st.scissor[0][1], sw = st.scissor[0][2], sh = st.scissor[0][3];
     // The views widened to a wider window (output_scale.c rt_persp): the HUD's layers are 16:9 views too, so their
     // content keeps its shape in the middle of the image, narrower than it. A scissor that doesn't span the final
-    // image (the minimap's mask, menus' lists) moves with them.
+    // image (the minimap's mask, menus' lists) moves with them; on a taller window, vertically.
     extern float output_view_shape(void);
     float shape = output_view_shape();
     if (shape > 1 && pass_out && pass_sx > 0 && sw < 16384) {
@@ -1405,6 +1567,13 @@ static VkRect2D scissor_rect(void) {
         if (x > 0 || x + sw < gw - 0.5) {
             double c = gw / 2, x0 = c + (x - c) / shape, x1 = c + (x + sw - c) / shape;
             x = (int)floor(x0); sw = (int)ceil(x1) - x;
+        }
+    }
+    if (shape < 1 && pass_out && pass_sy > 0 && sh < 16384) {  // (a taller window: the same, vertically)
+        double gh = h / pass_sy;
+        if (y > 0 || y + sh < gh - 0.5) {
+            double c = gh / 2, y0 = c + (y - c) * shape, y1 = c + (y + sh - c) * shape;
+            y = (int)floor(y0); sh = (int)ceil(y1) - y;
         }
     }
     if (vp_sx != 1 || vp_sy != 1 || vp_ox != 0 || vp_oy != 0) {
@@ -2749,6 +2918,7 @@ static struct { uint64_t copy_addr; NvnTexture *src; uint64_t frame; } shadow_sr
 
 static void shadow_copy_note(ShaderInfo *fi) {
     NvnTexture *copy = st.rt.ncolor > 0 ? st.rt.color[0] : NULL;
+    if (vk_is_shadow_copy(copy) && copy->backend && depth_twin_format(copy->backend)) pass_twin = copy->backend;
     if (!vk_shadow_direct() || !vk_is_shadow_copy(copy) || !copy->addr) return;
     for (int i = 0; i < fi->ntex; i++) {
         NvnTexture *t = shader_texture_object(1, &fi->tex[i]);
@@ -3246,6 +3416,8 @@ static bool up_patch_frag(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *
 // - a pane that covers the layer's whole 16:9 width (a fade, a loading screen's black, the menus' blurred picture of
 //   the game - a picture of the wider scene) covered only the middle of the wider picture: it gets the 16:9 matrix,
 //   which stretches it over the whole window. (The start screen is shown 16:9 with bars: output_scale.c.)
+// On a taller window (16:10, 4:3: shape < 1, #125) the same vertically: the layers' matrices get m11 x shape, and a
+// pane over the whole 16:9 height gets the 16:9 matrix.
 // In a copy of the buffer, as rt_persp makes them: m00 / shape on a wider window, m11 x shape on a narrower one.
 // - a pane wholly past the edges (a layout's parts kept off screen: a pane with a texture nothing draws into, at the
 //   inventory's description box) is not drawn (hud_clip, scissor_rect), as it is never seen on the console.
@@ -3255,40 +3427,60 @@ static bool hud_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
     if (off < 0) off = getenv("SAVAGEWIND_NO_HUD_FIX") != NULL;
     extern float output_view_shape(void);
     float shape = output_view_shape();
-    if (off || shape <= 1 || size < 64 || !st.rt.ncolor || !st.rt.color[0]) return false;
+    if (off || shape == 1 || size < 64 || !st.rt.ncolor || !st.rt.color[0]) return false;
     TexBackend *tb = (TexBackend *)st.rt.color[0]->backend;
     if (!tb || tb->rs_group != RS_OUT) return false;
     const float *g = (const float *)(uintptr_t)addr;
+    // A layer whose matrix comes with its view already in it (projection x view, a translation in column 3; the HUD's
+    // clock and some texts): 16:9 (|m11| / m00), it gets its first row / shape (a taller window: its second x shape),
+    // so it stays in the 16:9 layout with the rest of the HUD instead of moving outwards with the wider view.
+    if (g[0] > 0 && g[5] != 0 && g[14] == -1 && !g[1] && !g[2] && !g[4] && !g[6] && !g[8] && !g[9] && !g[12] && !g[13] &&
+        (g[3] || g[7]) && g[15] > 0 && fabsf(fabsf(g[5]) / g[0] - 16.0f / 9.0f) < 0.002f) {
+        static float buf[0x10000 / 4];
+        uint64_t n = size > sizeof buf ? sizeof buf : size;
+        memcpy(buf, g, n);
+        if (shape > 1) buf[0] /= shape, buf[3] /= shape;
+        else buf[5] *= shape, buf[7] *= shape;
+        *out = ubo_span(vk_transient_copy(buf, n, 256), n);
+        return true;
+    }
     if (!(g[0] > 0 && g[5] > 0 && g[14] == -1 && !g[1] && !g[2] && !g[3] && !g[4] && !g[6] && !g[7] && !g[8] && !g[9] &&
           !g[12] && !g[13] && !g[15]))
         return false;
+    bool tall = shape < 1;  // (a taller window: the view widened vertically, m11 x shape)
     float ratio = g[5] / g[0], flat = 16.0f / 9.0f, wide = flat * shape;
-    bool is_flat = fabsf(ratio - flat) < 0.002f, is_wide = fabsf(ratio - wide) < 0.002f * shape;
+    bool is_flat = fabsf(ratio - flat) < 0.002f, is_wide = fabsf(ratio - wide) < 0.002f * fmaxf(shape, 1.0f);
     if (!is_flat && !is_wide) return false;
-    float m00 = is_flat ? g[0] / shape : g[0];  // the widened matrix's
-    // a 40-degree HUD layer's pane over the whole 16:9 width -> the 16:9 matrix
-    if (size >= 34 * 16 && fabsf(g[5] - 2.74748f) < 0.001f) {
+    float m00 = is_flat && !tall ? g[0] / shape : g[0];  // the widened matrix's
+    float m11 = is_flat && tall ? g[5] * shape : g[5];
+    // a 40-degree HUD layer's pane over the whole 16:9 width (a taller window: height) -> the 16:9 matrix
+    float m11_flat = tall ? m11 / shape : m11, edge = tall ? shape : 1 / shape;
+    if (size >= 34 * 16 && fabsf(m11_flat - 2.74748f) < 0.001f) {
         const float *mv = g + 16, *rc = g + 33 * 4;  // (view rows 4-6, rectangle)
         if (rc[0] > 0 && rc[1] > 0) {
-            float lo[1] = {1e9f}, hi[1] = {-1e9f};
+            float lo = 1e9f, hi = -1e9f;
             for (int k = 0; k < 4; k++) {
                 float x = (k & 1) * rc[0] + rc[2], y = rc[3] - (k >> 1) * rc[1];
-                float vx = mv[0] * x + mv[1] * y + mv[3], vz = mv[8] * x + mv[9] * y + mv[11];
+                float vx = mv[0] * x + mv[1] * y + mv[3], vy = mv[4] * x + mv[5] * y + mv[7];
+                float vz = mv[8] * x + mv[9] * y + mv[11];
                 float w = -vz;  // (row 3 of the matrix: 0 0 -1 0)
-                if (w <= 0) { lo[0] = 1e9f; break; }
-                float nx = m00 * vx / w;
-                if (nx < lo[0]) lo[0] = nx;
-                if (nx > hi[0]) hi[0] = nx;
+                if (w <= 0) { lo = 1e9f; break; }
+                float n = tall ? m11 * vy / w : m00 * vx / w;
+                if (n < lo) lo = n;
+                if (n > hi) hi = n;
             }
-            if (lo[0] <= -1 / shape + 0.01f && hi[0] >= 1 / shape - 0.01f) m00 *= shape;
-            if (lo[0] < 1e8f && (hi[0] <= -1 / shape || lo[0] >= 1 / shape)) hud_clip = true;  // (wholly off a 16:9 screen)
+            if (lo <= -edge + 0.01f && hi >= edge - 0.01f) {
+                if (tall) m11 /= shape;
+                else m00 *= shape;
+            }
+            if (lo < 1e8f && (hi <= -edge || lo >= edge)) hud_clip = true;  // (wholly off a 16:9 screen)
         }
     }
-    if (m00 == g[0]) return false;
+    if (m00 == g[0] && m11 == g[5]) return false;
     static float buf[0x10000 / 4];
     uint64_t n = size > sizeof buf ? sizeof buf : size;
     memcpy(buf, g, n);
-    buf[0] = m00;
+    buf[0] = m00, buf[5] = m11;
     *out = ubo_span(vk_transient_copy(buf, n, 256), n);
     return true;
 }
@@ -3713,6 +3905,11 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
             NvnTexture *cascades = st_->shadow ? shadow_copy_source(et) : NULL;  // (the copy's readers: the cascades)
             if (cascades) {
                 VkImageView v = vk_view(cascades, &e->view, e->has_view, false, st_->type);
+                if (v) view = v, layout = VK_IMAGE_LAYOUT_GENERAL;
+            }
+            TexBackend *eb = (TexBackend *)et->backend;
+            if (st_->shadow && !cascades && view && eb && !(e->has_view && (e->view.setmask & 3))) {
+                VkImageView v = depth_twin_sample(eb, st_->type, stage == 5 && !vk_is_shadow_copy(et));  // (its depth twin)
                 if (v) view = v, layout = VK_IMAGE_LAYOUT_GENERAL;
             }
         }
@@ -4539,7 +4736,12 @@ static bool draw_must_happen(void) {
     return false;
 }
 static void draw_(CmdRec *r, bool indexed);
+static uint64_t stat_discarded;
 static void draw(CmdRec *r, bool indexed) {
+    // Rasterizer discard: the primitives stop before rasterization, so nothing reaches the targets, depth, stencil or
+    // occlusion queries. Its only output in NVN is transform feedback, which isn't implemented (cmdbuf.c), so the draw
+    // has nothing left to do (a vertex shader writing storage buffers or images would be the one difference).
+    if (st.rasterizer_discard) { stat_discarded++; return; }
     PROFD_T0();
     draw_(r, indexed);
     PROFD_ADD(prof_draw);
@@ -4578,21 +4780,24 @@ static void draw_(CmdRec *r, bool indexed) {
     if (!st.program) { stat_skipped++; return; }
     static int no_key_gen = -1;
     if (no_key_gen < 0) no_key_gen = getenv("SAVAGEWIND_VK_NO_KEY_GEN") != NULL;
-    static struct { uint64_t gen; uint32_t origin, dmode; NvnProgram *np; Prog *pr; } pm;
+    static struct { uint64_t gen; uint32_t origin, dmode; NvnProgram *np; Prog *pr; bool points; } pm;
     uint32_t origin = nvn_window_origin(), dmode = nvn_depth_mode();
     Prog *pr;
     bool vkey_flip = origin == 0;
-    if (!no_key_gen && pm.pr && pm.gen == key_gen && pm.np == st.program && pm.origin == origin && pm.dmode == dmode) {
+    bool points = r->x[0] == 0;  // (a point list: its vertex shader writes a point size, ShaderKey.point_size)
+    if (!no_key_gen && pm.pr && pm.gen == key_gen && pm.np == st.program && pm.origin == origin && pm.dmode == dmode &&
+        pm.points == points) {
         pr = pm.pr;
     } else {
         ShaderKey vkey = {0}, fkey = {0};
         vkey.glsl = fkey.glsl = 1;
         vkey.flip_y = fkey.flip_y = origin == 0;
         vkey.depth_minus_one = dmode == 0;
+        vkey.point_size = points;
         for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
         for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
         pr = get_program(st.program, &vkey, &fkey);
-        pm.gen = key_gen; pm.np = st.program; pm.origin = origin; pm.dmode = dmode; pm.pr = pr;
+        pm.gen = key_gen; pm.np = st.program; pm.origin = origin; pm.dmode = dmode; pm.pr = pr; pm.points = points;
     }
     if (pr && atomic_load(&pr->state) == 0 && (one_shot_target() || draw_must_happen())) wait_built(&pr->state);
     if (!pr || atomic_load(&pr->state) != 1) {
@@ -6754,6 +6959,16 @@ static void exec_list(uint64_t handle, int depth) {
             static bool logged;
             if (r->x[0] && !logged) { logged = true; LOG("[nvn] SetDepthClamp on (depth clamp %s)\n", g_vk.depth_clamp ? "supported" : "not supported"); }
             st.depth_clamp = r->x[0] != 0 && !off;
+            break;
+        }
+        case CMD_SET_RASTERIZER_DISCARD: {
+            static int seen;  // (the first few changes: when and how often the game uses it)
+            if (seen < 4 && (!seen || (r->x[0] != 0) != st.rasterizer_discard)) {
+                seen++;
+                LOG("[nvn] SetRasterizerDiscard %s (frame %llu, %llu draws discarded so far)\n", r->x[0] ? "on" : "off",
+                    (unsigned long long)renderer_present_count(), (unsigned long long)stat_discarded);
+            }
+            st.rasterizer_discard = r->x[0] != 0;
             break;
         }
         case CMD_SET_POLYGON_OFFSET: memcpy(st.poly_offset, r->f, sizeof st.poly_offset); break;

@@ -215,6 +215,9 @@ static bool radv_gcn(void) {
     return false;
 }
 
+// RADV on an RDNA 4 chip (RX 9060 / 9070): "AMD Radeon RX 9070 XT (RADV GFX1201)"
+static bool radv_gfx12(void) { return strstr(g_vk.props.deviceName, "(RADV GFX12") != NULL; }
+
 static void create_device(void) {
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
@@ -248,6 +251,12 @@ static void create_device(void) {
 #ifdef __linux__
     g_vk.radv = drv.driverID == VK_DRIVER_ID_MESA_RADV;
 #endif
+    {   // (for bug reports: the driver's version, and whether ASTC textures reach the GPU as they are or decoded)
+        VkFormatProperties ap;
+        vkGetPhysicalDeviceFormatProperties(g_vk.phys, VK_FORMAT_ASTC_4x4_UNORM_BLOCK, &ap);
+        LOG("[vk] driver: %s %s (id %d), ASTC %s\n", drv.driverName, drv.driverInfo, (int)drv.driverID,
+            ap.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT ? "sampled by the GPU" : "decoded on the CPU");
+    }
     // SAVAGEWIND_VK_LEGACY=1: Alpha 2's setup, none of maintenance5, graphics pipeline libraries and attachment
     // feedback loops (SAVAGEWIND_VK_M5=1 / _GPL=1 / _FEEDBACK_LOOP=1 turn one back on). The 0.3.1 hotfix made it the
     // default on AMD's and Intel's Windows drivers, for a black window from Alpha 3 on (#85); that was their shader
@@ -290,8 +299,11 @@ static void create_device(void) {
     bool uil = false;
 #endif
     // Pipelines linked from shaders compiled apart from the fixed state (exec.c, graphics pipeline libraries), when
-    // the driver links them fast. SAVAGEWIND_VK_NO_GPL=1: whole pipelines, as before.
-    bool gpl = !getenv("SAVAGEWIND_VK_NO_GPL") && !(win_legacy && !getenv("SAVAGEWIND_VK_GPL")) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+    // the driver links them fast. SAVAGEWIND_VK_NO_GPL=1: whole pipelines, as before. RADV on RDNA 4 (Mesa 26.0, an
+    // RX 9070 XT) hung the GPU ~46 s in, at the title screen, with them and ran without (#228); SAVAGEWIND_VK_GPL=1
+    // turns them on there anyway.
+    bool gpl_off = (win_legacy || radv_gfx12()) && !getenv("SAVAGEWIND_VK_GPL");
+    bool gpl = !getenv("SAVAGEWIND_VK_NO_GPL") && !gpl_off && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
                has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
     // when each frame reached the display (SAVAGEWIND_LOG_PRESENT, tests: "present timing" below)
     bool pwait = getenv("SAVAGEWIND_LOG_PRESENT") && has_ext(ep, ne, VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
@@ -420,6 +432,8 @@ static void create_device(void) {
     b->samplerAnisotropy = h->samplerAnisotropy;
     g_vk.feat_aniso = h->samplerAnisotropy;
     b->textureCompressionBC = h->textureCompressionBC;
+    // (textures.c samples ASTC images as they are wherever the driver lists the formats: the feature has to be on)
+    b->textureCompressionASTC_LDR = h->textureCompressionASTC_LDR;
     b->shaderInt64 = h->shaderInt64;
     b->depthBiasClamp = h->depthBiasClamp;
     b->depthClamp = h->depthClamp;
@@ -456,9 +470,18 @@ static void create_device(void) {
     }
     g_vk.present_wait = pwait;
     float prio[2] = {1.0f, 1.0f};
-    // two queues when the family has them: the second one presents (present thread below)
+    // Two queues when the family has them: the second one presents (present thread below). NVIDIA's GPUs before
+    // Turing (PCI device ids below 0x1E00: the GTX 10 series and older) faulted writing to GPU address 0 within the
+    // first frames whenever the second queue presented, and ran with the presents on the game's queue (#36: a GTX 1050,
+    // a GTX 1050 Ti, a GTX 1050 Mobile, a Quadro P1000). Those get one queue. SAVAGEWIND_VK_PRESENT_THREAD=0: one queue
+    // on every GPU; any other value: two there too (testing).
+    const char *pt_env = getenv("SAVAGEWIND_VK_PRESENT_THREAD");
+    bool nv_pre_turing = g_vk.props.vendorID == 0x10DE && g_vk.props.deviceID < 0x1E00;
+    bool two_q = g_vk.qfam_count >= 2 && (pt_env ? strcmp(pt_env, "0") != 0 : !nv_pre_turing);
+    if (nv_pre_turing && !pt_env && g_vk.qfam_count >= 2)
+        LOG("[vk] NVIDIA before Turing (device 0x%04x): presents on the game's queue (#36)\n", g_vk.props.deviceID);
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
-                                  .queueCount = g_vk.qfam_count >= 2 ? 2 : 1, .pQueuePriorities = prio};
+                                  .queueCount = two_q ? 2 : 1, .pQueuePriorities = prio};
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
@@ -1183,7 +1206,8 @@ static void recreate_swapchain(void) {
 // next frame is drawn); vkQueuePresentKHR and vkAcquireNextImageKHR take sc_lock (the swapchain is externally
 // synchronized). The next frame begins once only a game frame after a generated one is still waiting (vk_frame_begin:
 // one frame at a time otherwise, as before); a swapchain change and teardown wait for them all.
-// SAVAGEWIND_VK_PRESENT_THREAD=0 (or a family with one queue): presents on the calling thread, as before.
+// SAVAGEWIND_VK_PRESENT_THREAD=0, NVIDIA before Turing (create_device, #36) or a family with one queue: presents on
+// the calling thread, as before.
 static pthread_mutex_t pres_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pres_cv = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t sc_lock = PTHREAD_MUTEX_INITIALIZER;

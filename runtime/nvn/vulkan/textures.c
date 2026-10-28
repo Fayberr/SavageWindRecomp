@@ -314,6 +314,11 @@ void vk_collect_dead(void) {
     ndead = k;
 }
 
+static bool is_bc_or_astc(VkFormat f) {
+    return (f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK) ||
+           (f >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK);
+}
+
 static void create_image(NvnTexture *t, TexBackend *b) {
     VkFmt mf = fmt_of(t->format);
     b->scalable = b->rs_group != RS_NONE;
@@ -416,6 +421,17 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         VkClearColorValue zero = {{0}};
         VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
         vkCmdClearColorImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rg);
+    }
+    {   // (debugging) SAVAGEWIND_DEBUG_NEW_FILL=1: every new colour image starts magenta (texels nothing wrote yet)
+        static int fill = -1;
+        if (fill < 0) fill = getenv("SAVAGEWIND_DEBUG_NEW_FILL") != NULL;
+        if (fill && !depthfmt && !is_bc_or_astc(vf)) {
+            VkCommandBuffer cb = vk_upload_cmd();
+            VkClearColorValue mag = {{1.0f, 0.0f, 1.0f, 1.0f}};
+            VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+            vkCmdClearColorImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &mag, 1, &rg);
+            vk_full_barrier(cb);
+        }
     }
     if (depthfmt) {
         // New depth / stencil images start zeroed (as fresh memory reads on Apple GPUs). The game builds its depth
@@ -1350,8 +1366,40 @@ VkSampler vk_sampler(NvnSamplerDesc *d, bool aniso_ok) {
     VkSampler s = VK_NULL_HANDLE;
     for (int i = 0; i < g_nsamplers && !s; i++)
         if (!memcmp(&g_samplers[i].key, &key, sizeof key)) s = g_samplers[i].s;
+    bool found = s != VK_NULL_HANDLE;
+    // maxSamplerAllocationCount (4000 on Intel's Windows driver, the spec's minimum) counts every VkSampler alive;
+    // keep some for the rest of the renderer (imgui, FidelityFX, the default samplers). Past it, or when the driver
+    // refuses one (#239: -2 on an Intel Iris Xe), the closest existing sampler stands in rather than ending the game.
+    uint32_t limit = g_vk.props.limits.maxSamplerAllocationCount;
+    bool full = limit > 256 && (uint32_t)g_nsamplers >= limit - 128;
+    static int test_max = -1;  // SAVAGEWIND_VK_MAX_SAMPLERS=<n>: the game's samplers stop at n (tests of the reuse)
+    if (test_max < 0) test_max = getenv("SAVAGEWIND_VK_MAX_SAMPLERS") ? atoi(getenv("SAVAGEWIND_VK_MAX_SAMPLERS")) : 0;
+    if (test_max > 0 && g_nsamplers >= test_max) full = true;
+    if (!found && !full) s = sampler_create(d, an);
     if (!s) {
-        s = sampler_create(d, an);
+        int best = -1, best_score = -1;
+        for (int i = 0; i < g_nsamplers; i++) {
+            const NvnSamplerDesc *k = &g_samplers[i].key;
+            int score = (k->compare_mode == d->compare_mode) * 8 + (k->min_filter == d->min_filter) * 4 +
+                        (k->mag_filter == d->mag_filter) * 2 + (k->wrap[0] == d->wrap[0] && k->wrap[1] == d->wrap[1]);
+            if (score > best_score) best_score = score, best = i;
+        }
+        s = best >= 0 ? g_samplers[best].s : vk_default_sampler(d->mag_filter == 1);
+        static bool logged;
+        if (!logged) {
+            logged = true;
+            LOG("[vk] sampler %s (%d made, driver limit %u): reusing the closest one from now on\n",
+                full ? "limit reached" : "creation failed", g_nsamplers, limit);
+        }
+        pthread_mutex_unlock(&g_sampler_lock);
+        *slot = (void *)s;
+        *slot_aniso = an;
+        return s;
+    }
+    if (!found) {
+        int made = g_nsamplers + 1;  // (the count in players' logs: #239)
+        if (made == 1 || made == 64 || made == 256 || made == 1024 || made == 2048)
+            LOG("[vk] samplers: %d (driver limit %u)\n", made, limit);
         if (g_nsamplers == g_cap_samplers) {
             g_cap_samplers = g_cap_samplers ? g_cap_samplers * 2 : 256;
             g_samplers = realloc(g_samplers, g_cap_samplers * sizeof *g_samplers);
@@ -1418,7 +1466,14 @@ static VkSampler sampler_create(const NvnSamplerDesc *d, float aniso) {
         } else si.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     }
     VkSampler s;
-    VK_CHECK(vkCreateSampler(g_vk.dev, &si, NULL, &s));
+    VkResult r = vkCreateSampler(g_vk.dev, &si, NULL, &s);
+    if (r == VK_ERROR_DEVICE_LOST) VK_CHECK(r);
+    if (r != VK_SUCCESS) {  // (vk_sampler reuses another one)
+        static int logged;
+        if (logged++ < 3) LOG("[vk] vkCreateSampler failed: %d (border %d, aniso %.0f, compare %u)\n", r, border, aniso,
+                              d->compare_mode);
+        return VK_NULL_HANDLE;
+    }
     return s;
 }
 

@@ -237,6 +237,17 @@ float rt_solver_steps(float delta_frame, float per_frame) {
     return keep && delta_frame > 0 && delta_frame < 1 ? per_frame / sqrtf(delta_frame) : delta_frame * per_frame;
 }
 
+// The sound system's frame (tools/patches.py _snd_frame_floor, #145): the game gives it the delta frame, at least 0.5
+// (a 60 fps frame), and every sound timer and fade steps by it: above 60 fps the sound's clock ran ahead of the game's
+// (x1.6 at ~95 fps, x2 at 120), and the field battle music started each segment while the last one still played. The
+// floor is 0.5 x the frame's length in console frames: the console's at 30 fps (slow motion floored as there), the
+// frame's own length above. SAVAGEWIND_SND_FRAME_FLOOR=0: the game's 0.5.
+float rt_snd_frame_floor(void) {
+    static int keep = -1;
+    if (keep < 0) keep = env_int("SAVAGEWIND_SND_FRAME_FLOOR", 1) != 0;
+    return keep && framepace_on() ? 0.5f * g_frame_ratio : 0.5f;
+}
+
 void rt_vfr_update(uint64_t vfr) {
     extern bool nvn_timeline(void);
     if (nvn_timeline()) LOG("[tl] %.3f %x vfr\n", plat_now_ns() / 1e6, kernel_current_thread_handle());

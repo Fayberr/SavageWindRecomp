@@ -45,6 +45,8 @@ typedef struct {
     bool flip_y;            // lower-left window origin
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
+    uint8_t point_size;     // vertex, GLSL: the draw is a point list; a shader that writes no point size writes 1.0
+                            // (NVN's default size; without maintenance5 Vulkan leaves it undefined)
     uint32_t shared_size;   // compute: shared memory bytes (from the program's control section)
 } ShaderKey;
 
