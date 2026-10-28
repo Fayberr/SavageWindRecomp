@@ -151,7 +151,10 @@ The DLC are optional: the whole game plays without them. What you get depends on
 | Only the first or only the second DLC | The whole game, without DLC content: the game uses the DLC only when it finds both |
 | Both DLC | The whole game plus Master Mode, the Trial of the Sword, the Travel Medallion and The Champions' Ballad; the title screen shows "DLC Ver.3.0" |
 
-Both are needed for the DLC content because the first holds the data of both and the second only its version.
+The two packs came out months apart in 2017, both part of the Expansion Pass. In the version the game has now (DLC
+3.0), the first DLC holds the data of both packs, *The Champions' Ballad* included, and the second only tells the
+game that you have the second pack. So setting up only one of them never breaks your game: it runs as without DLC.
+To unlock the DLC content, set up both, from your own console and your own Expansion Pass.
 
 ## Status
 
