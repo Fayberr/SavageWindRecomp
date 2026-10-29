@@ -1,6 +1,7 @@
 # Contributor environment
 
-Prepared on 2026-10-28 from upstream `test` commit `8368fa49da3f368c8c18dff411fd92f06f1fc25a`.
+Prepared on 2026-10-28 from upstream `test` commit `8368fa49da3f368c8c18dff411fd92f06f1fc25a`,
+with Windows setup continued on 2026-10-29 after the Pi relay recovered.
 These helpers belong to the contributor's setup branch, not to an upstream feature submission.
 
 ## Project state
@@ -46,8 +47,9 @@ source contrib/env.sh
 ./build/savagewind --config
 ```
 
-`contrib/check.sh` runs the game-site/layout checks, input binding capture, vibration and synthetic RomFS
-tests, then builds the runtime. The extra checks sample shader translation/validation and portable SIMD
+`contrib/check.sh` runs the game-site/layout checks, input binding capture and vibration, then builds the runtime.
+It also runs the synthetic RomFS test on Linux; the standalone upstream target lacks its platform dependency
+on Windows, which is reported explicitly. The extra checks sample shader translation/validation and portable SIMD
 against Unicorn. All use synthetic input, with no game files required.
 The extra SIMD sample is not a full opcode enumeration or an exhaustive verification.
 
@@ -72,12 +74,34 @@ pwsh -NoProfile -File contrib/setup-windows.ps1
 If source files have already arrived through Syncthing, run the last two lines only. The wrapper initializes
 missing Git metadata with a mixed reset, preserving source files, then calls upstream's setup using `pwsh`.
 It installs MSYS2 UCRT64 dependencies and a separate python.org virtualenv, pins generator dependencies,
-runs source checks and builds the runtime. It does not launch the game or change GPU drivers.
+runs source checks and builds the runtime. If MSYS2 is absent, it uses the official 2026-09-27 self-extracting
+archive and verifies its published SHA-256. Python uses UTF-8, and WindowsApps is added to the process PATH
+for winget. It does not launch the game or change GPU drivers.
 
-Windows installation and execution have **not** been verified in this session: the VPS-to-Pi SSH relay on
-port 2222 was unavailable, and Syncthing reported its Pi peer disconnected. Source propagation is unverified.
-The known RTX 3080 Ti should be the useful hardware test target once remote access is available; query the
-actual installed driver and `vulkaninfo --summary` before testing.
+On a first installation, a mirror returned HTTP 429. The local MSYS2 configuration now prioritizes the
+official `https://repo.msys2.org` repository and uses `ParallelDownloads = 1`; original configs are backed up
+next to them with `.contrib-original` suffixes. Package signature verification stays enabled.
+
+The Pi reboot restored the relay on 2026-10-29. WinPC access and source propagation are verified. The target
+is a Ryzen 7 5700X3D with RTX 3080 Ti. Check [the verification record](VERIFICATION.md) for build/test results.
+
+For extra synthetic checks, use MSYS2 UCRT64:
+
+```bash
+bash contrib/extra-checks-windows.sh
+```
+
+For an automated launcher screenshot on the logged-in desktop, from local or SSH `pwsh`:
+
+```powershell
+pwsh -NoProfile -File contrib/smoke-windows.ps1
+```
+
+It creates and removes a temporary Interactive task, uses isolated data/settings/save paths under
+`build/contrib/windows-smoke`, and asks the launcher to save its own screenshot after 30 frames and exit.
+No game files are required. A bounded wait stops a stalled test process. The screenshot covers only the app.
+Validation is requested, and stdout/stderr are captured alongside the result. The test uses the current Windows
+identity SID for its task principal, so it also works when OpenSSH's account-name environment is incomplete.
 
 ## Gameplay and automated testing
 
