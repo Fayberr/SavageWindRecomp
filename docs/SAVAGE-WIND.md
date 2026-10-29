@@ -970,6 +970,20 @@ Pendiente:
      ninguna función pasa del 1 %; `rt_dispatch` 4 %), el resto esperas. `SAVAGEWIND_VK_LIST_STATS=1` (medir) mostró
      que un frame no se parte en listas independientes: ~2800 `CallCommands` por frame, ~1 draw cada una, todas usan
      estado puesto antes. Bajar la traducción a 4-5 ms pide traducir en paralelo (notas de la sesión).
+   - Render targets comprimidos en GPU integradas (2026-10-26): las imágenes de color se creaban con
+     `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT` sin `VkImageFormatListCreateInfo`, y Mesa (RADV) les quita DCC antes de RDNA3
+     (`radv_are_formats_dcc_compatible`): ningún render target iba comprimido y cada clear escribía la imagen entera
+     (en una Radeon 660M, 36 clears por frame en Kakariko = 1,38 ms, ~0,18 ms por target de 1600x900; sin fast clears,
+     que en `GENERAL` exigen DCC). Ahora los render targets listan su formato y su par sRGB / UNORM (sin par: no son
+     mutables), como LAS Recomp 03ee802f; una vista en otro formato usa el propio (`vk_view_format`, con aviso en el
+     log: 0 en las pruebas). Solo los render targets: BOTW lee los bloques de una textura BC4 con una vista RGBA16, que
+     una lista rechazaría. Un target con feedback loop (el 0 del G-buffer: el terreno lo lee y lo escribe) se rehace
+     sin lista copiando su contenido la primera vez (`vk_texture_drop_format_list`): RADV no comprime en
+     `ATTACHMENT_FEEDBACK_LOOP_OPTIMAL` y lo descomprimía al empezar cada pase (0,12 → 1,39 ms por frame). Clears
+     1,38 → 0,83 ms. Por defecto en GPU integradas (en las dedicadas LAS lo midió algo más lento en una RTX 3080 Ti);
+     `SAVAGEWIND_VK_LEAN_USAGE=0` / `=1` lo fuerza. Medido sobre `test` (36a02bc, con #108), 3+3 pasadas alternas sin
+     límite de FPS a 1280x720: el establo del río 66,6 → 70,6 fps (+6,1 %) y la puerta de la Ciudad Gerudo 60,0 → 63,7
+     (+6,3 %), GPU por frame −5,9 y −7,1 %; Kakariko +1,6 % (dentro del ruido: una pasada con NPC delante).
    - Sombras del sol con depth clamp (2026-10-20): `nvnCommandBufferSetDepthClamp` no hacía nada. BOTW lo activa para
      sus tres cascadas de sombra del sol (un array D16 de 896x896x3, ~650-750 draws por frame) y para la consulta de
      oclusión del sol: lo que está más cerca de la luz que el plano cercano de una cascada se aplasta contra él en vez
@@ -983,6 +997,21 @@ Pendiente:
      apagado). `SAVAGEWIND_NO_DEPTH_CLAMP=1` lo ignora (A/B). Metal (`renderer.m`): `setDepthClipMode`, sin compilar.
      La paleta de entorno (`fcb4` del shader de la máscara de sombras) pasa de la de interior a la de exterior en 60 s
      al salir del santuario y al cargar una partida afuera, y no vuelve a la de interior al regresar (ver abajo).
+   - Barreras por imagen entre pases (2026-10-26): cada pase empezaba con una barrera global (`ALL_COMMANDS`,
+     escrituras de memoria → lecturas y escrituras). Tras escrituras de attachments, RADV convierte una barrera global
+     en escribir e invalidar toda la L2, porque sin imagen no sabe si eran coherentes con ella
+     (`radv_src_access_flush` añade `AC_BARRIER_INV_L2`); con barreras por imagen no (`radv_image_is_l2_coherent`).
+     Si desde la última barrera completa solo hubo pases (ni copias, ni dispatch, ni subidas, ni escrituras a la
+     memoria del juego, ni lecturas de targets lineales: todo eso va tras una barrera completa, que marca
+     `bar_other`), la barrera del pase siguiente nombra las imágenes de esos pases (las de sus vistas de attachment,
+     tras `vk_view`) más una dependencia de ejecución para lo demás; una imagen diferida fuerza la completa.
+     `SAVAGEWIND_VK_FULL_PASS_BARRIER=1` vuelve a la barrera completa. La validación de sincronización
+     (`VK_LAYER_VALIDATE_SYNC=1` con `VK_LAYER_SYNCVAL_SHADER_ACCESSES_HEURISTIC=1`, mensajes con
+     `SAVAGEWIND_VK_VALIDATION=1`) da en las tres escenas los mismos avisos que antes (los del feedback loop del
+     terreno, dentro del pase) y ninguno entre pases; sin barreras de memoria entre pases da cientos. Medido sobre
+     `test` (36a02bc, con #108), 3+3 pasadas alternas sin límite de FPS a 1280x720 en una Radeon 660M: GPU por frame
+     −1,9 % en Kakariko, −1,1 % en el establo del río y −1,9 % en la puerta de la Ciudad Gerudo; FPS +1,3 % en
+     Kakariko (los otros dos, +1,1 y +0,8 %, dentro del ruido).
    - Fallos gráficos que quedaban en la Alpha 2 (2026-10-22):
      - Consulta de oclusión del sol: `ReportCounter` con `SAMPLES_PASSED` (tipo 1) devolvía siempre 0 muestras y
        `ResetCounter` no hacía nada. BOTW dibuja una vez por frame el disco del sol con prueba de profundidad y sin

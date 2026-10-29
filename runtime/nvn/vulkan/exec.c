@@ -220,12 +220,64 @@ VkCommandBuffer vk_upload_cmd(void) {
     return s->upload;
 }
 
+// Since the last full barrier only render passes wrote (copies, dispatches, uploads and guest memory stores come
+// after a full barrier, which sets bar_other), and these were their targets. The next pass's barrier then names
+// those images instead of all memory: on AMD a global barrier after attachment writes also writes back and
+// invalidates the whole L2, as the driver can't tell the writes were coherent with it (RADV: radv_src_access_flush
+// adds AC_BARRIER_INV_L2 without an image), an image barrier doesn't (radv_image_is_l2_coherent).
+// SAVAGEWIND_VK_FULL_PASS_BARRIER=1: a full barrier before every pass, as before.
+static bool bar_other = true;
+static VkImage bar_img[64];
+static VkImageAspectFlags bar_aspect[64];
+static int bar_n;
+
+void vk_pass_barrier_forget(void) { bar_other = true; }
+
 void vk_full_barrier(VkCommandBuffer cb) {
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                            .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
     vkCmdPipelineBarrier2(cb, &di);
+    bar_other = true;  // (what follows may write anything)
+    bar_n = 0;
+}
+
+static void pass_barrier(VkCommandBuffer cb) {
+    static int full = -1;
+    if (full < 0) full = getenv("SAVAGEWIND_VK_FULL_PASS_BARRIER") != NULL;
+    if (full || bar_other) {
+        vk_full_barrier(cb);
+        bar_other = false;  // (a pass follows)
+        return;
+    }
+    VkImageMemoryBarrier2 ib[64];
+    for (int i = 0; i < bar_n; i++) {
+        bool ds = bar_aspect[i] & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+        ib[i] = (VkImageMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                        .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                        .srcAccessMask = ds ? VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                        .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                        .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                        .image = bar_img[i],
+                                        .subresourceRange = {bar_aspect[i], 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
+    }
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};  // (execution only: reads before writes)
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb,
+                           .imageMemoryBarrierCount = (uint32_t)bar_n, .pImageMemoryBarriers = ib};
+    vkCmdPipelineBarrier2(cb, &di);
+    bar_n = 0;
+}
+
+static void pass_barrier_note(TexBackend *b) {  // a target of the pass begun
+    if (!b || !b->image) return;
+    for (int i = 0; i < bar_n; i++) if (bar_img[i] == b->image) return;
+    if (bar_n == 64) { bar_other = true; return; }
+    bar_img[bar_n] = b->image;
+    bar_aspect[bar_n++] = b->aspect ? b->aspect : VK_IMAGE_ASPECT_COLOR_BIT;
 }
 
 static void ring_retire(void);
@@ -1368,6 +1420,7 @@ static void vk_end_pass_at(int line) {
     for (int i = 0; i < pass_nblock; i++) vk_block_flush(vk_cmd(), pass_block[i]);
     pass_nblock = 0;
     depth_twin_after_pass(vk_cmd());  // (the shadow copy just drawn: its depth twin)
+    if (pass_nlinear) bar_other = true;  // (copies to memory)
     for (int i = 0; i < pass_nlinear; i++) readback_schedule(vk_cmd(), pass_linear[i], &pass_linear_view[i], pass_linear_has_view[i]);
     pass_nlinear = 0;
     // (debug frame) what the pass drew: its targets, as begin_pass recorded them (st.rt may name the next pass's)
@@ -1428,7 +1481,7 @@ static void begin_pass(void) {
             break;
         }
     VkCommandBuffer cb = vk_cmd();
-    vk_full_barrier(cb);  // passes, copies and dispatches see each other's results
+    pass_barrier(cb);  // passes, copies and dispatches see each other's results
     {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
@@ -1491,6 +1544,7 @@ static void begin_pass(void) {
         renderer_mark_gpu_owned(t);
         VkImageView v = vk_view(t, &st.rt.cview[i], st.rt.has_cview[i], true, TEXTYPE_2D);
         TexBackend *b = t->backend;
+        if (v) pass_barrier_note(b);  // (the image the view is of: vk_view may have made or changed it)
         if (b && b->drawn_frame != renderer_present_count()) { b->prev_drawn = b->drawn_frame; b->drawn_frame = renderer_present_count(); }
         bool blocks = b && b->block_pending;  // (a view of a compressed image's blocks: drawn into b->block)
         if (blocks) {
@@ -1525,6 +1579,7 @@ static void begin_pass(void) {
         }
         pass_color[i] = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 4) && vk_format(t->format) == b->format
                       ? vk_format(st.rt.cview[i].format) : b->format;
+        pass_color[i] = vk_view_format(b, pass_color[i]);  // (g_vk.lean_usage: the format its view really has)
         uint32_t lv = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 1) ? st.rt.cview[i].base_level : 0;
         uint32_t ew = level_extent(b->width, lv), eh = level_extent(b->height, lv);
         if (blocks) ew = b->block->width, eh = b->block->height;
@@ -1539,6 +1594,7 @@ static void begin_pass(void) {
         renderer_mark_gpu_owned(st.rt.depth);
         VkImageView v = vk_view(st.rt.depth, &st.rt.dview, st.rt.has_dview, true, TEXTYPE_2D);
         TexBackend *b = st.rt.depth->backend;
+        if (v) pass_barrier_note(b);
         if (b && b->drawn_frame != renderer_present_count()) { b->prev_drawn = b->drawn_frame; b->drawn_frame = renderer_present_count(); }
         if (v && renderer_format_is_depth(st.rt.depth->format)) {
             VkRenderingAttachmentInfo a = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v,
@@ -1605,6 +1661,7 @@ static void begin_pass(void) {
     if (mvec_enabled() && has_d && pass_ncolor < 8 && pass_samples == 1) {  // (mvec.c) the motion target, appended
         TexBackend *mt = mvec_pass_target(st.rt.depth, minw, minh);
         if (mt) {
+            pass_barrier_note(mt);  // (the motion target is drawn into too)
             uint64_t frame = renderer_present_count();
             ca[pass_ncolor] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
                                                           .imageView = post_view(mt), .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
@@ -3301,6 +3358,12 @@ static void resolve_feedback(Prog *pr) {
                 int ci = -1;
                 for (int k = 0; k < st.rt.ncolor; k++) if (st.rt.color[k] == t) ci = k;
                 if (ci >= 0) {
+                    if (!src->feedback_seen && src->nview_fmt) {  // (outside a pass: no DCC for it from now on)
+                        vk_end_pass();
+                        st.rt_dirty = true;
+                        src->feedback_seen = true;
+                        vk_texture_drop_format_list(t);
+                    }
                     src->feedback_seen = true;
                     fbdump_note(t);
                     if (in_pass && !st.rt_dirty && (pass_feedback & (1u << ci))) {
@@ -5554,6 +5617,7 @@ have_pipe:
     stat_draws++;
     chunk_draws++;
     if (pr->vi->writes_gmem || pr->fi->writes_gmem) {
+        bar_other = true;
         if (pr->vi->writes_gmem) gw_note(0);
         if (pr->fi->writes_gmem) gw_note(1);
         if (getenv("SAVAGEWIND_LOG_HOLD")) LOG("[hold] frame %llu draw %llu: vs %llx (%d) fs %llx (%d) fs hash %016llx\n",
