@@ -401,3 +401,14 @@ test-vibration: $(B)/test_vibration
 	$(B)/test_vibration
 
 .PHONY: test-vibration
+
+# The Wii U / Cemu save importer against tools/botw_save_convert.py: both convert synthetic saves and every output file
+# is compared (no game files needed). With your own: python3 tools/test_save_convert.py --src <profile> --bootup <pack>
+$(B)/test_save_convert: tools/test_save_convert.c runtime/services/save_convert.c runtime/services/save_convert.h runtime/services/archive.c runtime/services/archive.h
+	@mkdir -p $(B)
+	$(CC) -O1 -std=gnu11 -D_FILE_OFFSET_BITS=64 -Iruntime -o $@ tools/test_save_convert.c runtime/services/archive.c
+
+test-save-convert: $(B)/test_save_convert
+	python3 tools/test_save_convert.py --exe $(B)/test_save_convert
+
+.PHONY: test-save-convert
