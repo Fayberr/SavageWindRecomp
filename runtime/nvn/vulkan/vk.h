@@ -35,6 +35,7 @@ typedef struct {
     uint32_t qfam, qfam_count;
     VmaAllocator vma;
     VkPhysicalDeviceProperties props;
+    bool is_mali;              // Arm Mali (vendor 0x13B5): the Mali-only paths' default (tiler / non-coherent workarounds)
     VkPipelineCache pcache;
     VkPipelineCache pcache_pre;  // the precompiled shaders' libraries (cache/vk_precompiled.bin; read only while playing)
     VkSemaphore timeline;      // value = last completed submission number
@@ -84,6 +85,7 @@ typedef struct { VkBuffer buf; uint64_t off; void *ptr; } VkSpan;
 VkSpan vk_transient(uint64_t size, uint64_t align);
 VkSpan vk_transient_copy(const void *data, uint64_t size, uint64_t align);
 VkSpan vk_readback(uint64_t size);  // host-cached GPU -> CPU staging (read right after the copy completes)
+void vk_readback_sync(void);         // ... before reading it (non-coherent host-cached memory: invalidated)
 VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout);
 
 // ---- textures (textures.c)
@@ -118,6 +120,7 @@ typedef struct TexBackend {
     uint32_t pending_w, pending_h, pending_stride;
     uint8_t astc_bw, astc_bh;  // ASTC without GPU support: decoded to RGBA8 on upload (runtime/nvn/astc.c)
     bool astc_srgb;
+    bool bc4_cpu;                // BC4 decoded to R8 on upload (SAVAGEWIND_VK_BC4_CPU=1: Mali text / sprites test)
     uint32_t glyph_gen;          // a button glyph sheet (runtime/nvn/glyphs.c): the icons it was uploaded with
     // textures.c: one image per memory and shape, shared by every texture made there
     uint64_t key_addr;           // 0: not shared
@@ -134,7 +137,12 @@ typedef struct TexBackend {
     // A compressed image drawn into through an uncompressed view of its blocks (a texel a block: BOTW encodes its NPC
     // speech bubbles to BC4 on the GPU that way). Vulkan draws into no compressed image: the draw goes into this
     // block-sized image instead, copied into this one after the pass (textures.c block_view, vk_block_flush).
+    // block is the one the open pass draws into: one of block_lv (a block image per level of b drawn into that way;
+    // only level 0 outside the Mali R8 path), block_level the level of b its texels are the blocks of.
     struct TexBackend *block;
+    struct TexBackend *block_lv[16];
+    uint8_t block_level;
+    bool gpu_bc4;                // BC4 kept as BC4 though SAVAGEWIND_VK_BC4_CPU is on: the GPU draws into its blocks
     bool block_pending;          // (exec.c) the attachment view just made is block's: copy it after the pass
 } TexBackend;
 
