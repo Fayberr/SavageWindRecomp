@@ -495,3 +495,4 @@ T("AMD FSR 3: it renders smaller and builds the full-resolution image from the f
 T("TAA: blends each frame with the ones before it, following the game's motion, so edges stay smooth and stop shimmering; slightly softer, use it with Sharpening.", "TAA: mezcla cada fotograma con los anteriores siguiendo el movimiento del juego, así los bordes quedan suaves y dejan de parpadear; algo más suave, úsalo con Enfoque.")
 T("FSR 1", "")
 T("Frame generation on", "Generación de fotogramas activa")
+T("Unbound arrow keys act as the left stick in the title, pause and map menus.", "Las flechas sin asignar funcionan como el stick izquierdo en los menús de título, pausa y mapa.")

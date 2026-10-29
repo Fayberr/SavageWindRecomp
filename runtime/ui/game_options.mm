@@ -576,6 +576,12 @@ void build_items(void) {
                                               : "Press A, then the new button.",
                          nullptr, action, slot);
         it.label = bind_label;
+        if (action == A_BIND_KEY) it.desc_fn = [](const Item &) {
+            static std::string desc;
+            desc = std::string(tr("Press A, then the new key. Esc cancels.")) + " " +
+                   tr("Unbound arrow keys act as the left stick in the title, pause and map menus.");
+            return desc.c_str();
+        };
         v.push_back(it);
     };
     for (int s = 0; s < BIND_PAD_COUNT; s++) bind(P_KEYS, A_BIND_KEY, s);

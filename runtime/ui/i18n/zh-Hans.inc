@@ -495,3 +495,4 @@ T("AMD FSR 3: it renders smaller and builds the full-resolution image from the f
 T("TAA: blends each frame with the ones before it, following the game's motion, so edges stay smooth and stop shimmering; slightly softer, use it with Sharpening.", "TAA：跟随游戏的运动，将每一帧与之前的帧混合，使边缘平滑、不再闪烁；画面略微柔和，建议配合锐化使用。")
 T("FSR 1", "")
 T("Frame generation on", "帧生成已开启")
+T("Unbound arrow keys act as the left stick in the title, pause and map menus.", "未绑定的方向键在标题、暂停和地图菜单中可用作左摇杆。")

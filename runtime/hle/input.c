@@ -16,6 +16,7 @@
 #include "../nvn/renderer.h"
 #include "../settings.h"
 #include "../input_bind.h"
+#include "../framepace.h"
 #include "../motion.h"
 #include "../vibration.h"
 
@@ -28,6 +29,7 @@ _Static_assert(BTN_DOWN == BIND_DOWN && BTN_ZL == BIND_ZL, "bindings follow the 
 
 static _Atomic uint64_t key_buttons, pad_buttons;
 static _Atomic int32_t key_lx, key_ly, key_rx, key_ry, pad_lx, pad_ly, pad_rx, pad_ry;
+static _Atomic int32_t menu_lx, menu_ly;
 static uint8_t keys_down[SDL_SCANCODE_COUNT];
 static uint8_t mouse_down[8];  // SDL_BUTTON_LEFT .. X2 (keyboard bindings BIND_MOUSE + button)
 static SDL_Gamepad *pad;
@@ -47,6 +49,12 @@ static int held_key(int sc) {
     return sc > 0 && sc < SDL_SCANCODE_COUNT && (keys_down[sc] || test_keys[sc]);
 }
 
+static int menu_arrow(int sc) {
+    for (int i = 0; i < BIND_KEY_COUNT; i++)
+        if (g_bind_key[i] == sc) return 0;  // a player's binding takes priority
+    return held_key(sc);
+}
+
 // Through the bindings (runtime/hle/bindings.c: g_bind_key), read on every key event, so a rebind applies at once.
 static void recompute_keyboard(void) {
     uint64_t b = 0;
@@ -58,6 +66,8 @@ static void recompute_keyboard(void) {
     key_ly = (held_key(g_bind_key[BIND_LS_UP]) - held_key(g_bind_key[BIND_LS_DOWN])) * tilt;
     key_rx = (held_key(g_bind_key[BIND_RS_RIGHT]) - held_key(g_bind_key[BIND_RS_LEFT])) * 32767;
     key_ry = (held_key(g_bind_key[BIND_RS_UP]) - held_key(g_bind_key[BIND_RS_DOWN])) * 32767;
+    menu_lx = (menu_arrow(SDL_SCANCODE_RIGHT) - menu_arrow(SDL_SCANCODE_LEFT)) * 32767;
+    menu_ly = (menu_arrow(SDL_SCANCODE_UP) - menu_arrow(SDL_SCANCODE_DOWN)) * 32767;
     bool tilt_key = held_key(g_bind_key[BIND_TILT]) && !menu_input_captured();
     if (tilt_key != tilt_held) motion_tilt_held(tilt_held = tilt_key);
 }
@@ -668,6 +678,12 @@ static void fill_state(Cpu *c) {
         if (renderer_present_count() < until) b |= 1ull << BTN_PLUS;
     }
     int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly) + script_ly);
+    // Gate at each poll: an arrow held when a menu closes must never move the player.
+    // Event activity also includes cutscenes and fanfares, so it cannot identify dialogue choices safely.
+    if (!menu && (framepace_title_ui() || framepace_menu_ui())) {
+        lx = clamp_axis(lx + menu_lx);
+        ly = clamp_axis(ly + menu_ly);
+    }
     int32_t mx = 0, my = 0;
     if (!menu) mouse_stick(&mx, &my);
     int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx + mx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry + my) + script_ry);
