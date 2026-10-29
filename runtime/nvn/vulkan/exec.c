@@ -4524,6 +4524,7 @@ bool vk_pso_warm_stage(const ShaderInfo *si, int stage) {
     if (!cache) return false;
     StageBuild b;
     memset(&b, 0, sizeof b);
+    b.si = si;  // (stage_layouts reads si->mvec for the push constant range, as stage_build's layouts do)
     b.m = warm_module(si, stage, b.binds, &b.nbinds, MAX_BIND);
     if (!b.m) return false;
     stage_layouts(&b, stage);
