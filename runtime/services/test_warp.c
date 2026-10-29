@@ -140,25 +140,51 @@ void test_warp_patch(uint8_t *d, uint64_t size) {
     }
 }
 
-// Every frame (SAVAGEWIND_TEST_TIME): TimeMgr's time of day held at the hour. ksys::world::Manager [world_mgr]
+// TimeMgr's time of day, 0..360 = 24 h (NULL until the world exists). ksys::world::Manager [world_mgr]
 // (+0x5c0 count, +0x5c8 its managers; [0] = TimeMgr, the time at +0xb8), as SAVAGEWIND_CLOCK_PROBE reads it
 // (runtime/hle/framepace.c).
-void test_warp_frame(uint64_t frame) {
-    static float tod = -2;
-    if (tod == -2) {
-        const char *t = getenv("SAVAGEWIND_TEST_TIME");
-        tod = t && *t ? (float)atof(t) * 15.0f : -1;
-    }
-    if (tod < 0 || !g_site.world_mgr) return;
+static float *time_of_day(void) {
+    if (!g_site.world_mgr) return NULL;
     uint64_t wm = *(uint64_t *)(uintptr_t)g_site.world_mgr;
-    if (!wm || !*(uint32_t *)(uintptr_t)(wm + 0x5c0)) return;
+    if (!wm || !*(uint32_t *)(uintptr_t)(wm + 0x5c0)) return NULL;
     uint64_t mgrs = *(uint64_t *)(uintptr_t)(wm + 0x5c8), tm = mgrs ? *(uint64_t *)(uintptr_t)mgrs : 0;
-    if (!tm) return;
-    float *now = (float *)(uintptr_t)(tm + 0xb8);
+    return tm ? (float *)(uintptr_t)(tm + 0xb8) : NULL;
+}
+
+// The hour held every frame (-2: SAVAGEWIND_TEST_TIME not read yet, -1: not held).
+static float held_tod = -2;
+
+static void read_test_time(void) {
+    if (held_tod != -2) return;
+    const char *t = getenv("SAVAGEWIND_TEST_TIME");
+    held_tod = t && *t ? (float)atof(t) * 15.0f : -1;
+}
+
+// The control endpoint (runtime/control_game.c): hold the hour (0..24), or let it run again (< 0).
+void test_warp_set_hour(float hour) {
+    read_test_time();
+    held_tod = hour < 0 ? -1 : hour * 15.0f;
+}
+
+// The current hour of the day (0..24), or -1 before the world exists; *held says whether it is being held.
+float test_warp_hour(bool *held) {
+    read_test_time();
+    if (held) *held = held_tod >= 0;
+    float *now = time_of_day();
+    if (!now) return -1.0f;
+    return (held_tod >= 0 ? held_tod : *now) / 15.0f;  // (a hold is written into the game on the next frame)
+}
+
+// Every frame (SAVAGEWIND_TEST_TIME, or the control endpoint's `hour`): the time of day held at the hour.
+void test_warp_frame(uint64_t frame) {
+    read_test_time();
+    if (held_tod < 0) return;
+    float *now = time_of_day();
+    if (!now) return;
     static bool logged;
-    if (!logged && *now != tod) {
-        LOG("[warp] time of day %.1f -> %.1f at frame %llu (held)\n", *now, tod, (unsigned long long)frame);
+    if (!logged && *now != held_tod) {
+        LOG("[warp] time of day %.1f -> %.1f at frame %llu (held)\n", *now, held_tod, (unsigned long long)frame);
         logged = true;
     }
-    *now = tod;
+    *now = held_tod;
 }

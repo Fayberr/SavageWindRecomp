@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "../hle.h"
+#include "../control.h"
 #include "../nvn/nvn.h"
 #include "../nvn/renderer.h"
 #include "../settings.h"
@@ -575,16 +576,18 @@ static uint64_t g_pad_obj;
 volatile int g_inject_plus;  // frames to hold Plus for the game (movie.c: A/B skip a skippable movie)
 RT_ON_RESET(input_reboot_reset) { g_pad_obj = 0; g_inject_plus = 0; }  // (reboot: the controller object was guest memory)
 void input_frame(uint64_t frame) {
+    extern uint64_t renderer_present_count(void);
+    control_input_frame(renderer_present_count());
     if (g_pad_obj && getenv("SAVAGEWIND_DUMP_PAD") && frame % 600 == 0) {
         const uint8_t *m = (const uint8_t *)(uintptr_t)(g_pad_obj - 0x98);
-        LOG("[pad] mgr %llx 4e0=%u 4e4=%u 4e8=%u 548=%#x 54c..=%02x %02x %02x 56c=%02x\n", g_pad_obj - 0x98,
+        LOG("[pad] mgr %llx 4e0=%u 4e4=%u 4e8=%u 548=%#x 54c..=%02x %02x %02x 56c=%02x\n", (unsigned long long)(g_pad_obj - 0x98),
             *(uint32_t *)(m + 0x4e0), *(uint32_t *)(m + 0x4e4), *(uint32_t *)(m + 0x4e8), *(uint32_t *)(m + 0x548),
             m[0x54c], m[0x54d], m[0x54e], m[0x56c]);
         for (int i = 0; i < 9; i++) {
             const uint8_t *o = m + 0x98 + 0x48 * i;
             uint64_t player = *(uint64_t *)(m + 0x10 * i);
             LOG("[pad]  ctl%d id %#x style %#x btn %#x conn %d %d | player %llx [8]=%u\n", i, *(uint32_t *)(o + 8),
-                *(uint32_t *)(o + 0xc), *(uint32_t *)(o + 0x14), o[0x44], o[0x45], player,
+                *(uint32_t *)(o + 0xc), *(uint32_t *)(o + 0x14), o[0x44], o[0x45], (unsigned long long)player,
                 player ? *(uint32_t *)(uintptr_t)(player + 8) : 0);
         }
     }
@@ -636,7 +639,11 @@ void input_frame(uint64_t frame) {
 }
 
 // Buttons held right now (keyboard, gamepad, test script), independent of whether the game polls (movies).
-uint64_t input_buttons_now(void) { return (menu_input_captured() ? 0 : key_buttons | pad_buttons) | script_buttons; }
+uint64_t input_buttons_now(void) {
+    uint64_t b = (menu_input_captured() ? 0 : key_buttons | pad_buttons) | script_buttons;
+    control_input_apply(&b, NULL, NULL, NULL, NULL);
+    return b;
+}
 
 static int32_t clamp_axis(int32_t v) { return v > 32767 ? 32767 : v < -32767 ? -32767 : v; }
 
@@ -648,7 +655,7 @@ static void fill_state(Cpu *c) {
     memset(s, 0, 0x28);
     *(int64_t *)s = ++sampling;
     static int nlog;
-    if (nlog < 6 && (sampling % 600) == 1) { nlog++; LOG("[input] GetNpadState id %#x lr %llx\n", id, c->x[30]); }
+    if (nlog < 6 && (sampling % 600) == 1) { nlog++; LOG("[input] GetNpadState id %#x lr %llx\n", id, (unsigned long long)c->x[30]); }
     if (id != 0) return;  // docked: only player 1 (FullKey); Handheld stays disconnected
     extern uint64_t g_watch_lo, g_watch_hi;
     if (id == 0 && !g_pad_obj) g_pad_obj = c->x[1] - 8;
@@ -657,7 +664,7 @@ static void fill_state(Cpu *c) {
         sscanf(getenv("SAVAGEWIND_WATCH_PAD"), "%x,%x", &lo, &hi);
         g_watch_lo = c->x[1] - 8 - 0x98 + lo;
         g_watch_hi = c->x[1] - 8 - 0x98 + hi;
-        LOG("[input] watching controller object %llx\n", c->x[1] - 8);
+        LOG("[input] watching controller object %llx\n", (unsigned long long)(c->x[1] - 8));
     }
     bool menu = menu_input_captured();  // the overlay menu / name entry has the controls (typing there isn't for the game)
     uint64_t b = menu ? script_buttons : key_buttons | pad_buttons | script_buttons;
@@ -680,6 +687,7 @@ static void fill_state(Cpu *c) {
         int32_t m = dx && dy ? 23170 : 32767;  // diagonals: same speed (32767 / sqrt 2)
         if (dx || dy) lx = dx * m, ly = dy * m;
     }
+    control_input_apply(&b, &lx, &ly, &rx, &ry);
     // stick directions also appear as buttons (bits 16-23)
     if (lx < -16000) b |= 1ull << 16;
     if (ly > 16000) b |= 1ull << 17;
@@ -691,7 +699,7 @@ static void fill_state(Cpu *c) {
     if (ry < -16000) b |= 1ull << 23;
     *(uint64_t *)(s + 8) = b;
     static uint64_t last_b;
-    if (b != last_b && getenv("SAVAGEWIND_INPUT")) LOG("[input] id %#x buttons %#llx (sampling %lld, lr %llx)\n", id, (unsigned long long)b, (long long)sampling, c->x[30]);
+    if (b != last_b && getenv("SAVAGEWIND_INPUT")) LOG("[input] id %#x buttons %#llx (sampling %lld, lr %llx)\n", id, (unsigned long long)b, (long long)sampling, (unsigned long long)c->x[30]);
     last_b = b;
     *(int32_t *)(s + 16) = lx;
     *(int32_t *)(s + 20) = ly;

@@ -17,6 +17,7 @@
 #include "settings.h"
 #include "hle.h"
 #include "kernel.h"
+#include "control.h"
 
 const char *g_romfs_dir;
 uint64_t g_program_id;
@@ -322,6 +323,7 @@ int main(int argc, char **argv) {
 #else
     setvbuf(stderr, NULL, _IOLBF, 0);
 #endif
+    control_init();
     const char *root = "extracted";  // (in the data root)
     bool skip_launcher = getenv("SAVAGEWIND_NO_LAUNCHER") || getenv("SAVAGEWIND_INPUT");  // tests boot straight in
     bool config = false;
