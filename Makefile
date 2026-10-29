@@ -158,23 +158,28 @@ CXXFLAGS := -O2 -g -std=c++17 -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime
 
 .DEFAULT_GOAL := all
 
-# AMD FidelityFX SDK 1.1.4 (third_party/FidelityFX, MIT): FSR 3 frame interpolation and optical flow on its Vulkan
-# backend (runtime/nvn/vulkan/framegen.cpp). Its sources unchanged, with ffx_compat.h for what MSVC's headers bring;
-# the shaders are tools/ffx_shaders.py's (third_party/FidelityFX/spirv).
+# AMD FidelityFX SDK 1.1.4 (third_party/FidelityFX, MIT): FSR 3 frame interpolation and optical flow
+# (runtime/nvn/vulkan/framegen.cpp) and the FSR 3 upscaler (runtime/nvn/vulkan/fsr3.cpp) on its Vulkan backend. Its
+# sources unchanged, with ffx_compat.h for what MSVC's headers bring; the shaders are tools/ffx_shaders.py's
+# (third_party/FidelityFX/spirv).
 FFX      := third_party/FidelityFX
 FFX_SRC  := $(FFX)/sdk/src/components/frameinterpolation/ffx_frameinterpolation.cpp \
-            $(FFX)/sdk/src/components/opticalflow/ffx_opticalflow.cpp $(FFX)/sdk/src/backends/vk/ffx_vk.cpp \
+            $(FFX)/sdk/src/components/opticalflow/ffx_opticalflow.cpp \
+            $(FFX)/sdk/src/components/fsr3upscaler/ffx_fsr3upscaler.cpp $(FFX)/sdk/src/backends/vk/ffx_vk.cpp \
             $(wildcard $(FFX)/sdk/src/shared/*.cpp)
 FFX_OBJ  := $(patsubst $(FFX)/sdk/src/%.cpp,$(B)/ffx/%.o,$(FFX_SRC))
 FFX_INC  := -I$(FFX)/sdk/include -I$(FFX)/sdk/src/components -I$(FFX)/sdk/src/shared -I$(FFX)/sdk/src/backends/shared
 ifneq ($(PLATFORM),macos)
 BACKEND_OBJ += $(FFX_OBJ)
+$(B)/rt/nvn/vulkan/fsr3.o: CXXFLAGS := -DSW_FSR3=1 -include $(FFX)/ffx_compat.h $(FFX_INC) $(CXXFLAGS)
 endif
 $(B)/ffx/%.o: $(FFX)/sdk/src/%.cpp $(FFX)/ffx_compat.h
 	@mkdir -p $(dir $@)
 	$(CXX) -O2 -g -std=c++17 -w -include $(FFX)/ffx_compat.h $(FFX_INC) -I$(FFX)/sdk/include/FidelityFX/gpu $(DEPINC) -c $< -o $@
-$(B)/rt/nvn/vulkan/framegen.o: CXXFLAGS += -include $(FFX)/ffx_compat.h $(FFX_INC) -I$(FFX)/spirv
-$(B)/rt/nvn/vulkan/framegen.o: $(FFX)/spirv/ffx_shaders_vk.h $(FFX)/ffx_compat.h
+# (the SDK's headers ahead of $(DEPINC)'s: another copy of them there, from a build of the SDK, has other context
+# sizes, and a context smaller than the SDK's own code writes overran the next one in memory)
+$(B)/rt/nvn/vulkan/framegen.o: CXXFLAGS := -include $(FFX)/ffx_compat.h $(FFX_INC) -I$(FFX)/spirv $(CXXFLAGS)
+$(B)/rt/nvn/vulkan/framegen.o: $(FFX)/spirv/ffx_shaders_vk.h $(FFX)/spirv/ffx_fsr3upscaler_vk.h $(FFX)/ffx_compat.h
 
 all: $(EXE) $(CONFIG_EXE) $(if $(strip $(GEN_SRC)),$(GAMELIB))  # (GEN_SRC is a space when there is no generated/)
 
@@ -396,8 +401,13 @@ $(B)/test_pc_settings: tests/test_pc_settings.c runtime/settings.c runtime/setti
 	@mkdir -p $(dir $@)
 	$(CC) -O1 -DSDL_STATIC_LIB $(OSFLAGS) $(DEPINC) -Iruntime -o $@ $< -lSDL3 -lm
 
-test-pc-controls: $(B)/test_pc_controls $(B)/test_pc_settings
+$(B)/test_options_pointer: tests/test_options_pointer.c runtime/pc_cursor.c runtime/pc_cursor.h runtime/pc_cursor_math.h
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -ffunction-sections -fdata-sections -DSDL_STATIC_LIB $(OSFLAGS) $(DEPINC) -Iruntime -isystem third_party -o $@ $< -fuse-ld=lld -Wl,--gc-sections $(if $(filter windows,$(PLATFORM)),-Wl$(comma)--exclude-all-symbols) -lSDL3 -lm
+
+test-pc-controls: $(B)/test_pc_controls $(B)/test_pc_settings $(B)/test_options_pointer
 	$(B)/test_pc_controls
+	$(B)/test_options_pointer
 	@set -e; f=$$(mktemp); trap 'rm -f "$$f"' EXIT; \
 	  env -u SAVAGEWIND_PC_CURSOR -u SAVAGEWIND_PC_BOW $(B)/test_pc_settings "$$f" 1 1; \
 	  env -u SAVAGEWIND_PC_CURSOR -u SAVAGEWIND_PC_BOW $(B)/test_pc_settings "$$f" 0 0; \
