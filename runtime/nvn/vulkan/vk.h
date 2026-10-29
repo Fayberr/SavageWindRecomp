@@ -99,6 +99,7 @@ typedef struct TexBackend {
     VkImageAspectFlags aspect;
     bool gpu_owned, uploaded, dynamic;
     bool slices_renderable;  // 3D image made 2D-array compatible: its slices are render targets
+    bool not_attachable;     // made without a color or depth/stencil attachment usage (vk_view: no render view)
     bool cube_ok;            // made cube compatible: cube and cube-array views allowed
     bool feedback_ok;        // made with VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT (sampled while it is rendered to)
     bool feedback_seen;      // a draw sampled it while writing it: its passes begin with the feedback loop enabled

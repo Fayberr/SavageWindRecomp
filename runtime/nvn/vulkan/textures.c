@@ -416,6 +416,7 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         depthfmt = false;
     }
     b->cube_ok = (ci.flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) != 0;
+    b->not_attachable = !(ci.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
     static uint64_t serials;
     b->serial = __atomic_add_fetch(&serials, 1, __ATOMIC_RELAXED);
     b->format = vf;
@@ -1290,6 +1291,20 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
     if (render && fmt != b->format && is_bc(b->format) && !is_bc(fmt) && lv0 == 0 && b->layers == 1 && b->depth == 1)
         return block_view(b, fmt);  // (drawn into through a view of its blocks)
     if (render) {
+        // A view to draw into must be of an image made to be drawn into, in a format that can be (the image's usage,
+        // the view format's features). Anything else, such as a compressed image's blocks the path above doesn't take
+        // (a level past the first, an array layer), is an invalid attachment: NVIDIA draws it or drops it, while Intel's
+        // Windows driver crashed in vkCmdBeginRendering on such a view (Arc B580 in 0.3.1, #247, where BOTW's NPC
+        // speech bubbles drew into a BC4 texture through such a view before the block image above existed). No view:
+        // begin_pass (exec.c) leaves that target out of the pass, its draws land nowhere, as for a missing target.
+        bool ds = b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+        if (b->not_attachable || (!ds && fmt != b->format && !format_supports(fmt, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))) {
+            static int nlog;
+            if (nlog++ < 20)
+                LOG("[vk] texture #%llu (nvn fmt %#x, %ux%ux%u target %u) can't be drawn into as format %d: left out of the pass\n",
+                    (unsigned long long)t->debug_id, t->format, t->width, t->height, t->depth, t->target, (int)fmt);
+            return VK_NULL_HANDLE;
+        }
         if (b->base_type == VK_IMAGE_VIEW_TYPE_3D) {
             // One slice of one level (the view's layer is the slice), as a 2D view of the 2D-array-compatible image.
             // BOTW renders the levels of its 3D noise and an 8x8x8 light volume slice by slice.

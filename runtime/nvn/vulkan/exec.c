@@ -1556,6 +1556,38 @@ static void begin_pass(void) {
     }
     if (!w) { pass_sx = pass_sy = 1; minw = minh = 16; }
     pass_w = minw; pass_h = minh;
+    {   // (debugging) SAVAGEWIND_LOG_NULL_VIEWS=1: each new shape of pass with a target slot that has no view
+        static int on = -1, nseen;
+        static uint32_t seen[64];
+        if (on < 0) on = getenv("SAVAGEWIND_LOG_NULL_VIEWS") != NULL;
+        uint32_t unbound = 0, noview = 0, vol = 0, lin = 0;
+        for (uint32_t i = 0; on && i < pass_ncolor && i < 8; i++) {
+            if (!st.rt.color[i]) unbound |= 1u << i;
+            else if (!ca[i].imageView) noview |= 1u << i;
+            else {
+                TexBackend *b = st.rt.color[i]->backend;
+                if (b && b->base_type == VK_IMAGE_VIEW_TYPE_3D) vol |= 1u << i;
+                if (st.rt.color[i]->flags & 0x40) lin |= 1u << i;
+            }
+        }
+        bool d_lost = on && st.rt.depth && !has_d && !has_s;
+        uint32_t key = pass_ncolor | unbound << 4 | noview << 12 | (uint32_t)d_lost << 20 | (uint32_t)has_d << 21 |
+                       (uint32_t)(vol != 0) << 22 | (uint32_t)(lin != 0) << 23 | (uint32_t)(pass_nblock != 0) << 24;
+        static int nvoid;
+        bool known = !on || (!unbound && !noview && !d_lost && w && !vol && !lin && !pass_nblock);
+        for (int k = 0; !known && k < nseen; k++) known = seen[k] == key;
+        if (on && !w && nvoid < 40) known = false, nvoid++;
+        if (!known && nseen < 64) {
+            seen[nseen++] = key;
+            LOG("[rt] frame %llu: pass of %u color (unbound %#x, no view %#x, 3D slice %#x, linear %#x, blocks %u), depth %s%s\n",
+                (unsigned long long)renderer_present_count(), pass_ncolor, unbound, noview, vol, lin, pass_nblock,
+                d_lost ? "without a view" : has_d ? "yes" : "no", w ? "" : ": nothing to draw into");
+            for (uint32_t i = 0; i < pass_ncolor && i < 8; i++)
+                if (noview >> i & 1)
+                    LOG("[rt]   slot %u: %ux%ux%u format %#x target %u\n", i, st.rt.color[i]->width, st.rt.color[i]->height,
+                        st.rt.color[i]->depth, st.rt.color[i]->format, st.rt.color[i]->target);
+        }
+    }
     // A pass with nothing to draw into: every color target without a view and no depth (BOTW draws into a 32x32x32
     // BC4 volume, whose blocks this backend can't render to). Its draws land nowhere, so it is not begun and they are
     // skipped: Intel's Windows driver (UHD 620, API 1.3.215) crashed in vkCmdBeginRendering on such a pass, a null
@@ -2730,6 +2762,13 @@ static VkPipeline gpl_stage_lib(StageBuild *b, int stage, const PipeState *s) {
     uint64_t have = atomic_load(&b->lib[variant]);
     if (have) return (VkPipeline)(uintptr_t)have;
     VkPipeline p = g_vk.pcache_pre ? gpl_shader_lib(b->m, stage, b->lib_layout, variant, g_vk.pcache_pre, true) : VK_NULL_HANDLE;
+    // (testing) SAVAGEWIND_LOG_LIBS=1: each shader library the precompiled shaders' cache did not have (precompile.c)
+    static int log_libs = -1;
+    if (log_libs < 0) log_libs = getenv("SAVAGEWIND_LOG_LIBS") != NULL;
+    if (!p && log_libs && g_vk.pcache_pre)
+        LOG("[vk] library not precompiled: %s variant %d, %u instructions%s%s%s\n", stage == STAGE_VERTEX ? "vertex" : "fragment",
+            variant, b->si->num_insts, b->si->mvec ? ", motion vector" : "", b->si->mvec_still ? ", still" : "",
+            b->si->mvec_mask ? ", reactive mask" : "");
     if (!p) p = gpl_shader_lib(b->m, stage, b->lib_layout, variant, g_vk.pcache, false);
     if (!p) return VK_NULL_HANDLE;
     uint64_t want = 0;
@@ -4524,6 +4563,7 @@ bool vk_pso_warm_stage(const ShaderInfo *si, int stage) {
     if (!cache) return false;
     StageBuild b;
     memset(&b, 0, sizeof b);
+    b.si = si;  // (stage_layouts reads it: a motion vector variant's layout has the push constants)
     b.m = warm_module(si, stage, b.binds, &b.nbinds, MAX_BIND);
     if (!b.m) return false;
     stage_layouts(&b, stage);
@@ -6793,14 +6833,12 @@ TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
                         lk[0], lk[1], lk[2], pc[20], pc[22], pc[21], pc[23], pc[24], pc[25], pc[26], pc[27]);
             }
             // The scene's per-object motion vectors (mvec.c: everything that moves, jitter taken out) when they were
-            // made this frame, at the depth's size: in place of the camera's and Link's box. Their .xy are clip-space
+            // made this frame, at the depth's size, with SAVAGEWIND_FG_OBJECT_VECTORS=1: in place of the camera's and Link's box. Their .xy are clip-space
             // NDC differences (y up, the image's y down), FSR's uv offset over the render size (-x / 2, y / 2), as for
             // the FSR 3 upscaler (fsr3_scene).
             bool objv = mvec_filled == renderer_present_count() && mvec_vectors_img && mvec_vectors_img->width == db->width &&
                         mvec_vectors_img->height == db->height;
-            static int no_obj = -1;  // (A/B) SAVAGEWIND_FG_CAMERA_VECTORS=1: the camera's (and Link's) vectors only
-            if (no_obj < 0) no_obj = getenv("SAVAGEWIND_FG_CAMERA_VECTORS") != NULL;
-            if (no_obj) objv = false;
+            if (!mvec_for_framegen()) objv = false;  // (the default: they break up foliage, mvec.c mvec_for_framegen)
             if (objv) mv = mvec_vectors_img;
             if (g_gpuprof_frame) gp_mark(cb, "frame generation: motion vectors");
             if (!objv) post_pass_pc(cb, "fg_mv.frag", &dv, 1, mv, pc, sizeof pc, false);
