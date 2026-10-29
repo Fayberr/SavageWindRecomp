@@ -141,6 +141,21 @@ class ConvertTests(unittest.TestCase):
         self.assertEqual(c.convert_tracker(be), le)
         self.assertEqual(c.convert_tracker(le), be)
 
+    def test_tracker_only_swaps_when_the_byte_order_changes(self):
+        be = bytes([0, 0x20, 0x2F, 0, 0x01, 0x2C, 0, 0, 0, 0, 0, 0x11]) + bytes([1, 2, 3, 4])
+        le = c.convert_tracker(be)
+        for src_e, to_e, track, want in (('>', '<', be, le), ('<', '>', le, be), ('<', '<', le, le), ('>', '>', be, be)):
+            with tempfile.TemporaryDirectory() as tmp:
+                os.makedirs(os.path.join(tmp, 'src', '0'))
+                os.makedirs(os.path.join(tmp, 'src', 'tracker'))
+                with open(os.path.join(tmp, 'src', '0', 'game_data.sav'), 'wb') as f:
+                    f.write(build(self.fmt, src_e, sample(src_e)))
+                with open(os.path.join(tmp, 'src', 'tracker', 'trackblock00.sav'), 'wb') as f:
+                    f.write(track)
+                _, out = c.convert_profile(os.path.join(tmp, 'src'), os.path.join(tmp, 'dst'), self.fmt, to_e,
+                                           None, 'convert', False, dry_run=True)
+                self.assertEqual(out['tracker/trackblock00.sav'], want, (src_e, to_e))
+
     def test_rejects_garbage(self):
         with self.assertRaises(ValueError):
             c.read_entries(b'\x00' * 40)

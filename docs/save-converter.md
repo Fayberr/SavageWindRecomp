@@ -51,7 +51,9 @@ Slots keep their number. The game decides which slot "Continue" loads.
 ## Tests
 
 `python tools/test_botw_save_convert.py` runs the tests, which build their flag table by hand and need no game files.
-Against real files the tool reproduces a Switch save byte for byte when converting Switch to Switch, and a published
-100% save in both Wii U and Switch versions agrees flag for flag after conversion, apart from flags that exist in
-only one revision and text flags (the other file stores those word-swapped; a native 1.9.0 save keeps text as plain bytes, so
-the tool does too).
+
+Against real files: converting a Switch save for Switch reproduces it byte for byte when it is already the target
+revision. A published 100% save exists in both a Wii U and a Switch version. Converting the Wii U one to Switch
+gives the same 349,508 of 349,538 flags (8 slots plus options) as converting the Switch one for the same game files; the other 30 are text
+flags, which that Switch file stores word-swapped (a native 1.9.0 save keeps text as plain bytes, so the tool does too).
+All 36 Hero's Path files, and the album and compendium pictures, come out identical to the other console's copy in both directions. A Switch save converted to the Wii U layout also loaded in Cemu without problems.

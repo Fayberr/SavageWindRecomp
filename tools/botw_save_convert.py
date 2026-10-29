@@ -385,6 +385,7 @@ def convert_profile(src, dst, fmt, to_endian, slots, tracker, overwrite, dry_run
     report.append('target: revision 0x%X, %s endian' % (fmt.revision, 'little' if to_endian == '<' else 'big'))
     todo = sorted(s for s in os.listdir(root) if s.isdigit() and (slots is None or int(s) in slots))
     results = {}
+    src_endian = None
 
     def emit(rel, data):
         results[rel] = data
@@ -395,6 +396,8 @@ def convert_profile(src, dst, fmt, to_endian, slots, tracker, overwrite, dry_run
         if not os.path.isfile(gd):
             continue
         report.append('slot %s' % slot)
+        if src_endian is None:
+            src_endian = detect_endian(_read(gd))
         emit('%s/game_data.sav' % slot, convert_flags(_read(gd), fmt, 'game_data.sav', to_endian, report))
         cap = os.path.join(d, 'caption.sav')
         if os.path.isfile(cap) and 'caption.sav' in fmt.files:
@@ -408,10 +411,12 @@ def convert_profile(src, dst, fmt, to_endian, slots, tracker, overwrite, dry_run
         emit('option.sav', convert_flags(_read(opt), fmt, 'option.sav', to_endian, report))
     trk = os.path.join(root, 'tracker')
     if tracker != 'skip' and os.path.isdir(trk):
-        report.append('tracker (%s)' % tracker)
+        # the swap only applies when the byte order changes; a Switch save converted for Switch stays as it is
+        swap = tracker == 'convert' and src_endian is not None and src_endian != to_endian
+        report.append('tracker (%s)' % ('convert' if swap else 'copy' if tracker == 'convert' else tracker))
         for n in sorted(os.listdir(trk)):
             b = _read(os.path.join(trk, n))
-            emit('tracker/' + n, convert_tracker(b) if tracker == 'convert' and len(b) % 4 == 0 else b)
+            emit('tracker/' + n, convert_tracker(b) if swap and len(b) % 4 == 0 else b)
     for extra in ('album', 'pict_book'):      # photos and compendium pictures: plain JPEG files
         folder = os.path.join(root, extra)
         if os.path.isdir(folder):
