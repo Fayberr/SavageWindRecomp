@@ -13,8 +13,8 @@ What is converted (see docs/save-converter.md for the format):
   <slot>/caption.sav     the metadata the load screen shows
   <slot>/caption.jpg     copied as is (a plain JPEG)
   option.sav             settings; only flags that exist on both sides are kept
-  tracker/               Hero's Path recording. Skipped by default (the game starts a new one); --tracker swap
-                         byte-swaps it per 32-bit word, which is experimental.
+  tracker/               Hero's Path recording, byte-swapped (--tracker skip leaves it out, copy copies it as is)
+  album/, pict_book/     photos and compendium pictures, copied as is
 
 Existing files in the destination are never overwritten: with --overwrite they are renamed to <name>.bak first.
 """
@@ -327,6 +327,15 @@ def _describe(h):
     return '0x%08X' % h
 
 
+def convert_tracker(b):
+    """One Hero's Path block (a fixed 64 KiB record, swapped in 32-bit words except the 8 byte header: four
+    plain bytes, then two 16-bit fields). The swap is its own inverse, so it works in both directions."""
+    if len(b) % 4:
+        raise ValueError('tracker block size is not a multiple of 4')
+    head = b[:4] + b[5:6] + b[4:5] + b[7:8] + b[6:7]
+    return head + b''.join(b[i:i + 4][::-1] for i in range(8, len(b), 4))
+
+
 def crc32_name(name):
     return zlib.crc32(name.encode()) & 0xFFFFFFFF
 
@@ -398,16 +407,18 @@ def convert_profile(src, dst, fmt, to_endian, slots, tracker, overwrite, dry_run
         report.append('options')
         emit('option.sav', convert_flags(_read(opt), fmt, 'option.sav', to_endian, report))
     trk = os.path.join(root, 'tracker')
-    if tracker == 'swap' and os.path.isdir(trk):
-        report.append('tracker (experimental word swap)')
+    if tracker != 'skip' and os.path.isdir(trk):
+        report.append('tracker (%s)' % tracker)
         for n in sorted(os.listdir(trk)):
             b = _read(os.path.join(trk, n))
-            if len(b) % 4:
-                continue
-            emit('tracker/' + n, b''.join(b[i:i + 4][::-1] for i in range(0, len(b), 4)))
-    elif tracker == 'copy' and os.path.isdir(trk):
-        for n in sorted(os.listdir(trk)):
-            emit('tracker/' + n, _read(os.path.join(trk, n)))
+            emit('tracker/' + n, convert_tracker(b) if tracker == 'convert' and len(b) % 4 == 0 else b)
+    for extra in ('album', 'pict_book'):      # photos and compendium pictures: plain JPEG files
+        folder = os.path.join(root, extra)
+        if os.path.isdir(folder):
+            names = [n for n in sorted(os.listdir(folder)) if n.lower().endswith('.jpg')]
+            report.append('%s: %d pictures copied' % (extra, len(names)))
+            for n in names:
+                emit('%s/%s' % (extra, n), _read(os.path.join(folder, n)))
     if not results:
         raise SystemExit('nothing to convert')
     if not dry_run:
@@ -425,7 +436,7 @@ def main(argv=None):
     ap.add_argument('--to', choices=('switch', 'wiiu'), default='switch',
                     help='target console, sets the byte order (default: switch, which Savage Wind uses)')
     ap.add_argument('--slots', default=None, help='comma separated slot numbers (default: all)')
-    ap.add_argument('--tracker', choices=('skip', 'swap', 'copy'), default='skip')
+    ap.add_argument('--tracker', choices=('convert', 'skip', 'copy'), default='convert')
     ap.add_argument('--overwrite', action='store_true', help='replace existing files (the old ones become .bak)')
     ap.add_argument('--dry-run', action='store_true', help='convert in memory and report, write nothing')
     a = ap.parse_args(argv)

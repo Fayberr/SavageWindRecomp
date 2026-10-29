@@ -135,6 +135,12 @@ class ConvertTests(unittest.TestCase):
         le = build(self.fmt, '<', sample('<'))
         self.assertEqual(self.run_convert(self.run_convert(le, '>'), '<'), le)
 
+    def test_tracker_header_and_body(self):
+        be = bytes([0, 0x20, 0x2F, 0, 0x01, 0x2C, 0, 0, 0, 0, 0, 0x11]) + bytes([1, 2, 3, 4])
+        le = bytes([0, 0x20, 0x2F, 0, 0x2C, 0x01, 0, 0, 0x11, 0, 0, 0]) + bytes([4, 3, 2, 1])
+        self.assertEqual(c.convert_tracker(be), le)
+        self.assertEqual(c.convert_tracker(le), be)
+
     def test_rejects_garbage(self):
         with self.assertRaises(ValueError):
             c.read_entries(b'\x00' * 40)

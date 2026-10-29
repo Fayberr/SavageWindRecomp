@@ -26,7 +26,7 @@ It never overwrites: files that already exist in the destination are skipped. `-
 ## What it does
 
 A save is a handful of small files per slot. `game_data.sav` holds every game flag, `caption.sav` the metadata the
-load screen shows, `caption.jpg` its picture; `option.sav` holds the settings and `tracker/` the Hero's Path.
+load screen shows, `caption.jpg` its picture; `option.sav` holds the settings, `tracker/` the Hero's Path, and `album/` and `pict_book/` the photos.
 
 The flag files are the same on both consoles apart from three things, and the tool handles each:
 
@@ -42,13 +42,16 @@ The flag files are the same on both consoles apart from three things, and the to
 `option.sav` is converted the same way, but the two consoles have different options, so settings that do not exist
 on both sides take the Switch default.
 
-`tracker/` is skipped by default and the game starts a new Hero's Path. `--tracker swap` byte-swaps it per 32-bit
-word, which looks right but is untested, and `--tracker copy` copies it unchanged.
+`tracker/` (the Hero's Path) is byte-swapped in 32-bit words, except its 8 byte header, which holds four plain bytes
+and two 16-bit fields. `album/` and `pict_book/` are plain JPEG files and are copied. `--tracker skip` leaves the
+Hero's Path out (the game starts a new one) and `--tracker copy` copies it unchanged.
 
 Slots keep their number. The game decides which slot "Continue" loads.
 
 ## Tests
 
 `python tools/test_botw_save_convert.py` runs the tests, which build their flag table by hand and need no game files.
-Against real files the tool reproduces a Switch save byte for byte when converting Switch to Switch, which checks
-the flag table, ordering and defaults.
+Against real files the tool reproduces a Switch save byte for byte when converting Switch to Switch, and a published
+100% save in both Wii U and Switch versions agrees flag for flag after conversion, apart from flags that exist in
+only one revision and text flags (the other file stores those word-swapped; a native 1.9.0 save keeps text as plain bytes, so
+the tool does too).
