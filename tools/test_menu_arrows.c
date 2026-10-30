@@ -2,6 +2,7 @@
 // Linux: clang -O1 -ffunction-sections -fdata-sections -Iruntime -isystem /tmp/sdl3-src/include \
 // tools/test_menu_arrows.c -Wl,--gc-sections -lm -lpthread -o /tmp/test_menu_arrows
 #include <assert.h>
+#include <pthread.h>
 #include <stdio.h>
 #include "../runtime/hle/input.c"
 
@@ -35,12 +36,32 @@ static void sample_state(int32_t x, int32_t y, int32_t rx, int32_t ry, uint64_t 
     if (ry > 16000) buttons |= 1ull << 21;
     if (rx > 16000) buttons |= 1ull << 22;
     if (ry < -16000) buttons |= 1ull << 23;
+    if (state[1] != buttons)
+        fprintf(stderr, "buttons: expected %#llx, got %#llx\n", (unsigned long long)buttons, (unsigned long long)state[1]);
     assert(state[1] == buttons);
     assert(*(int32_t *)((uint8_t *)state + 24) == rx);
     assert(*(int32_t *)((uint8_t *)state + 28) == ry);
 }
 
 static void sample(int32_t x, int32_t y, uint64_t buttons) { sample_state(x, y, 0, 0, buttons); }
+
+// Run with -fsanitize=thread too: keyboard events and guest polls belong to different threads.
+static _Atomic bool poll_ready, poll_start;
+static void *poll_enter(void *unused) {
+    (void)unused;
+    uint64_t state[5] = {0};
+    uint32_t id = 0;
+    Cpu c = {0};
+    c.x[0] = (uintptr_t)state;
+    c.x[1] = (uintptr_t)&id;
+    poll_ready = true;
+    while (!poll_start) {}
+    for (int i = 0; i < 50000; i++) {
+        fill_state(&c);
+        assert((state[1] & ~(1ull << BTN_A)) == 0);
+    }
+    return NULL;
+}
 
 int main(void) {
     g_bind_key[BIND_LS_UP] = SDL_SCANCODE_W;
@@ -126,35 +147,48 @@ int main(void) {
     recompute_keyboard();
     g_settings.dpad_move = false;
 
-    // Enter selects in the menus, like E (A), and never in play.
-    keys_down[SDL_SCANCODE_RETURN] = 1;
-    recompute_keyboard();
-    sample(0, 0, 0);  // gameplay
-    title = true;
-    sample(0, 0, 1ull << BTN_A);
-    title = false; paused = true;
-    sample(0, 0, 1ull << BTN_A);
-    keys_down[SDL_SCANCODE_KP_ENTER] = 1;
-    recompute_keyboard();
-    sample(0, 0, 1ull << BTN_A);  // keypad Enter too
-    keys_down[SDL_SCANCODE_KP_ENTER] = 0;
-    keys_down[SDL_SCANCODE_LALT] = 1;
-    recompute_keyboard();
-    sample(0, 0, 0);  // Alt+Enter is the fullscreen toggle, it must not also confirm
-    keys_down[SDL_SCANCODE_LALT] = 0;
-    captured = true;
-    sample(0, 0, 0);  // overlay, name entry or binding capture owns input
-    captured = false;
-    paused = false;
-    sample(0, 0, 0);  // closing a menu while holding Enter releases A
-    keys_down[SDL_SCANCODE_RETURN] = 0;
-    recompute_keyboard();
+    // Test each Enter on its own: holding Return must not hide a broken keypad fallback.
+    const int enters[] = {SDL_SCANCODE_RETURN, SDL_SCANCODE_KP_ENTER};
+    const int modifiers[] = {SDL_SCANCODE_LALT, SDL_SCANCODE_RALT, SDL_SCANCODE_LGUI, SDL_SCANCODE_RGUI};
+    for (int k = 0; k < 2; k++) {
+        keys_down[enters[k]] = 1;
+        recompute_keyboard();
+        sample(0, 0, 0);  // gameplay
+        title = true;
+        sample(0, 0, 1ull << BTN_A);
+        title = false; paused = true;
+        sample(0, 0, 1ull << BTN_A);
+        for (int m = 0; m < 4; m++) {
+            keys_down[modifiers[m]] = 1;
+            recompute_keyboard();
+            sample(0, 0, 0);  // fullscreen modifiers must not also confirm
+            keys_down[modifiers[m]] = 0;
+            recompute_keyboard();
+            sample(0, 0, 1ull << BTN_A);
+        }
+        captured = true;
+        sample(0, 0, 0);  // overlay, name entry or binding capture owns input
+        captured = false;
+        paused = false;
+        sample(0, 0, 0);  // closing a menu while holding Enter releases A
+        paused = true;
+        sample(0, 0, 1ull << BTN_A);  // held behavior matches E when a menu opens again
+        input_reset();
+        sample(0, 0, 0);
+        test_keys[enters[k]] = 1;
+        recompute_keyboard();
+        sample(0, 0, 1ull << BTN_A);  // scripted keys publish through the same path
+        test_keys[enters[k]] = 0;
+        recompute_keyboard();
+        sample(0, 0, 0);
+        paused = false;
+    }
 
-    // A binding in any slot claims Enter, including buttons, sticks, walk and tilt.
-    for (int slot = 0; slot < BIND_KEY_COUNT; slot++) {
+    // A binding claims only that Enter; the other Enter must keep its menu fallback.
+    for (int k = 0; k < 2; k++) for (int slot = 0; slot < BIND_KEY_COUNT; slot++) {
         int16_t old = g_bind_key[slot];
-        g_bind_key[slot] = SDL_SCANCODE_RETURN;
-        keys_down[SDL_SCANCODE_RETURN] = 1;
+        g_bind_key[slot] = enters[k];
+        keys_down[enters[k]] = 1;
         recompute_keyboard();
         int32_t x = slot == BIND_LS_LEFT ? -32767 : slot == BIND_LS_RIGHT ? 32767 : 0;
         int32_t y = slot == BIND_LS_DOWN ? -32767 : slot == BIND_LS_UP ? 32767 : 0;
@@ -166,11 +200,45 @@ int main(void) {
         paused = false;
         sample_state(x, y, rx, ry, buttons);  // the binding also works in gameplay
         paused = true;
+        keys_down[enters[1 - k]] = 1;
+        recompute_keyboard();
+        sample_state(x, y, rx, ry, buttons | (1ull << BTN_A));
+        keys_down[enters[k]] = 0;
+        recompute_keyboard();
+        sample(0, 0, 1ull << BTN_A);  // only the unbound Enter is held
+        paused = false;
+        sample(0, 0, 0);
         g_bind_key[slot] = old;
-        keys_down[SDL_SCANCODE_RETURN] = 0;
+        keys_down[enters[1 - k]] = 0;
         input_reset();
     }
+
+    // Polls consume published state, not keyboard arrays owned by the event producer.
+    paused = true;
+    keys_down[SDL_SCANCODE_RETURN] = 1;
+    sample(0, 0, 0);
+    recompute_keyboard();
+    sample(0, 0, 1ull << BTN_A);
+    keys_down[SDL_SCANCODE_RETURN] = 0;
+    sample(0, 0, 1ull << BTN_A);
+    recompute_keyboard();
+    sample(0, 0, 0);
+
+    pthread_t poller;
+    int err = pthread_create(&poller, NULL, poll_enter, NULL);
+    assert(err == 0);
+    while (!poll_ready) {}
+    poll_start = true;
+    for (int i = 0; i < 50000; i++) {
+        keys_down[SDL_SCANCODE_RETURN] = i & 1;
+        keys_down[SDL_SCANCODE_LALT] = (i >> 1) & 1;
+        recompute_keyboard();
+    }
+    err = pthread_join(poller, NULL);
+    assert(err == 0);
+    input_reset();
+    sample(0, 0, 0);
     paused = false;
-    puts("menu arrows and Enter: gating, directions, binding priority, reset and held-key transitions passed");
+    puts("menu arrows and Enter: gating, independent bindings, reset and concurrent publication passed");
     return 0;
 }
