@@ -101,8 +101,9 @@ the data folder actually in use. `SAVAGEWIND_SAVE_DIR`, when set for a test run,
 To back up your progress or move it to another Savage Wind installation, close the game and copy the **whole
 `save` folder**, including `save_0` and its contents. Keep a backup of the destination's saves before replacing them.
 
-Played on the Wii U or in Cemu? [Converting Wii U / Cemu saves](docs/save-converter.md) turns that save into one
-Savage Wind can load.
+Played on the Wii U or in Cemu? Savage Wind Configuration can import that save: open **Settings > Saves** and choose
+**Import from Wii U / Cemu...**. It backs up your current saves first and asks before it replaces them. See
+[Importing Wii U / Cemu saves](docs/save-converter.md).
 
 ## What you need
 

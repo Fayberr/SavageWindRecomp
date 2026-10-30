@@ -1,34 +1,60 @@
-# Converting Wii U / Cemu saves
+# Importing Wii U / Cemu saves
 
-`tools/botw_save_convert.py` turns a Breath of the Wild save from the Wii U (for example one played in Cemu) into a
-save Savage Wind can load. It also converts between Switch revisions, and back to the Wii U layout (`--to wiiu`).
-It needs Python 3 and nothing else. It reads only your own files and ships no game data.
+Savage Wind Configuration can import a *Breath of the Wild* save from the Wii U, or one played in Cemu, and turn it into
+a save Savage Wind can load. You do not need Python or a terminal. It reads only your own files and ships no game data.
 
 ## Use it
 
-1. Close the game and Savage Wind Configuration, and keep a copy of the save you convert.
-2. Find the Wii U profile folder. In Cemu it is
+1. Close the game and open **Savage Wind Configuration**. Go to **Settings > Saves**. The tab is only on the start
+   screen, not in the in-game menu, because the game must not be running while its saves change.
+2. Choose **Import from Wii U / Cemu...** and pick the Wii U profile folder. In Cemu it is
    `mlc01/usr/save/00050000/<title id>/user/80000001`, the folder with the numbered slots `0`, `1`, ... and
-   `option.sav`. The tool also finds it when you give it a folder above.
-3. Run it from the Savage Wind folder (the one with `extracted/`), writing into a save folder:
+   `option.sav`. A folder above it works too: the importer looks up to seven levels down and prefers a Wii U save to
+   anything else it finds.
+3. The save is converted into a new folder next to your `save` folder. Your saves are not touched yet. When that is done,
+   a question names the backup folder and shows which slots come in. Choose **Import**, or **Cancel** to leave
+   everything as it is (the converted copy is removed again).
+4. Your current `save` folder is moved whole to `save-backups/save-<date>-<time>`, next to `save`. The converted save
+   takes its place, and whatever else the old folder held besides `save_0` (the `sdcard` folder) is copied back.
+   Nothing is deleted.
+5. The tab shows what was imported: the slots, how many flags were kept, set to their defaults or dropped, and how
+   many Hero's Path blocks, album pictures and compendium pictures came along. The slot list below it is read again.
 
-   ```
-   python tools/botw_save_convert.py --src <Cemu profile folder> --dst save/save_0
-   ```
+The import replaces the whole of `save_0` (all slots, `option.sav`, the Hero's Path, the album and the compendium
+pictures), not just some files in it. Mixing slots of two games would give a Hero's Path that does not match the save.
+To go back to what you had: close the game, rename `save` to something else, and rename the backup folder to `save`.
 
-   `--bootup` picks another `Pack/Bootup.pack` (default `extracted/romfs/Pack/Bootup.pack`), `--slots 0,2` converts
-   only some slots, and `--dry-run` converts in memory and only reports.
-4. Start Savage Wind and continue from the title screen.
+The other two buttons: **Back up saves** copies the whole `save` folder to a new dated folder in `save-backups`
+and leaves the saves where they are, and **Open save folder** opens it in your file manager.
 
-It never overwrites: files that already exist in the destination are skipped. `--overwrite` renames them to
-`<name>.bak-<time>` first.
+The slot list shows each slot's picture (`caption.jpg`, on the right while the row is selected), when the game wrote the
+slot (the file time of its `caption.sav`) and the play time, if the save's `caption.sav` has a `PlayTime` flag. The
+importer keeps the file times of the Wii U files, so an imported slot shows the date it was saved on the Wii U.
+
+It needs your game files set up: the importer reads the flag tables from `Pack/Bootup.pack` in them (see below).
+
+## When it does not work
+
+Each of these ends with "Nothing was changed.", and your saves are exactly as they were:
+
+- **No Breath of the Wild save found in that folder.** Pick the folder with the numbered slots, or one above it.
+- **That is a Switch save already.** Switch saves are used as they are: copy their files into the save folder instead.
+- **A save file is damaged or incomplete.** The message names the file. A half-copied save lands here.
+- **The game files weren't found / can't be read.** Set up the game files on the start screen first.
+- **The save folder is a link.** Moving a link would move the link, not the saves, so the importer stops.
+- **Files could not be read or written.** Close anything that has the save folder open (a file manager window, a
+  backup program) and try again.
+
+If the last step fails after the old folder has been moved, the move is undone. In the rare case that cannot be undone
+either, the message says "The import stopped halfway" and names the backup folder: rename it to `save` to get your
+saves back.
 
 ## What it does
 
 A save is a handful of small files per slot. `game_data.sav` holds every game flag, `caption.sav` the metadata the
 load screen shows, `caption.jpg` its picture; `option.sav` holds the settings, `tracker/` the Hero's Path, and `album/` and `pict_book/` the photos.
 
-The flag files are the same on both consoles apart from three things, and the tool handles each:
+The flag files are the same on both consoles apart from three things, and the importer handles each:
 
 - **Byte order.** The Wii U is big endian, the Switch little endian. Every 32-bit value is swapped. Text flags are
   stored as plain bytes and are not swapped.
@@ -43,14 +69,47 @@ The flag files are the same on both consoles apart from three things, and the to
 on both sides take the Switch default.
 
 `tracker/` (the Hero's Path) is byte-swapped in 32-bit words, except its 8 byte header, which holds four plain bytes
-and two 16-bit fields. `album/` and `pict_book/` are plain JPEG files and are copied. `--tracker skip` leaves the
-Hero's Path out (the game starts a new one) and `--tracker copy` copies it unchanged.
+and two 16-bit fields. `album/` and `pict_book/` are plain JPEG files and are copied.
 
 Slots keep their number. The game decides which slot "Continue" loads.
 
+The code is in `runtime/services/save_convert.c` (the importer, with no SDL in it), `runtime/services/archive.c` (the
+Yaz0 and SARC readers it shares with `fs.c`) and `runtime/ui/saves_tab.mm` (the tab). The conversion runs on a worker
+thread, so the start screen is not held up while it reads the game's tables and writes the files.
+
+## The Python tool
+
+`tools/botw_save_convert.py` does the same conversion from a terminal. It is the reference the importer follows and the
+test oracle for it, and it can do two things the tab does not offer: convert a Switch save back to the Wii U layout
+(`--to wiiu`) and choose slots (`--slots 0,2`) or leave the Hero's Path out (`--tracker skip`). It needs Python 3 and
+nothing else.
+
+```
+python tools/botw_save_convert.py --src <Cemu profile folder> --dst save/save_0
+```
+
+`--bootup` picks another `Pack/Bootup.pack` (default `extracted/romfs/Pack/Bootup.pack`) and `--dry-run` converts in
+memory and only reports. The tool never overwrites: files that already exist in the destination are skipped, and
+`--overwrite` renames them to `<name>.bak-<time>` first. It does not make backups of the whole folder; the tab does.
+
 ## Tests
 
-`python tools/test_botw_save_convert.py` runs the tests, which build their flag table by hand and need no game files.
+`python tools/test_botw_save_convert.py` runs the tests of the Python tool, which build their flag table by hand and
+need no game files.
+
+`make test-save-convert` (or `python3 tools/test_save_convert.py`) builds the importer into a test program and compares it
+with the Python tool: both convert synthetic saves made against a small `Bootup.pack` built by hand, and every output
+file has to match byte for byte, along with the per-file flag counts. It also covers the refusals (no save, a Switch
+save, damaged saves, a missing or broken `Bootup.pack`), folders with non-ASCII names, and the safety of the backup,
+the swap and its rollback. No game files are needed.
+
+With your own files, the same script compares both implementations on your real save:
+
+```
+python3 tools/test_save_convert.py --src <Cemu profile folder> --bootup <Pack/Bootup.pack>
+```
+
+Nothing is written outside a temporary folder that is removed afterwards.
 
 Against real files: converting a Switch save for Switch reproduces it byte for byte when it is already the target
 revision. A published 100% save exists in both a Wii U and a Switch version. Converting the Wii U one to Switch
