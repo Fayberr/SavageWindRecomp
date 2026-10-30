@@ -341,7 +341,7 @@ def run_python(src, bootup, dst):
 def run_c(exe, src, bootup, dst, extra=()):
     """-> (files or None, stats, counts, error text, exit code)"""
     p = subprocess.run([exe, 'convert', '--src', src, '--bootup', bootup, '--dst', dst, *extra],
-                       capture_output=True, text=True, encoding='utf-8')
+                       capture_output=True, text=True, encoding='utf-8', errors='replace')
     if p.returncode != 0:
         line = [x for x in p.stdout.splitlines() if x.startswith('RESULT')]
         return None, {}, {}, (line[0] if line else 'C: no result: ' + p.stderr[:300]), p.returncode
@@ -480,9 +480,13 @@ def synthetic(r):
     r.both('ten slots (names sort as text)', make_profile(os.path.join(tmp, 'many'), seed=3, slots=tuple(range(11)),
                                                           tracker=False, extras=False), boot)
 
-    uni = os.path.join(tmp, 'Spielstände 日本語 ñ')
-    make_profile(os.path.join(uni, 'user', '80000001'), seed=1)
-    r.both('folders with non-ASCII names', uni, boot, tag='unicode')
+    if sys.platform == 'win32':
+        # the game's .exe reads UTF-8 paths (runtime/platform/windows.manifest); this test program has no such manifest
+        print('SKIP  folders with non-ASCII names (this test program has no UTF-8 manifest like the game\'s .exe)')
+    else:
+        uni = os.path.join(tmp, 'Spielstände 日本語 ñ')
+        make_profile(os.path.join(uni, 'user', '80000001'), seed=1)
+        r.both('folders with non-ASCII names', uni, boot, tag='unicode')
 
     # the game's own revision differs: more flags in the target, fewer in the old one (already covered); another revision number
     boot2 = os.path.join(tmp, 'Bootup2.pack')

@@ -11,6 +11,11 @@
 //               backup   the Back up saves button
 // Output: lines "KEY value" for the script to read (KIND is the Kind enum, CODE an ScCode); exit status 1 when the tab
 // itself misbehaved.
+#ifdef _WIN32
+#include <direct.h>  // _mkdir
+#include <stdlib.h>  // _putenv_s
+#include <windows.h>
+#endif
 #include <chrono>
 #include <thread>
 
@@ -28,10 +33,19 @@ uint64_t vk_imgui_texture_rgba(const void *, int, int) { return 1000 + (uint64_t
 void vk_imgui_texture_free(uint64_t) { g_freed++; }
 const char *rt_data_root(void) { return "."; }
 bool rt_is_link(const char *p) {
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(p);  // (a junction or symlink is a reparse point)
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_REPARSE_POINT);
+#else
     struct stat st;
     return lstat(p, &st) == 0 && S_ISLNK(st.st_mode);
+#endif
 }
+#ifdef _WIN32
+bool SDL_CreateDirectory(const char *p) { return _mkdir(p) == 0 || errno == EEXIST; }
+#else
 bool SDL_CreateDirectory(const char *p) { return mkdir(p, 0755) == 0 || errno == EEXIST; }
+#endif
 void SDL_ShowOpenFolderDialog(SDL_DialogFileCallback, void *, SDL_Window *, const char *, bool) { g_dialog_opened++; }
 }
 void reveal_folder(const std::string &dir) { printf("REVEAL %s\n", dir.c_str()); }
@@ -179,7 +193,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: test_saves_tab jpeg <path> | import|cancel|pick|backup --save <dir> --game <dir> [--src <dir>]\n");
         return 2;
     }
+#ifdef _WIN32
+    _putenv_s("SAVAGEWIND_SAVE_DIR", save.c_str());
+#else
     setenv("SAVAGEWIND_SAVE_DIR", save.c_str(), 1);
+#endif
     saves_tab_set_game_files(game.c_str());
     ImGui::CreateContext();
     g_io = &ImGui::GetIO();
