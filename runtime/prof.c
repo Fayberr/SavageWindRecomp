@@ -64,7 +64,6 @@ static atomic_uint next_chunk;
 
 static uint64_t ticks0, ns0, ticks1, ns1, unix0;
 static char last_file[256];
-static uint64_t last_records;
 
 uint32_t prof_register(ProfSite *s) {
     pthread_mutex_lock(&site_lock);
@@ -352,7 +351,6 @@ static void *writer_main(void *arg) {
         LOG("[prof] wrote %s: %llu events, %u threads, %.2f s\n", path, (unsigned long long)records, nt,
             (double)(ns1 - ns0) / 1e9);
     }
-    last_records = records;
     // back to zero for the next capture (only what was used)
     memset(pool, 0, (size_t)used * CHUNK_RECS * sizeof(ProfRec));
     atomic_store(&state, IDLE);
