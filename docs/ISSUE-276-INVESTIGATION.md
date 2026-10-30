@@ -154,6 +154,58 @@ The optimized scanner remains an ignored benchmark prototype under
 is a small Windows-specific scanner change. Background scanning and a shared
 cache are still useful to keep the window responsive on slower filesystems.
 
+### Tradeoffs
+
+For a stable installation, native Windows enumeration preserved the measured
+logical byte total and link exclusions. The change requires Windows-specific
+code and regression coverage for path encoding, permissions and reparse points.
+Microsoft documents that directory attribute information may occasionally lag
+on a busy NTFS filesystem. A displayed total can therefore be briefly stale
+while files are changing. It must remain an informational estimate; deletion
+must continue using the existing independent path validation.
+[FindFirstFileEx remarks](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findfirstfileexa#remarks).
+Neither the old recursive traversal nor this prototype is an atomic snapshot of
+a directory being modified concurrently.
+
+## Linux and macOS follow-up
+
+On POSIX, `is_link()` calls `lstat()` and `tree_size()` then calls `stat()` for
+the same non-link entry. One `lstat()` can provide both type and size while still
+skipping symlinks. Linux `readdir()` entries do not provide file size, so the
+Windows technique cannot be transferred directly.
+[Linux readdir](https://man7.org/linux/man-pages/man3/readdir.3.html),
+[Linux stat/lstat](https://man7.org/linux/man-pages/man2/stat.2.html).
+
+An Oracle ARM64 Linux/ext4 benchmark used a synthetic tree containing 41,067
+files in 874 counted directories. It excluded an unrelated top-level directory
+and a symlink to an outside directory. Sparse files had varying logical lengths;
+all methods returned exactly 1,970,118 bytes. This is not the Windows game tree
+and does not establish a cross-platform hardware or filesystem comparison.
+
+After warming all three methods, six passes alternated forward/reverse method
+order. Median traversal times were:
+
+| Implementation | Median | Speedup over upstream |
+| --- | ---: | ---: |
+| Actual upstream size function | 127.831 ms | 1.00x |
+| Single `lstat()` per entry | 86.729 ms | 1.47x |
+| Directory-relative `fstatat()`, one lookup per entry | 70.417 ms | 1.82x |
+
+The relative prototype uses `AT_SYMLINK_NOFOLLOW` and opens child directories
+with `openat()`/`O_NOFOLLOW`. The improvement is real in this warmed synthetic
+test but much smaller than the measured Windows gain. Cold metadata, network
+filesystems and the actual game tree on Linux remain unmeasured. The prototypes
+and logs are ignored under `build/probe/posix/`.
+
+macOS offers `getattrlistbulk()` to fetch directory-entry attributes in batches,
+which is a similar opportunity to the native Windows approach. File logical
+data length is available as `ATTR_FILE_DATALENGTH`; a production implementation
+must check the returned attribute mask and handle unsupported attributes or
+filesystems. This API is documented, but no macOS prototype or speed measurement
+was made, so no multiplier is claimed.
+[Apple bulk-attribute manual](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/getattrlistbulk.2),
+[Apple file-attribute manual](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/getattrlist.2).
+
 ## Recommended fix and verification
 
 Run size enumeration on a worker and expose a shared cached result to both
@@ -175,7 +227,7 @@ For a fix, verify both page orders, first and repeat opens, empty and populated
 roots, and that event processing continues while a deliberately slow scan is
 running. Verify cache invalidation during setup/deletion/DLC changes and that
 an old worker cannot publish into a new root/session. Check worker shutdown and
-thread-creation failure. Linux and macOS behavior remains unmeasured.
+thread-creation failure. Linux and macOS launcher behavior remains unmeasured.
 
 ## Local evidence
 
