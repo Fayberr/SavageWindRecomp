@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utime.h>
 
 #include "../platform.h"
 #include "archive.h"
@@ -218,6 +219,15 @@ static bool write_file(const char *path, const void *d, size_t n, MadeList *made
     return ok;
 }
 
+// A written copy keeps the date of the file it comes from: the Saves tab shows when a slot was saved, and that is the
+// file time of caption.sav (an import would otherwise date every slot with the moment of the import)
+static void keep_time(const char *from, const char *to) {
+    struct stat st;
+    if (stat(from, &st) != 0) return;
+    struct utimbuf t = {st.st_atime, st.st_mtime};
+    utime(to, &t);
+}
+
 static bool copy_file(const char *from, const char *to, MadeList *made, ScReport *r) {
     FILE *in = fopen(from, "rb");
     if (!in) { fail(r, SC_IO, "%s: %s", from, strerror(errno)); return false; }
@@ -234,6 +244,7 @@ static bool copy_file(const char *from, const char *to, MadeList *made, ScReport
     ok = fclose(out) == 0 && ok;
     if (read_bad) { fail(r, SC_IO, "%s: read error", from); return false; }
     if (!ok) { fail(r, SC_IO, "%s: could not be written (disk full?)", to); return false; }
+    keep_time(from, to);
     r->n_written++;
     return true;
 }
@@ -799,24 +810,53 @@ static bool looks_like_profile(const char *p) {
     return yes;
 }
 
-static bool find_profile(const char *dir, int depth, int *visits, char *root, size_t cap) {
-    if (++*visits > PROFILE_VISITS) return false;
-    if (looks_like_profile(dir)) return snprintf(root, cap, "%s", dir) < (int)cap;
-    if (depth >= PROFILE_DEPTH) return false;
+// Whether the first slot of a profile is in the Wii U's byte order (the revision in the header is a small number)
+static bool profile_is_big_endian(const char *p) {
     int n;
-    char **v = names_list(dir, &n);
-    bool found = false;
-    for (int i = 0; v && i < n && !found; i++) {
-        char sub[PATH_CAP];
-        if (path_join(sub, sizeof sub, dir, v[i]) && is_dir(sub)) found = find_profile(sub, depth + 1, visits, root, cap);
+    char **v = names_list(p, &n);
+    bool be = false;
+    for (int i = 0; v && i < n; i++) {
+        char f[PATH_CAP], g[PATH_CAP];
+        uint8_t head[4];
+        if (!all_digits(v[i]) || !path_join(f, sizeof f, p, v[i]) || !path_join(g, sizeof g, f, "game_data.sav") || !is_file(g))
+            continue;
+        FILE *fp = fopen(g, "rb");
+        if (fp && fread(head, 1, 4, fp) == 4) be = rd32(head, false) < 0x10000 && rd32(head, true) >= 0x10000;
+        if (fp) fclose(fp);
+        break;
     }
     if (v) names_free(v, n);
-    return found;
+    return be;
+}
+
+// What the search found: the first Wii U profile, else the first profile of any kind (so that a Switch save can be
+// told apart from no save, and a folder holding both Savage Wind's own saves and a Cemu profile finds the latter)
+typedef struct { int visits; bool have_be, have_any; char be[PATH_CAP], any[PATH_CAP]; } Search;
+
+static void find_profile(const char *dir, int depth, Search *s) {
+    if (s->have_be || ++s->visits > PROFILE_VISITS) return;
+    if (looks_like_profile(dir)) {
+        if (profile_is_big_endian(dir)) s->have_be = snprintf(s->be, sizeof s->be, "%s", dir) < (int)sizeof s->be;
+        else if (!s->have_any) s->have_any = snprintf(s->any, sizeof s->any, "%s", dir) < (int)sizeof s->any;
+        return;
+    }
+    if (depth >= PROFILE_DEPTH) return;
+    int n;
+    char **v = names_list(dir, &n);
+    for (int i = 0; v && i < n && !s->have_be; i++) {
+        char sub[PATH_CAP];
+        if (path_join(sub, sizeof sub, dir, v[i]) && is_dir(sub)) find_profile(sub, depth + 1, s);
+    }
+    if (v) names_free(v, n);
 }
 
 ScCode sc_find_profile(const char *dir, char *root, size_t cap) {
-    int visits = 0;
-    return find_profile(dir, 0, &visits, root, cap) ? SC_OK : SC_NO_SAVE;
+    Search *s = calloc(1, sizeof *s);
+    find_profile(dir, 0, s);
+    const char *found = s->have_be ? s->be : s->have_any ? s->any : NULL;
+    if (found) snprintf(root, cap, "%s", found);
+    free(s);
+    return found ? SC_OK : SC_NO_SAVE;
 }
 
 // ------------------------------------------------------------------ converting a profile
@@ -869,7 +909,7 @@ static bool convert_one(const char *from, const char *to, const char *rel, const
     }
     bool ok = write_file(to, out.p, out.n, made, r);
     free(out.p);
-    if (ok) report_add_file(r, rel, &st);
+    if (ok) keep_time(from, to), report_add_file(r, rel, &st);
     return ok;
 }
 
@@ -900,6 +940,7 @@ static bool copy_folder(const char *from, const char *to, bool pictures_only, bo
             if (!blk) { fail(r, SC_IO, "%s", why); ok = false; break; }
             if (sz % 4 == 0 && sz >= 8) convert_tracker(blk, sz);  // (an odd-sized file is copied as it is)
             ok = write_file(b, blk, sz, made, r);
+            if (ok) keep_time(a, b);
             free(blk);
             if (ok) (*count)++;
         } else {
@@ -1045,6 +1086,10 @@ ScCode sc_stage_install(ScStage *st, const char *save_dir, const char *backup_di
     r->code = SC_OK;
     bool had = exists(save_dir);
     if (had && !is_dir(save_dir)) { fail(r, SC_IO, "%s: not a folder", save_dir); return r->code; }
+#ifndef _WIN32
+    struct stat ls;  // (renaming a link moves the link, not the saves it points to; Windows junctions: the caller checks)
+    if (had && lstat(save_dir, &ls) == 0 && S_ISLNK(ls.st_mode)) { fail(r, SC_LINKED, "%s", save_dir); return r->code; }
+#endif
     if (had) {
         if (exists(backup_dir)) { fail(r, SC_IO, "%s: exists already", backup_dir); return r->code; }
         if (!parent_dirs(backup_dir, NULL, r)) return r->code;
@@ -1055,9 +1100,10 @@ ScCode sc_stage_install(ScStage *st, const char *save_dir, const char *backup_di
     }
     if (rename(st->dir, save_dir) != 0) {
         int err = errno;
-        if (had && rename(backup_dir, save_dir) != 0)
-            fail(r, SC_IO, "%s could not be put in place (%s) and the saves are in %s", st->dir, strerror(err), backup_dir);
-        else
+        if (had && rename(backup_dir, save_dir) != 0) {
+            fprintf(stderr, "[saves] %s could not be put in place (%s) and %s could not be put back\n", st->dir, strerror(err), backup_dir);
+            fail(r, SC_MOVED, "%s", backup_dir);
+        } else
             fail(r, SC_IO, "%s: %s", st->dir, strerror(err));
         return r->code;
     }

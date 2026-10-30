@@ -28,6 +28,7 @@ typedef enum {
     SC_BAD_BOOTUP,    // Pack/Bootup.pack can't be read or lacks the flag tables (detail: why)
     SC_IO,            // a file or folder couldn't be read, written or moved (detail: which and why)
     SC_LINKED,        // the save folder is a link: moving it would move the link
+    SC_MOVED,         // sc_stage_install stopped halfway and could not undo it: the saves are in the backup (detail: it)
 } ScCode;
 
 // One converted flag file: what it held and what became of it
@@ -65,7 +66,8 @@ uint32_t sc_format_revision(const ScFormat *f);
 enum { SC_ALLOW_SWITCH = 1 };  // (tests) a little-endian source is converted for its revision instead of refused
 
 // The profile folder in dir: dir itself if it holds numbered slot folders with a game_data.sav, else the first folder
-// below it (up to 7 levels, in name order) that does. SC_NO_SAVE otherwise.
+// below it (up to 7 levels, in name order) that does; one in the Wii U's byte order is preferred to any other. SC_NO_SAVE
+// otherwise.
 ScCode sc_find_profile(const char *dir, char *root, size_t cap);
 
 typedef struct ScStage ScStage;
