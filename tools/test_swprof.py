@@ -7,6 +7,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 import swprof  # noqa: E402
@@ -14,14 +15,17 @@ import swprof  # noqa: E402
 TPM = 1000  # ticks per ms: the header's two clocks run 1000 ticks per 1e6 ns
 
 
-def build(sites, threads, records):
-    """sites {id: name}; threads [name]; records [(thread, t0, t1, val, site, kind)] in ticks."""
+def build(sites, threads, records, modules=()):
+    """sites {id: name}; threads [name]; records [(thread, t0, t1, val, site, kind)] in ticks;
+    modules [(base, size, bias, kind, name)]."""
     body = b''
     for sid, name in sites.items():
         n = name.encode()
         body += struct.pack('<IH', sid, len(n)) + n
     for i, name in enumerate(threads):
         body += swprof.THREAD.pack(i, 0, 100 + i, name.encode())
+    for base, size, bias, kind, name in modules:
+        body += swprof.MODULE.pack(base, size, bias, kind, name.encode())
     by_thread = {}
     for r in records:
         by_thread.setdefault(r[0], []).append(r)
@@ -32,7 +36,7 @@ def build(sites, threads, records):
             chunks += swprof.REC.pack(a, b, val, site, kind)
     end_ticks = max(r[2] for r in records) + 10
     header = swprof.HEADER.pack(b'SWPROF01', 1, swprof.REC.size, 0, 0, end_ticks, end_ticks * 1000000 // TPM,
-                                1700000000, len(sites), len(threads), len(by_thread), 0)
+                                1700000000, len(sites), len(threads), len(by_thread), len(modules))
     return header + body + chunks
 
 
@@ -136,6 +140,76 @@ class SwprofTest(unittest.TestCase):
             fh.write(b'\0' * 200)
         with self.assertRaises(SystemExit):
             swprof.Capture(bad)
+
+
+GAME, RUNTIME, OTHER = 0x10000000, 0x20000000, 0x30000000
+MODULES = [(GAME, 0x1000, GAME, swprof.MOD_GAME, 'game.dll'), (RUNTIME, 0x1000, RUNTIME, swprof.MOD_RUNTIME, 'swr.exe'),
+           (OTHER, 0x1000, OTHER, swprof.MOD_OTHER, 'driver.dll')]
+
+
+class SamplerTest(unittest.TestCase):
+    """100 ms of one thread ("main", os id 100), a sample every ms: 60 in game code, 10 in the runtime, 10 in the driver
+    called from the runtime, and 20 inside a "kernel wait" zone (those would be in game code otherwise)."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        sites = {1: 'kernel wait'}
+        recs = [(0, 0, 0, 0, 0, swprof.FRAME), (0, 100 * TPM, 0, 1, 0, swprof.FRAME),
+                (0, 80 * TPM, 100 * TPM, 0, 1, swprof.ZONE)]
+        for ms in range(100):
+            if ms < 60 or ms >= 80:
+                stack = [GAME + 0x10, GAME + 0x20, RUNTIME + 0x300]
+            elif ms < 70:
+                stack = [RUNTIME + 0x100, GAME + 0x20]
+            else:
+                stack = [OTHER + 0x5, RUNTIME + 0x200, GAME + 0x20]
+            recs.append((1, ms * TPM, 100, 7, 0, swprof.SAMPLE | (len(stack) << 8)))
+            stack += [0] * (-len(stack) % 3)
+            for i in range(0, len(stack), 3):
+                recs.append((1, stack[i], stack[i + 1], stack[i + 2], 0, swprof.STACK))
+        self.path = os.path.join(self.dir.name, 's.swprof')
+        with open(self.path, 'wb') as fh:
+            fh.write(build(sites, ['main', 'sampler'], recs, MODULES))
+
+    def test_reads_modules_and_samples(self):
+        cap = swprof.Capture(self.path)
+        self.assertEqual([m[3] for m in cap.modules], [swprof.MOD_GAME, swprof.MOD_RUNTIME, swprof.MOD_OTHER])
+        self.assertEqual(len(cap.samples), 100)
+        self.assertEqual(cap.samples[0][3], [GAME + 0x10, GAME + 0x20, RUNTIME + 0x300])
+        self.assertEqual(cap.samples[65][3], [RUNTIME + 0x100, GAME + 0x20])  # (padding is cut off)
+
+    def test_split_and_runtime_functions(self):
+        res = swprof.analyse(swprof.Capture(self.path))
+        sp = res['sampler']
+        self.assertEqual(sp['samples'], 100)
+        self.assertAlmostEqual(sp['interval_ms'], 1.0, delta=0.01)
+        main = next(t for t in sp['threads'] if t['name'] == 'main')
+        self.assertEqual((main['game'], main['runtime'], main['driver/system'], main['waiting']), (60.0, 10.0, 10.0, 20.0))
+        self.assertEqual(sp['runtime_self'][0]['name'], 'runtime+0x100')
+        self.assertEqual(sp['runtime_callers_of_driver'][0]['name'], 'runtime+0x200')
+        incl = {r['name']: r['samples'] for r in sp['runtime_inclusive']}
+        self.assertEqual(incl, {'runtime+0x100': 10, 'runtime+0x200': 10, 'runtime+0x300': 60})  # (waiting is not counted)
+        self.assertIn('no runtime binary', sp['symbols_note'])
+
+    def test_report_mentions_the_note_and_no_game_address(self):
+        res = swprof.analyse(swprof.Capture(self.path))
+        text = swprof.text_report(res, 10, 33.4)
+        self.assertIn('Do not put game addresses', text)
+        self.assertNotIn(hex(GAME)[2:], text)
+
+    def test_symbols(self):
+        exe = os.path.join(self.dir.name, 'swr')
+        with open(exe, 'wb') as fh:
+            fh.write(b'\x7fELF' + b'\0' * 100)
+        nm = '0000000000000100 T render_frame\n0000000000000200 t helper\n0000000000000300 T wait_thing\n0000000000000400 D data\n'
+        done = mock.Mock(stdout=nm)
+        with mock.patch.object(swprof.shutil, 'which', return_value='/usr/bin/nm'), \
+                mock.patch.object(swprof.subprocess, 'run', return_value=done):
+            sym = swprof.Symbols(exe, MODULES[1])
+        self.assertEqual(sym.name(RUNTIME + 0x150), 'render_frame')
+        self.assertEqual(sym.name(RUNTIME + 0x200), 'helper')
+        self.assertEqual(sym.name(RUNTIME + 0x300 + (1 << 21)), 'runtime+0x%x' % (0x300 + (1 << 21)))
 
 
 if __name__ == '__main__':

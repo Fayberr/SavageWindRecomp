@@ -2,13 +2,15 @@
 """Reads a capture of the on-demand profiler (runtime/prof.c) and says where the time went.
 
 Usage:
-  swprof.py [capture.swprof] [--top N] [--slow MS] [--json FILE] [--csv FILE] [--frames FIRST:LAST]
+  swprof.py [capture.swprof] [--top N] [--slow MS] [--json FILE] [--csv FILE] [--frames FIRST:LAST] [--exe RUNTIME_BINARY]
 
 Without a file the newest profile/swprof-*.swprof is used. Python 3.8, standard library only.
 
 The report has: the frames (rate, percentiles, the slow ones with what each thread was doing), the zones
 (SW_ZONE) as a tree per thread, the added-up work (SW_ACC) as a tree per thread, the counters, and the top places by
-self time. Times are milliseconds per frame unless a heading says otherwise.
+self time, and, when the sampler ran, where the threads sat: game code, the SWR runtime (named per function when --exe
+points at the runtime binary of the run), the driver and system, or waiting. The game code is one total: no game
+function is ever looked up or named. Times are milliseconds per frame unless a heading says otherwise.
 """
 import argparse
 import bisect
@@ -17,16 +19,25 @@ import glob
 import json
 import math
 import os
+import shutil
 import struct
+import subprocess
 import sys
 
 HEADER = struct.Struct('<8sIIQQQQQIIII')
 THREAD = struct.Struct('<IIQ32s')
 CHUNK = struct.Struct('<II')
 REC = struct.Struct('<QQQII')
+MODULE = struct.Struct('<QQQI196s')
 
-ZONE, COUNTER, FRAME, ACC, GPU = 1, 2, 3, 4, 5
+ZONE, COUNTER, FRAME, ACC, GPU, SAMPLE, STACK = 1, 2, 3, 4, 5, 6, 7
+MOD_RUNTIME, MOD_GAME, MOD_OTHER = 1, 2, 3
 GPU_IDLE = '(gpu idle)'
+# zones in which a thread is waiting for something, not working: a sample inside one counts as waiting
+WAIT_ZONES = {'kernel wait', 'kernel wait (handles)', 'gpu_wait', 'present pace', 'wait for recorder submit',
+              'recorder drain', 'recorder ring full'}
+COPYRIGHT_NOTE = ('Reminder: the game code is shown as one total on purpose. Do not put game addresses, game names or '
+                  'generated code into pull requests or issues.')
 
 
 class Capture:
@@ -35,7 +46,7 @@ class Capture:
     def __init__(self, path):
         with open(path, 'rb') as f:
             data = f.read()
-        (magic, version, recsize, t0, n0, t1, n1, unix0, nsites, nthreads, nchunks, _) = HEADER.unpack_from(data, 0)
+        (magic, version, recsize, t0, n0, t1, n1, unix0, nsites, nthreads, nchunks, nmodules) = HEADER.unpack_from(data, 0)
         if magic != b'SWPROF01' or version != 1 or recsize != REC.size:
             raise SystemExit(f'{path}: not a capture this tool reads (magic {magic!r}, version {version})')
         self.path = path
@@ -52,6 +63,11 @@ class Capture:
             _, _, tid, name = THREAD.unpack_from(data, pos)
             pos += THREAD.size
             self.threads.append((name.split(b'\0')[0].decode('utf-8', 'replace') or 'thread', tid))
+        self.modules = []  # (base, size, bias, kind, name)
+        for _ in range(nmodules):
+            base, size, bias, kind, name = MODULE.unpack_from(data, pos)
+            pos += MODULE.size
+            self.modules.append((base, size, bias, kind, name.split(b'\0')[0].decode('utf-8', 'replace')))
         span_ns = max(n1 - n0, 1)
         self.ticks_per_ms = max((t1 - t0) / span_ns * 1e6, 1e-9)
         self.ticks0, self.ticks1 = t0, t1
@@ -62,6 +78,8 @@ class Capture:
         self.counters = collections.defaultdict(list)  # name -> [(ms, value)]
         self.frame_marks = []  # (ms, frame number)
         self.gpu = []  # (start, end, site, draws)
+        self.samples = []  # (ms, os thread id, kernel handle, [addresses innermost first])
+        self.sample_depth = 0
         self.records = 0
         ms = lambda t: (t - t0) / self.ticks_per_ms
         for _ in range(nchunks):
@@ -69,6 +87,15 @@ class Capture:
             pos += CHUNK.size
             for a, b, val, site, kind in REC.iter_unpack(data[pos:pos + n * REC.size]):
                 k = kind & 0xff
+                if k == SAMPLE:
+                    self.samples.append([ms(a), b, val, []])
+                    self.sample_depth = kind >> 8
+                    continue
+                if k == STACK:  # (an address, not a time: before the check below)
+                    if self.samples and len(self.samples[-1][3]) < self.sample_depth:
+                        self.samples[-1][3].extend((a, b, val))
+                        del self.samples[-1][3][self.sample_depth:]
+                    continue
                 if a < t0:
                     continue  # began before the capture
                 if k == ZONE and thread < len(self.zones):
@@ -167,7 +194,151 @@ def self_times(tree):
     return {p: max(ms - child.get(p, 0.0), 0.0) for p, (_, ms) in tree.items()}
 
 
-def analyse(cap, first=None, last=None):
+class Symbols:
+    """Function names of the runtime binary, from nm. A module address becomes a binary address by the module's bias
+    (ELF) or its base minus the PE ImageBase; an address with no name stays 'runtime+0x...'. Only the runtime is ever
+    named: the game library's functions are never looked up."""
+
+    def __init__(self, exe, module):
+        self.addrs, self.names, self.delta = [], [], 0
+        self.base = module[0] if module else 0
+        self.note = ''
+        if not exe:
+            self.note = 'no runtime binary given (--exe): function names are runtime+offset'
+            return
+        try:
+            with open(exe, 'rb') as f:
+                head = f.read(0x1000)
+        except OSError as e:
+            self.note = f'cannot read {exe}: {e.strerror}'
+            return
+        if head[:2] == b'MZ':  # PE: nm lists ImageBase + RVA
+            pe = struct.unpack_from('<I', head, 0x3c)[0]
+            image_base = struct.unpack_from('<Q', head, pe + 24 + 24)[0] if pe + 56 < len(head) else 0
+            self.delta = (module[0] if module else 0) - image_base
+        else:  # ELF / Mach-O: the load bias
+            self.delta = module[2] if module else 0
+        tool = next((t for t in ('llvm-nm', 'nm') if shutil.which(t)), None)
+        if not tool:
+            self.note = 'nm not found: function names are runtime+offset'
+            return
+        try:
+            out = subprocess.run([tool, '-n', '--defined-only', exe], capture_output=True, text=True, timeout=120).stdout
+        except (OSError, subprocess.SubprocessError) as e:
+            self.note = f'{tool} failed: {e}'
+            return
+        for line in out.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) == 3 and parts[1] in ('t', 'T', 'w', 'W', 'i', 'I'):
+                try:
+                    self.addrs.append(int(parts[0], 16))
+                except ValueError:
+                    continue
+                self.names.append(parts[2])
+        if not self.addrs:
+            self.note = 'the binary has no symbols: function names are runtime+offset'
+
+    def name(self, addr):
+        a = addr - self.delta
+        i = bisect.bisect_right(self.addrs, a) - 1
+        if i >= 0 and a - self.addrs[i] < (1 << 20):
+            return self.names[i]
+        return f'runtime+0x{addr - self.base:x}'
+
+
+CATEGORIES = ('game', 'runtime', 'driver/system', 'waiting')
+
+
+def wait_intervals(cap, ti):
+    """Merged (start, end) of the zones on thread ti where it only waits."""
+    iv = sorted((a, b) for a, b, site in cap.zones[ti] if cap.sites.get(site) in WAIT_ZONES)
+    merged = []
+    for a, b in iv:
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return merged
+
+
+def sampler_summary(cap, fr, span, nframes, symbols):
+    """Where the threads were, by sample: game code / the runtime / the driver and system / waiting. Runtime functions
+    by self (top frame) and inclusive (anywhere in the stack); what the runtime was doing when a sample sat in the
+    driver or system."""
+    if not cap.samples:
+        return {}
+    mods = sorted(cap.modules)
+    starts = [m[0] for m in mods]
+
+    def module_of(addr):
+        i = bisect.bisect_right(starts, addr) - 1
+        if i >= 0 and addr < mods[i][0] + mods[i][1]:
+            return mods[i]
+        return None
+
+    by_tid = {}
+    for ti, (name, tid) in enumerate(cap.threads):
+        if name != 'gpu':
+            by_tid[tid] = ti
+    waits = {}
+    split = collections.defaultdict(lambda: collections.Counter())  # thread -> category -> samples
+    times = collections.defaultdict(list)
+    rt_self, rt_incl, rt_callers = collections.Counter(), collections.Counter(), collections.Counter()
+    per_frame = collections.defaultdict(collections.Counter)  # frame mark index -> category -> samples
+    total = 0
+    for t, tid, handle, pcs in cap.samples:
+        if not (span[0] <= t < span[1]) or not pcs:
+            continue
+        ti = by_tid.get(tid)
+        tname = cap.threads[ti][0] if ti is not None else f'os thread {tid}'
+        if ti is not None and ti not in waits:
+            waits[ti] = wait_intervals(cap, ti)
+        times[tname].append(t)
+        total += 1
+        mk = [module_of(a) for a in pcs]
+        top = mk[0]
+        cat = 'waiting' if ti is not None and _inside(waits[ti], t) else \
+            'game' if top and top[3] == MOD_GAME else 'runtime' if top and top[3] == MOD_RUNTIME else 'driver/system'
+        split[tname][cat] += 1
+        per_frame[fr.index_at(t)][cat] += 1
+        if cat == 'waiting':
+            continue
+        rt = [pcs[i] for i in range(len(pcs)) if mk[i] and mk[i][3] == MOD_RUNTIME]
+        if not rt:
+            continue
+        names = [symbols.name(a) for a in rt]
+        if cat == 'runtime':
+            rt_self[names[0]] += 1
+        elif cat == 'driver/system':
+            rt_callers[names[0]] += 1
+        for n in set(names):
+            rt_incl[n] += 1
+    if not total:
+        return {}
+    # time between two samples of one thread, to turn counts into milliseconds
+    gaps = sorted(b - a for ts in times.values() for a, b in zip(ts, ts[1:]) if b - a < 50)
+    interval = percentile(gaps, 50) if gaps else 1.0
+
+    def rows(counter, n=40):
+        return [{'name': k, 'samples': v, 'percent': round(100 * v / total, 2),
+                 'ms_per_frame': round(v * interval / nframes, 4)} for k, v in counter.most_common(n)]
+
+    return {
+        'samples': total, 'interval_ms': round(interval, 3), 'symbols_note': symbols.note,
+        'threads': [{'name': n, 'samples': sum(c.values()),
+                     **{k: round(100 * c[k] / sum(c.values()), 1) for k in CATEGORIES}}
+                    for n, c in sorted(split.items(), key=lambda kv: -sum(kv[1].values()))],
+        'runtime_self': rows(rt_self), 'runtime_inclusive': rows(rt_incl), 'runtime_callers_of_driver': rows(rt_callers),
+        '_per_frame': per_frame,
+    }
+
+
+def _inside(intervals, t):
+    i = bisect.bisect_right(intervals, [t, math.inf]) - 1
+    return i >= 0 and intervals[i][0] <= t < intervals[i][1]
+
+
+def analyse(cap, first=None, last=None, exe=None):
     fr = Frames(cap, first, last)
     nframes = max(len(fr.items), 1)
     result = {'file': os.path.basename(cap.path), 'duration_s': round(cap.duration_ms / 1000, 3), 'events': cap.records,
@@ -221,6 +392,13 @@ def analyse(cap, first=None, last=None):
         result['slow_frames'].append({'frame': n, 'ms': round(dur, 2), 'at_s': round(start / 1000, 3),
                                       'top': [{'thread': k[0], 'name': k[1], 'ms': round(v, 2)} for k, v in cause]})
     result['gpu'] = gpu_summary(cap, fr, span, nframes)
+    runtime = next((m for m in cap.modules if m[3] == MOD_RUNTIME), None)
+    result['sampler'] = sampler_summary(cap, fr, span, nframes, Symbols(exe, runtime))
+    per = result['sampler'].pop('_per_frame', {}) if result['sampler'] else {}
+    for sf, (i, n, start, dur) in zip(result['slow_frames'], sorted(fr.items, key=lambda it: -it[3])[:10]):
+        c = per.get(i)
+        if c:
+            sf['samples'] = {k: c[k] for k in CATEGORIES if c[k]}
     result['_frames'] = fr
     result['_per_frame_self'] = per_frame_self
     return result
@@ -270,6 +448,22 @@ def text_report(res, top_n, slow_ms):
           f"Passes, dispatches and copies by GPU time (ms per frame):")
         for r in g['rows'][:top_n]:
             w(f"  {r['ms_per_frame']:8.3f}  {r['rows_per_frame']:7.2f}x  {r['draws_per_frame']:8.1f} draws  max {r['max_ms']:.2f}  {r['name']}")
+    sp = res.get('sampler')
+    if sp:
+        w(f"\nSampler: {sp['samples']} samples, one per {sp['interval_ms']} ms per thread. Share of each thread's time:")
+        w(f"  {'thread':<24}{'samples':>8}" + ''.join(f'{c:>15}' for c in CATEGORIES))
+        for t in sp['threads']:
+            w(f"  {t['name']:<24}{t['samples']:>8}" + ''.join(f'{t[c]:>14}%' for c in CATEGORIES))
+        for key, title in (('runtime_self', 'Runtime functions by self time (the top frame was in the runtime)'),
+                           ('runtime_callers_of_driver', 'Runtime functions that were calling into the driver or system'),
+                           ('runtime_inclusive', 'Runtime functions by inclusive time (anywhere in the stack)')):
+            if sp[key]:
+                w(f'\n{title}; percent of all samples, ms per frame:')
+                for r in sp[key][:top_n]:
+                    w(f"  {r['percent']:6.2f}%  {r['ms_per_frame']:8.3f}  {r['name']}")
+        if sp['symbols_note']:
+            w(f"  ({sp['symbols_note']})")
+        w('  ' + COPYRIGHT_NOTE)
     for th in res['threads']:
         if not th['zones'] and not th['acc'] or th['name'] == 'gpu':
             continue
@@ -299,6 +493,8 @@ def text_report(res, top_n, slow_ms):
             w(f"  frame {s['frame']}: {s['ms']} ms at {s['at_s']} s")
             for t in s['top']:
                 w(f"      {t['ms']:7.2f} ms  [{t['thread']}] {t['name']}")
+            if s.get('samples'):
+                w('      samples: ' + ', '.join(f'{k} {v}' for k, v in s['samples'].items()))
     return '\n'.join(out)
 
 
@@ -326,6 +522,7 @@ def main(argv=None):
     ap.add_argument('--json', metavar='FILE')
     ap.add_argument('--csv', metavar='FILE', help='one row per frame: its time and the self time of the top places')
     ap.add_argument('--frames', metavar='FIRST:LAST', help='only these frame numbers')
+    ap.add_argument('--exe', metavar='FILE', help='the runtime binary of the captured run, to name its functions in the sampler section')
     a = ap.parse_args(argv)
     path = a.capture or newest()
     if not path:
@@ -335,7 +532,7 @@ def main(argv=None):
         lo, _, hi = a.frames.partition(':')
         first = int(lo) if lo else None
         last = int(hi) if hi else None
-    res = analyse(Capture(path), first, last)
+    res = analyse(Capture(path), first, last, a.exe)
     print(text_report(res, a.top, a.slow))
     if a.csv:
         write_csv(res, a.csv)
