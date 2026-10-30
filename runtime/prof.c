@@ -12,6 +12,7 @@
 //            u32 sites, threads, chunks, u32 reserved
 //   sites    per site: u32 id, u16 length, name
 //   threads  per thread: u32 index, u32 reserved, u64 os thread id, char name[32]
+//   modules  (the header's last u32 says how many) per module: u64 base, size, bias, u32 kind, char name[196]
 //   chunks   per chunk: u32 thread, u32 records, then the records
 #include "prof.h"
 
@@ -260,6 +261,7 @@ bool prof_start(void) {
     g_prof_seq = 0;
     g_prof_gen++;  // every thread registers again, with a chunk of its own
     __atomic_store_n(&g_prof_on, 1, __ATOMIC_RELEASE);
+    prof_sampler_begin();
     LOG("[prof] capture started (buffer %u MB)\n", (unsigned)((uint64_t)pool_chunks * CHUNK_RECS * sizeof(ProfRec) >> 20));
     return true;
 }
@@ -269,6 +271,9 @@ static void put64(FILE *f, uint64_t v) { fwrite(&v, 8, 1, f); }
 
 static void *writer_main(void *arg) {
     (void)arg;
+    prof_sampler_end();
+    static ProfModule modules[128];
+    int nmod = prof_sampler_modules(modules, 128);
     // a thread may be in the middle of a record as the capture stops; give it time to finish
     plat_sleep_until_ns(plat_now_ns() + 50000000ull);
     uint32_t used = atomic_load(&next_chunk);
@@ -312,7 +317,7 @@ static void *writer_main(void *arg) {
         put32(f, nsites);
         put32(f, nt);
         put32(f, used);
-        put32(f, 0);
+        put32(f, (uint32_t)nmod);
         for (uint32_t i = 1; i <= nsites; i++) {
             const char *n = site_names[i] ? site_names[i] : "?";
             put32(f, i);
@@ -325,6 +330,13 @@ static void *writer_main(void *arg) {
             put32(f, 0);
             put64(f, threads[i].tid);
             fwrite(threads[i].name, 1, sizeof threads[i].name, f);
+        }
+        for (int i = 0; i < nmod; i++) {
+            put64(f, modules[i].base);
+            put64(f, modules[i].size);
+            put64(f, modules[i].bias);
+            put32(f, modules[i].kind);
+            fwrite(modules[i].name, 1, sizeof modules[i].name, f);
         }
         for (uint32_t i = 0; i < used; i++) {
             ProfRec *r = pool + (size_t)i * CHUNK_RECS;

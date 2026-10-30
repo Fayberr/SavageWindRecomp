@@ -412,9 +412,9 @@ test-vibration: $(B)/test_vibration
 
 .PHONY: test-vibration
 
-$(B)/test_prof: tools/test_prof.c runtime/prof.c runtime/prof.h runtime/rt.h
+$(B)/test_prof: tools/test_prof.c runtime/prof.c runtime/sampler.c runtime/prof.h runtime/rt.h
 	@mkdir -p $(B)
-	$(CC) -O2 -std=gnu11 -Wall -Wextra -Werror $(OSFLAGS) -Iruntime -o $@ tools/test_prof.c runtime/prof.c -lpthread
+	$(CC) -O2 -std=gnu11 -Wall -Wextra -Werror $(OSFLAGS) -Iruntime -o $@ tools/test_prof.c runtime/prof.c runtime/sampler.c -lpthread
 
 # (POSIX only: mkdtemp, nanosleep)
 test-prof: $(B)/test_prof

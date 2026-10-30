@@ -12,6 +12,20 @@
 
 #include "prof.h"
 
+// what sampler.c takes from the kernel: the threads to sample (the workers of the test)
+#include <pthread.h>
+#include "kernel.h"
+static pthread_t g_sampled[8];
+static int g_nsampled;
+static pthread_mutex_t g_sampled_lock = PTHREAD_MUTEX_INITIALIZER;
+int kernel_running_threads(pthread_t *host, uint32_t *handle, uint64_t *entry, int max) {
+    pthread_mutex_lock(&g_sampled_lock);
+    int n = g_nsampled < max ? g_nsampled : max;
+    for (int i = 0; i < n; i++) host[i] = g_sampled[i], handle[i] = 0x100 + (uint32_t)i, entry[i] = 0;
+    pthread_mutex_unlock(&g_sampled_lock);
+    return n;
+}
+
 // what prof.c takes from the platform layer
 uint64_t plat_now_ns(void) {
     struct timespec ts;
@@ -51,6 +65,9 @@ static void work_unit(void) {
 static pthread_barrier_t bar;
 static int g_rounds;
 static void *worker(void *arg) {
+    pthread_mutex_lock(&g_sampled_lock);
+    g_sampled[g_nsampled++] = pthread_self();
+    pthread_mutex_unlock(&g_sampled_lock);
     char name[16];
     snprintf(name, sizeof name, "worker%ld", (long)(intptr_t)arg);
     prof_thread_name(name);
@@ -61,7 +78,7 @@ static void *worker(void *arg) {
     return NULL;
 }
 
-typedef struct { uint64_t zones, accs, acc_calls, counters, frames, records; uint32_t threads, sites; int ok; } Counts;
+typedef struct { uint64_t zones, accs, acc_calls, counters, frames, records, samples, stack_recs; uint32_t threads, sites, modules; int ok; } Counts;
 
 static Counts read_file(const char *path) {
     Counts c = {0};
@@ -82,6 +99,11 @@ static Counts read_file(const char *path) {
     }
     unsigned char th[48];
     for (uint32_t i = 0; i < nthreads; i++) assert(fread(th, 1, sizeof th, f) == sizeof th);
+    uint32_t nmodules;
+    memcpy(&nmodules, h + 68, 4);
+    unsigned char mod[24 + 4 + 196];
+    for (uint32_t i = 0; i < nmodules; i++) assert(fread(mod, 1, sizeof mod, f) == sizeof mod);
+    c.modules = nmodules;
     for (uint32_t i = 0; i < nchunks; i++) {
         uint32_t hdr[2];
         assert(fread(hdr, 4, 2, f) == 2);
@@ -94,6 +116,8 @@ static Counts read_file(const char *path) {
             case PROF_ACC: c.accs++; c.acc_calls += r[j].kind >> 8; break;
             case PROF_COUNTER: c.counters++; CHECK(r[j].t1 == 7, "counter value %llu", (unsigned long long)r[j].t1); break;
             case PROF_FRAME: c.frames++; break;
+            case PROF_SAMPLE: c.samples++; CHECK((r[j].kind >> 8) > 0 && (r[j].kind >> 8) <= 18, "sample depth %u", r[j].kind >> 8); break;
+            case PROF_STACK: c.stack_recs++; break;
             default: CHECK(0, "kind %u", r[j].kind);
             }
         }
@@ -169,7 +193,14 @@ int main(void) {
     CHECK(c.frames == ROUNDS, "frames %llu", (unsigned long long)c.frames);
     CHECK(c.zones == 2ull * ROUNDS * (WORKERS + 1), "zones %llu", (unsigned long long)c.zones);
     CHECK(c.counters == 1ull * ROUNDS * (WORKERS + 1), "counters %llu", (unsigned long long)c.counters);
-    CHECK(c.threads == WORKERS + 1, "threads %u", c.threads);
+    CHECK(c.threads >= WORKERS + 1, "threads %u", c.threads);  // (the sampler thread is one more)
+    printf("sampler: %llu samples, %llu stack records, %u modules\n", (unsigned long long)c.samples,
+           (unsigned long long)c.stack_recs, c.modules);
+#if defined(__linux__) || defined(_WIN32)
+    CHECK(c.samples > 20 && c.stack_recs >= c.samples, "samples %llu stack records %llu", (unsigned long long)c.samples,
+          (unsigned long long)c.stack_recs);
+    CHECK(c.modules >= 1, "modules %u", c.modules);
+#endif
     // each work unit calls draw and draw/pre 10 times; the last frame of every thread is flushed only by the next
     // frame boundary, so all but that one are in the file
     CHECK(c.acc_calls >= 2ull * 10 * (ROUNDS - 1) * (WORKERS + 1) && c.acc_calls <= 2ull * 10 * ROUNDS * (WORKERS + 1),

@@ -42,9 +42,19 @@ const char *prof_last_file(void);
 // GPU events are written with prof_put_gpu() from the code that reads the GPU's timestamps (nvn/vulkan/exec.c).
 typedef struct { const char *name; uint32_t id; } ProfSite;  // id 0: not registered yet
 typedef struct { uint64_t t0, t1, val; uint32_t site, kind; } ProfRec;  // 32 bytes. kind: low 8 bits PROF_*, ACC: calls << 8
-enum { PROF_ZONE = 1, PROF_COUNTER = 2, PROF_FRAME = 3, PROF_ACC = 4, PROF_GPU = 5 };
+enum { PROF_ZONE = 1, PROF_COUNTER = 2, PROF_FRAME = 3, PROF_ACC = 4, PROF_GPU = 5, PROF_SAMPLE = 6, PROF_STACK = 7 };
 // PROF_GPU: a stretch of GPU work (t0..t1 in cycle counter ticks, val = draws | frame << 32), written by whichever
 // thread reads the GPU's timestamps back; the tool shows these as a thread of their own, "gpu".
+
+// PROF_SAMPLE (the sampler, runtime/sampler.c): t0 = time, t1 = os thread id, val = kernel handle, kind >> 8 = the stack's
+// depth; the PROF_STACK records after it hold the addresses, three to a record in t0, t1, val (innermost first).
+
+// ---- the sampler (runtime/sampler.c): prof_start and the capture's writer call these
+enum { PROF_MODULE_RUNTIME = 1, PROF_MODULE_GAME = 2, PROF_MODULE_OTHER = 3 };
+typedef struct { uint64_t base, size, bias; uint32_t kind; char name[196]; } ProfModule;  // bias: add to a symbol's address
+void prof_sampler_begin(void);
+void prof_sampler_end(void);  // waits for the sampler thread to finish
+int prof_sampler_modules(ProfModule *out, int max);
 
 typedef struct ProfAcc ProfAcc;
 typedef struct {
