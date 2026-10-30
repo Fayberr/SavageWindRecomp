@@ -34,12 +34,12 @@ ZONE, COUNTER, FRAME, ACC, GPU, SAMPLE, STACK = 1, 2, 3, 4, 5, 6, 7
 MOD_RUNTIME, MOD_GAME, MOD_OTHER = 1, 2, 3
 GPU_IDLE = '(gpu idle)'
 # zones in which a thread is waiting for something, not working: a sample inside one counts as waiting
-WAIT_ZONES = {'kernel wait', 'kernel wait (handles)', 'gpu_wait', 'present pace', 'wait for recorder submit',
+WAIT_ZONES = {'kernel wait', 'kernel wait (handles)', 'guest sleep', 'gpu_wait', 'present pace', 'wait for recorder submit',
               'recorder drain', 'recorder ring full'}
 # Runtime functions that only wait (for a kernel object, for work, for one of the four cores). A sample whose stack is in
 # the system below one of them is waiting even with no wait zone around it: a wait that began before the capture did has
 # no zone (its stamp was not taken), and some waits have none.
-WAIT_FUNCS = {'kwait', 'block_current', 'queue_wait', 'core_acquire'}
+WAIT_FUNCS = {'kwait', 'block_current', 'guest_sleep', 'queue_wait', 'queue_thread', 'rec_drain', 'core_acquire'}
 COPYRIGHT_NOTE = ('Reminder: the game code is shown as one total on purpose. Do not put game addresses, game names or '
                   'generated code into pull requests or issues.')
 

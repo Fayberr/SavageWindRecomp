@@ -250,6 +250,17 @@ void kernel_preempt(KThread *t) {
     core_acquire(t);
 }
 
+// svcSleepThread with a time: a function of its own (not inlined) so the profiler's sampler sees a sleeping thread as
+// waiting by its stack (tools/swprof.py WAIT_FUNCS), even a sleep that began before the capture did.
+static __attribute__((noinline)) void guest_sleep(uint64_t ns) {
+    SW_ZONE("guest sleep");
+    for (uint64_t end = plat_now_ns() + ns, now; !g_rt_unwind && (now = plat_now_ns()) < end;) {
+        uint64_t d = end - now < 50000000 ? end - now : 50000000;
+        struct timespec ts = {(time_t)(d / 1000000000), (long)(d % 1000000000)};
+        nanosleep(&ts, NULL);
+    }
+}
+
 // svcSleepThread(0) and friends: let the threads of the same priority waiting for this core go first.
 static void core_yield(KThread *t) {
     if (!t || t->core_held < 0) { sched_yield(); return; }
@@ -923,11 +934,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         int64_t ns = (int64_t)x[0];
         if (ns <= 0) { core_yield(t_cur); break; }
         core_release(t_cur);
-        for (uint64_t end = plat_now_ns() + (uint64_t)ns, now; !g_rt_unwind && (now = plat_now_ns()) < end;) {
-            uint64_t d = end - now < 50000000 ? end - now : 50000000;
-            struct timespec ts = {(time_t)(d / 1000000000), (long)(d % 1000000000)};
-            nanosleep(&ts, NULL);
-        }
+        guest_sleep((uint64_t)ns);
         core_acquire(t_cur);
         break;
     }
