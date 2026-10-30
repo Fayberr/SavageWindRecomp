@@ -2,6 +2,7 @@
 // output, byte for byte, for Wii U -> Switch); the comments say where a choice comes from rather than what a line does.
 #include "save_convert.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <stdarg.h>
@@ -184,8 +185,17 @@ static void made_undo(MadeList *m) {
 static bool make_dirs(const char *path, MadeList *made, ScReport *r) {
     char p[PATH_CAP];
     if (snprintf(p, sizeof p, "%s", path) >= (int)sizeof p) { fail(r, SC_IO, "%s: path too long", path); return false; }
-    for (char *q = p + 1; ; q++) {
+    char *start = p + 1;
+#ifdef _WIN32
+    // "C:/..." and "C:\...": the drive is not a folder to make (mkdir("C:") fails), so start after its separator
+    if (isalpha((unsigned char)p[0]) && p[1] == ':') start = p[2] == '/' || p[2] == '\\' ? p + 3 : p + 2;
+#endif
+    for (char *q = start; ; q++) {
+#ifdef _WIN32
+        if (*q != '/' && *q != '\\' && *q) continue;
+#else
         if (*q != '/' && *q) continue;
+#endif
         char c = *q;
         *q = 0;
         if (!is_dir(p)) {
