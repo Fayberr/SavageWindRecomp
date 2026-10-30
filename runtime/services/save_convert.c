@@ -3,6 +3,7 @@
 #include "save_convert.h"
 
 #include <ctype.h>
+#include <time.h>
 #include <dirent.h>
 #include <errno.h>
 #include <stdarg.h>
@@ -19,7 +20,8 @@
 #define PATH_CAP 1100
 #define HEADER 0xC          // flag save files: revision, 0xFFFFFFFF, 1; then {hash, value} entries; then 0xFFFFFFFF
 #define PROFILE_DEPTH 7     // how far below the picked folder the profile may be (find_profile_root)
-#define PROFILE_VISITS 100000  // folders looked at at most: a drive picked by mistake must not run for minutes
+#define PROFILE_VISITS 100000  // folders looked at at most, and for at most PROFILE_SECONDS: a drive or a big projects
+#define PROFILE_SECONDS 4      // folder picked by mistake must not run for minutes
 
 // ------------------------------------------------------------------ small helpers
 static void fail(ScReport *r, ScCode c, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
@@ -841,10 +843,17 @@ static bool profile_is_big_endian(const char *p) {
 
 // What the search found: the first Wii U profile, else the first profile of any kind (so that a Switch save can be
 // told apart from no save, and a folder holding both Savage Wind's own saves and a Cemu profile finds the latter)
-typedef struct { int visits; bool have_be, have_any; char be[PATH_CAP], any[PATH_CAP]; } Search;
+typedef struct { int visits; time_t t0; bool have_be, have_any; char be[PATH_CAP], any[PATH_CAP]; } Search;
+
+static bool search_over(Search *s) {  // (out of folders or of time: stop looking)
+    if (s->visits > PROFILE_VISITS) return true;
+    if (time(NULL) - s->t0 > PROFILE_SECONDS) s->visits = PROFILE_VISITS + 1;
+    return s->visits > PROFILE_VISITS;
+}
 
 static void find_profile(const char *dir, int depth, Search *s) {
     if (s->have_be || ++s->visits > PROFILE_VISITS) return;
+    if ((s->visits & 63) == 0 && search_over(s)) return;
     if (looks_like_profile(dir)) {
         if (profile_is_big_endian(dir)) s->have_be = snprintf(s->be, sizeof s->be, "%s", dir) < (int)sizeof s->be;
         else if (!s->have_any) s->have_any = snprintf(s->any, sizeof s->any, "%s", dir) < (int)sizeof s->any;
@@ -855,6 +864,8 @@ static void find_profile(const char *dir, int depth, Search *s) {
     char **v = names_list(dir, &n);
     for (int i = 0; v && i < n && !s->have_be; i++) {
         char sub[PATH_CAP];
+        if (!strcmp(v[i], ".git") || !strcmp(v[i], "node_modules")) continue;  // (never a save; often huge)
+        if ((i & 63) == 63 && search_over(s)) break;
         if (path_join(sub, sizeof sub, dir, v[i]) && is_dir(sub)) find_profile(sub, depth + 1, s);
     }
     if (v) names_free(v, n);
@@ -862,6 +873,7 @@ static void find_profile(const char *dir, int depth, Search *s) {
 
 ScCode sc_find_profile(const char *dir, char *root, size_t cap) {
     Search *s = calloc(1, sizeof *s);
+    s->t0 = time(NULL);
     find_profile(dir, 0, s);
     const char *found = s->have_be ? s->be : s->have_any ? s->any : NULL;
     if (found) snprintf(root, cap, "%s", found);
