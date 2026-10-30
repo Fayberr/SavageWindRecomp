@@ -55,6 +55,16 @@ static int menu_arrow(int sc) {
     return held_key(sc);
 }
 
+// Enter / keypad Enter select in the game's menus (the A button, which E is bound to by default). A modified Enter is
+// left to Alt+Enter, the fullscreen toggle (runtime/ui/menu.mm), so it does not also confirm something on the way.
+static int menu_enter(void) {
+    for (int i = 0; i < BIND_KEY_COUNT; i++)
+        if (g_bind_key[i] == SDL_SCANCODE_RETURN || g_bind_key[i] == SDL_SCANCODE_KP_ENTER) return 0;
+    if (held_key(SDL_SCANCODE_LALT) || held_key(SDL_SCANCODE_RALT) ||
+        held_key(SDL_SCANCODE_LGUI) || held_key(SDL_SCANCODE_RGUI)) return 0;
+    return held_key(SDL_SCANCODE_RETURN) || held_key(SDL_SCANCODE_KP_ENTER);
+}
+
 // Through the bindings (runtime/hle/bindings.c: g_bind_key), read on every key event, so a rebind applies at once.
 static void recompute_keyboard(void) {
     uint64_t b = 0;
@@ -678,11 +688,12 @@ static void fill_state(Cpu *c) {
         if (renderer_present_count() < until) b |= 1ull << BTN_PLUS;
     }
     int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly) + script_ly);
-    // Gate at each poll: an arrow held when a menu closes must never move the player.
+    // Gate at each poll: an arrow or Enter held when a menu closes must never move the player or press A.
     // Event activity also includes cutscenes and fanfares, so it cannot identify dialogue choices safely.
     if (!menu && (framepace_title_ui() || framepace_menu_ui())) {
         lx = clamp_axis(lx + menu_lx);
         ly = clamp_axis(ly + menu_ly);
+        if (menu_enter()) b |= 1ull << BTN_A;
     }
     int32_t mx = 0, my = 0;
     if (!menu) mouse_stick(&mx, &my);

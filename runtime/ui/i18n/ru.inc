@@ -495,4 +495,4 @@ T("AMD FSR 3: it renders smaller and builds the full-resolution image from the f
 T("TAA: blends each frame with the ones before it, following the game's motion, so edges stay smooth and stop shimmering; slightly softer, use it with Sharpening.", "TAA: смешивает каждый кадр с предыдущими с учётом движения в игре, чтобы края оставались гладкими и не мерцали; чуть мягче, используйте вместе с резкостью.")
 T("FSR 1", "")
 T("Frame generation on", "Генерация кадров включена")
-T("Unbound arrow keys act as the left stick in the title, pause and map menus.", "Неназначенные клавиши-стрелки работают как левый стик в меню титульного экрана, паузы и карты.")
+T("In the title, pause and map menus, unbound arrow keys act as the left stick and Enter selects.", "В меню титульного экрана, паузы и карты неназначенные клавиши-стрелки работают как левый стик, а Enter выбирает.")

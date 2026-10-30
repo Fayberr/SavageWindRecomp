@@ -579,7 +579,7 @@ void build_items(void) {
         if (action == A_BIND_KEY) it.desc_fn = [](const Item &) {
             static std::string desc;
             desc = std::string(tr("Press A, then the new key. Esc cancels.")) + " " +
-                   tr("Unbound arrow keys act as the left stick in the title, pause and map menus.");
+                   tr("In the title, pause and map menus, unbound arrow keys act as the left stick and Enter selects.");
             return desc.c_str();
         };
         v.push_back(it);

@@ -122,6 +122,55 @@ int main(void) {
     sample(32767, 0, 0);  // the d-pad option must not add a second arrow action
     paused = false;
     sample(0, 0, 0);
-    puts("menu arrows: gating, directions, binding priority, reset and held-key transitions passed");
+    keys_down[SDL_SCANCODE_RIGHT] = 0;
+    recompute_keyboard();
+    g_settings.dpad_move = false;
+
+    // Enter selects in the menus, like E (A), and never in play.
+    keys_down[SDL_SCANCODE_RETURN] = 1;
+    recompute_keyboard();
+    sample(0, 0, 0);  // gameplay
+    title = true;
+    sample(0, 0, 1ull << BTN_A);
+    title = false; paused = true;
+    sample(0, 0, 1ull << BTN_A);
+    keys_down[SDL_SCANCODE_KP_ENTER] = 1;
+    recompute_keyboard();
+    sample(0, 0, 1ull << BTN_A);  // keypad Enter too
+    keys_down[SDL_SCANCODE_KP_ENTER] = 0;
+    keys_down[SDL_SCANCODE_LALT] = 1;
+    recompute_keyboard();
+    sample(0, 0, 0);  // Alt+Enter is the fullscreen toggle, it must not also confirm
+    keys_down[SDL_SCANCODE_LALT] = 0;
+    captured = true;
+    sample(0, 0, 0);  // overlay, name entry or binding capture owns input
+    captured = false;
+    paused = false;
+    sample(0, 0, 0);  // closing a menu while holding Enter releases A
+    keys_down[SDL_SCANCODE_RETURN] = 0;
+    recompute_keyboard();
+
+    // A binding in any slot claims Enter, including buttons, sticks, walk and tilt.
+    for (int slot = 0; slot < BIND_KEY_COUNT; slot++) {
+        int16_t old = g_bind_key[slot];
+        g_bind_key[slot] = SDL_SCANCODE_RETURN;
+        keys_down[SDL_SCANCODE_RETURN] = 1;
+        recompute_keyboard();
+        int32_t x = slot == BIND_LS_LEFT ? -32767 : slot == BIND_LS_RIGHT ? 32767 : 0;
+        int32_t y = slot == BIND_LS_DOWN ? -32767 : slot == BIND_LS_UP ? 32767 : 0;
+        int32_t rx = slot == BIND_RS_LEFT ? -32767 : slot == BIND_RS_RIGHT ? 32767 : 0;
+        int32_t ry = slot == BIND_RS_DOWN ? -32767 : slot == BIND_RS_UP ? 32767 : 0;
+        uint64_t buttons = slot < BIND_PAD_COUNT ? 1ull << slot : 0;
+        paused = true;
+        sample_state(x, y, rx, ry, buttons);
+        paused = false;
+        sample_state(x, y, rx, ry, buttons);  // the binding also works in gameplay
+        paused = true;
+        g_bind_key[slot] = old;
+        keys_down[SDL_SCANCODE_RETURN] = 0;
+        input_reset();
+    }
+    paused = false;
+    puts("menu arrows and Enter: gating, directions, binding priority, reset and held-key transitions passed");
     return 0;
 }

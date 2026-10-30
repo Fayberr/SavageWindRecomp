@@ -495,4 +495,4 @@ T("AMD FSR 3: it renders smaller and builds the full-resolution image from the f
 T("TAA: blends each frame with the ones before it, following the game's motion, so edges stay smooth and stop shimmering; slightly softer, use it with Sharpening.", "TAA: mengt elk frame met de vorige, de bewegingen van het spel volgend, zodat randen glad blijven en niet meer flikkeren; iets zachter, gebruik het met Verscherping.")
 T("FSR 1", "")
 T("Frame generation on", "Framegeneratie aan")
-T("Unbound arrow keys act as the left stick in the title, pause and map menus.", "Niet-toegewezen pijltjestoetsen werken als de linkerstick in het titel-, pauze- en kaartmenu.")
+T("In the title, pause and map menus, unbound arrow keys act as the left stick and Enter selects.", "In het titel-, pauze- en kaartmenu werken niet-toegewezen pijltjestoetsen als de linkerstick en selecteert Enter.")

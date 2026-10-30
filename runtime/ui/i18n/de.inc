@@ -495,4 +495,4 @@ T("AMD FSR 3: it renders smaller and builds the full-resolution image from the f
 T("TAA: blends each frame with the ones before it, following the game's motion, so edges stay smooth and stop shimmering; slightly softer, use it with Sharpening.", "TAA: verrechnet jedes Bild mit den vorherigen, den Bewegungen des Spiels folgend, sodass Kanten glatt bleiben und nicht mehr flimmern; etwas weicher, am besten mit Nachschärfen.")
 T("FSR 1", "")
 T("Frame generation on", "Bildgenerierung an")
-T("Unbound arrow keys act as the left stick in the title, pause and map menus.", "Nicht belegte Pfeiltasten steuern den linken Stick im Titel-, Pausen- und Kartenmenü.")
+T("In the title, pause and map menus, unbound arrow keys act as the left stick and Enter selects.", "In den Menüs für Titel, Pause und Karte wirken nicht belegte Pfeiltasten als linker Stick, Enter wählt aus.")

@@ -114,6 +114,6 @@ extern "C" void controls_bindings_draw(float scale) {
                                  "select, bottom face button / Esc back), and the in-game menu always opens with F1 or Esc, or "
                                  "the controller's Back + Start held together, or its Home / Guide button - so this page can't be "
                                  "locked out. The game's button icons follow the controller bindings."),
-                       tr("Unbound arrow keys act as the left stick in the title, pause and map menus."));
+                       tr("In the title, pause and map menus, unbound arrow keys act as the left stick and Enter selects."));
     ImGui::PopTextWrapPos();
 }
