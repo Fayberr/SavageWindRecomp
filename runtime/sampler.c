@@ -83,9 +83,15 @@ static void *sampler_main(void *arg) {
 }
 
 int prof_sampler_modules(ProfModule *out, int max) {
-    HMODULE mods[256];
+    // (a game with the video libraries loaded has hundreds of modules: ask for the size first)
     DWORD need = 0;
-    if (!K32EnumProcessModules(GetCurrentProcess(), mods, sizeof mods, &need)) return 0;
+    K32EnumProcessModules(GetCurrentProcess(), NULL, 0, &need);
+    HMODULE *mods = (HMODULE *)malloc(need + 64 * sizeof(HMODULE));
+    if (!mods) return 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), mods, need + 64 * sizeof(HMODULE), &need)) {
+        free(mods);
+        return 0;
+    }
     int n = 0;
     HMODULE exe = GetModuleHandleA(NULL);
     for (DWORD i = 0; i < need / sizeof(HMODULE) && n < max; i++) {
@@ -98,6 +104,7 @@ int prof_sampler_modules(ProfModule *out, int max) {
         K32GetModuleFileNameExA(GetCurrentProcess(), mods[i], m->name, sizeof m->name - 1);
         m->kind = mods[i] == exe ? PROF_MODULE_RUNTIME : strstr(m->name, "swgame") ? PROF_MODULE_GAME : PROF_MODULE_OTHER;
     }
+    free(mods);
     return n;
 }
 

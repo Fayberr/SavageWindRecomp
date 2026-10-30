@@ -272,8 +272,8 @@ static void put64(FILE *f, uint64_t v) { fwrite(&v, 8, 1, f); }
 static void *writer_main(void *arg) {
     (void)arg;
     prof_sampler_end();
-    static ProfModule modules[128];
-    int nmod = prof_sampler_modules(modules, 128);
+    static ProfModule modules[1024];
+    int nmod = prof_sampler_modules(modules, 1024);
     // a thread may be in the middle of a record as the capture stops; give it time to finish
     plat_sleep_until_ns(plat_now_ns() + 50000000ull);
     uint32_t used = atomic_load(&next_chunk);
