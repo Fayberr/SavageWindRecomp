@@ -354,7 +354,8 @@ void draw_result(int phase) {
         failure_text(g_code, g_kind == BACKUP_FAILED, &head, &hint);
         ImGui::TextColored(bad, "%s", head.c_str());
         if (!hint.empty()) ImGui::TextWrapped("%s", hint.c_str());
-        if (!g_detail.empty() && g_code != SC_NO_SAVE && g_code != SC_SWITCH_SAVE) ImGui::TextDisabled("%s", g_detail.c_str());
+        if (!g_detail.empty() && g_code != SC_NO_SAVE && g_code != SC_SWITCH_SAVE)
+            ImGui::TextDisabled("%s", (g_code == SC_MOVED ? shown_path(g_detail) : g_detail).c_str());  // (that one is the backup folder)
         if (g_code != SC_MOVED) ImGui::TextWrapped("%s", tr("Nothing was changed."));
     }
     ImGui::PopTextWrapPos();
