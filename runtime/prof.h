@@ -37,9 +37,12 @@ void prof_thread_name(const char *name);
 const char *prof_last_file(void);
 
 // ---- markers
+// GPU events are written with prof_put_gpu() from the code that reads the GPU's timestamps (nvn/vulkan/exec.c).
 typedef struct { const char *name; uint32_t id; } ProfSite;  // id 0: not registered yet
 typedef struct { uint64_t t0, t1, val; uint32_t site, kind; } ProfRec;  // 32 bytes. kind: low 8 bits PROF_*, ACC: calls << 8
-enum { PROF_ZONE = 1, PROF_COUNTER = 2, PROF_FRAME = 3, PROF_ACC = 4 };
+enum { PROF_ZONE = 1, PROF_COUNTER = 2, PROF_FRAME = 3, PROF_ACC = 4, PROF_GPU = 5 };
+// PROF_GPU: a stretch of GPU work (t0..t1 in cycle counter ticks, val = draws | frame << 32), written by whichever
+// thread reads the GPU's timestamps back; the tool shows these as a thread of their own, "gpu".
 
 typedef struct ProfAcc ProfAcc;
 typedef struct {
@@ -55,6 +58,10 @@ extern volatile uint32_t g_prof_seq;  // counts frames: a thread flushes its ACC
 extern __thread ProfCursor t_prof;
 
 uint32_t prof_register(ProfSite *s);
+// A marker named at run time ("pass: 4 color 1920x1080"): the name is copied, the same name gives the same id. Many
+// different names run out of ids; those share one.
+uint32_t prof_site_dyn(const char *name);
+double prof_ticks_per_ns(void);                // the cycle counter's rate, measured since the capture started
 bool prof_slow(ProfCursor *c);                 // a stale or full cursor: get this thread a chunk; false = drop the event
 void prof_acc_flush(ProfCursor *c);            // write the totals of the frame that ended
 
@@ -83,6 +90,8 @@ static inline void prof_put(uint32_t kind, uint32_t site, uint64_t t0, uint64_t 
     r->site = site;
     __atomic_store_n(&r->kind, kind, __ATOMIC_RELEASE);  // last: the reader takes a record once its kind is set
 }
+
+static inline void prof_put_gpu(uint32_t site, uint64_t t0, uint64_t t1, uint64_t val) { prof_put(PROF_GPU, site, t0, t1, val); }
 
 static inline uint32_t prof_site(ProfSite *s) { return s->id ? s->id : prof_register(s); }
 
@@ -121,7 +130,7 @@ static inline void prof_acc_exit(ProfZone *z) {
 #endif
 
 // Per-thread, per-frame totals for SW_ACC: indexed by site id.
-#define PROF_MAX_SITES 1024
+#define PROF_MAX_SITES 2048
 struct ProfAcc {
     uint64_t ticks[PROF_MAX_SITES];
     uint32_t calls[PROF_MAX_SITES];

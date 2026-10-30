@@ -144,6 +144,15 @@ int main(void) {
     assert(mkdtemp(dir));
     assert(chdir(dir) == 0);
 
+    // names made at run time: the same text gives the same id, another text another
+    {
+        char n1[32] = "pass 1920x1080", n2[32] = "pass 1280x720";
+        uint32_t a = prof_site_dyn(n1), b = prof_site_dyn(n2);
+        n1[0] = 'X';  // (the name is copied)
+        CHECK(a && b && a != b, "dynamic ids %u %u", a, b);
+        CHECK(prof_site_dyn("pass 1920x1080") == a && prof_site_dyn("pass 1280x720") == b, "dynamic ids are stable");
+    }
+
     // off: markers record nothing and a capture started later sees none of this
     work_unit();
     char s[256];

@@ -180,10 +180,13 @@ void vk_wait_seq(uint64_t seq) {
 
 uint64_t vk_pending_seq(void) { return submit_seq + 1; }
 
+uint64_t renderer_present_count(void);
+static void gp_collect(bool block);
 static Sub *sub(void) {
     Sub *s = &subs[cur_sub];
     if (s->seq != submit_seq + 1) {  // slot reused: its previous submission must be done
         vk_wait_seq(s->seq);
+        gp_collect(false);  // (the profiler: that submission's GPU time, and any older)
         if (s->ts) {  // (profiling) GPU time of that submission
             uint64_t t[2];
             if (vkGetQueryPoolResults(g_vk.dev, prof_qp, (uint32_t)cur_sub * 2, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
@@ -205,12 +208,13 @@ static void begin_cb(VkCommandBuffer *cb, bool *begun) {  // (the buffers: alloc
 }
 
 static void gp_mark(VkCommandBuffer cb, const char *fmt, ...);
+static void gp_begin(VkCommandBuffer cb);
 VkCommandBuffer vk_cmd(void) {
     Sub *s = sub();
     if (!s->main_begun) {
         begin_cb(&s->main, &s->main_begun);
         dyn_epoch++;
-        gp_mark(s->main, "(submission start; includes GPU idle before it)");
+        gp_begin(s->main);
         if (prof && prof_qp) {
             rec_CmdResetQueryPool(s->main, prof_qp, (uint32_t)cur_sub * 2, 2);
             rec_CmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_NONE, prof_qp, (uint32_t)cur_sub * 2);
@@ -293,14 +297,25 @@ static void pass_barrier_note(TexBackend *b) {  // a target of the pass begun
 
 static void ring_retire(void);
 
-// ---- SAVAGEWIND_GPUPROF_AT=<frame>: GPU time per pass / dispatch / copy of that frame, logged as "[gpuprof]".
-// A timestamp (ALL_COMMANDS: after everything before it) at each mark; a row = the work since the previous mark.
-bool g_gpuprof_frame;
+// ---- GPU time per pass, in the profiler's capture (runtime/prof.h)
+// While a capture runs a timestamp (ALL_COMMANDS: after everything before it) is written at the start of each submission,
+// pass, dispatch and copy; a row = the GPU work from one timestamp to the next, named by what starts it. Each finished
+// submission's rows are written as GPU events (tools/swprof.py shows them as the thread "gpu"), placed on the CPU clock by
+// VK_EXT_calibrated_timestamps, with the idle time between submissions as a row of its own.
+#define GPQ 2048  // timestamps a submission can hold (a long command list ends the submission earlier anyway)
+typedef struct {
+    uint32_t n, gen;
+    bool started;
+    uint64_t frame, seq, submit_ticks;
+    uint32_t site[GPQ], draws[GPQ];
+} GpSub;
+static GpSub gp_sub[SUBS];
 static VkQueryPool gp_qp;
-static int gp_n;
-#define GP_MAX 4096  // (an open-world frame has ~1500 marks)
-static char gp_label[GP_MAX][112];
-static uint32_t gp_draws[GP_MAX];
+static bool gp_failed;
+static uint8_t gp_fifo[SUBS];  // submissions with timestamps not read yet, oldest first
+static unsigned gp_head, gp_tail;
+static uint64_t gp_prev_end;  // CPU ticks where the GPU finished its last read submission (0: none in this capture)
+static uint32_t gp_prev_gen;
 // SAVAGEWIND_VK_DEVLOST_TRACE=1: the last 64 GPU operations, dumped on device loss (with SAVAGEWIND_SYNC_SUBMIT=1 the
 // dump ends with the command list that faulted).
 static char dl_ring[64][128];
@@ -320,41 +335,120 @@ void vk_devlost_dump(void) {
     LOG("[vk] last GPU operations before the device loss (oldest first):\n");
     for (unsigned i = dl_n > 64 ? dl_n - 64 : 0; i < dl_n; i++) LOG("[vk]   %s\n", dl_ring[i & 63]);
 }
-static void gp_mark(VkCommandBuffer cb, const char *fmt, ...) {
-    if (!g_gpuprof_frame || gp_n >= GP_MAX - 1) return;
-    if (!gp_qp) {
-        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = GP_MAX};
-        if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &gp_qp) != VK_SUCCESS) { g_gpuprof_frame = false; return; }
-    }
-    if (!gp_n) rec_CmdResetQueryPool(cb, gp_qp, 0, GP_MAX);
-    rec_CmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, gp_qp, (uint32_t)gp_n);
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(gp_label[gp_n], sizeof gp_label[0], fmt, ap);
-    va_end(ap);
-    gp_draws[gp_n] = 0;
-    gp_n++;
+static bool gp_ready(void) {
+    if (gp_qp) return true;
+    if (gp_failed) return false;
+    VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                .queryCount = SUBS * GPQ};
+    if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &gp_qp) != VK_SUCCESS) { gp_failed = true; gp_qp = VK_NULL_HANDLE; }
+    return gp_qp != VK_NULL_HANDLE;
 }
 
-// (SAVAGEWIND_GPUPROF_AT) a mark from code outside this file: the FidelityFX backend's job labels (vulkan/fsr3.cpp)
-void vk_gpuprof_mark(VkCommandBuffer cb, const char *what) {
-    if (g_gpuprof_frame) gp_mark(cb, "%s", what);
+static void gp_mark(VkCommandBuffer cb, const char *fmt, ...) {
+    GpSub *g = &gp_sub[cur_sub];
+    if (!g->started || g->gen != g_prof_gen || !prof_enabled() || g->n >= GPQ - 1) return;
+    char buf[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    g->site[g->n] = prof_site_dyn(buf);
+    g->draws[g->n] = 0;
+    rec_CmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, gp_qp, (uint32_t)(cur_sub * GPQ) + g->n);
+    g->n++;
 }
-void renderer_flush(void);
-void vk_gpuprof_report(void) {
-    if (!gp_n) return;
-    renderer_flush();
-    static uint64_t t[GP_MAX];
-    if (vkGetQueryPoolResults(g_vk.dev, gp_qp, 0, (uint32_t)gp_n, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
-        double per = g_vk.props.limits.timestampPeriod / 1e6, total = (t[gp_n - 1] - t[0]) * per;
-        LOG("[gpuprof] %d marks, %.2f ms first to last (rows: the work after each mark, until the next)\n", gp_n, total);
-        for (int i = 0; i + 1 < gp_n; i++) {
-            double ms = (t[i + 1] - t[i]) * per;
-            LOG("[gpuprof] %6.3f ms %5.1f%%  %s%s", ms, 100 * ms / (total > 0 ? total : 1), gp_label[i], gp_draws[i] ? "" : "\n");
-            if (gp_draws[i]) LOG(", %u draws\n", gp_draws[i]);
-        }
+
+// A submission's first command buffer begins (outside any render pass): its queries are reset and the first row starts.
+static void gp_begin(VkCommandBuffer cb) {
+    GpSub *g = &gp_sub[cur_sub];
+    g->n = 0;
+    g->started = false;
+    if (!prof_enabled() || !gp_ready()) return;
+    g->gen = g_prof_gen;
+    g->frame = renderer_present_count();
+    g->started = true;
+    rec_CmdResetQueryPool(cb, gp_qp, (uint32_t)(cur_sub * GPQ), GPQ);
+    gp_mark(cb, "submission start");
+}
+
+// The submission is complete: the closing timestamp, and its results are read once it has finished.
+static void gp_end(VkCommandBuffer cb, uint64_t seq) {
+    GpSub *g = &gp_sub[cur_sub];
+    if (!g->started) return;
+    g->started = false;
+    if (!g->n) return;
+    rec_CmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, gp_qp, (uint32_t)(cur_sub * GPQ) + g->n);
+    g->seq = seq;
+    g->submit_ticks = prof_ticks();
+    gp_fifo[gp_tail++ % SUBS] = (uint8_t)cur_sub;
+}
+
+// The GPU clock against the CPU's cycle counter: one reading of both (the call is bracketed by two counter reads).
+static bool gp_clocks(uint64_t *gpu, uint64_t *cpu) {
+    static PFN_vkGetCalibratedTimestampsEXT get;
+    if (!g_vk.calibrated) return false;
+    if (!get) get = (PFN_vkGetCalibratedTimestampsEXT)vkGetDeviceProcAddr(g_vk.dev, "vkGetCalibratedTimestampsEXT");
+    if (!get) return false;
+    VkCalibratedTimestampInfoEXT info = {.sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, .timeDomain = VK_TIME_DOMAIN_DEVICE_EXT};
+    uint64_t c0 = prof_ticks(), dev = 0, dev_max;
+    if (get(g_vk.dev, 1, &info, &dev, &dev_max) != VK_SUCCESS) return false;
+    *cpu = c0 + (prof_ticks() - c0) / 2;
+    *gpu = dev;
+    return true;
+}
+
+// Differences of GPU timestamps wrap at the queue's valid bits (36 on some Intel chips).
+static uint64_t gp_mask(void) {
+    static uint64_t mask;
+    if (!mask) {
+        uint32_t n = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(g_vk.phys, &n, NULL);
+        VkQueueFamilyProperties *q = calloc(n ? n : 1, sizeof *q);
+        vkGetPhysicalDeviceQueueFamilyProperties(g_vk.phys, &n, q);
+        uint32_t bits = g_vk.qfam < n ? q[g_vk.qfam].timestampValidBits : 64;
+        free(q);
+        mask = bits >= 64 || bits == 0 ? ~0ull : (1ull << bits) - 1;
     }
-    gp_n = 0;
+    return mask;
+}
+
+static void gp_read(GpSub *g, unsigned si) {
+    if (!prof_enabled() || g->gen != g_prof_gen || !g->n) return;
+    static uint64_t t[GPQ + 1];
+    if (vkGetQueryPoolResults(g_vk.dev, gp_qp, (uint32_t)(si * GPQ), g->n + 1, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
+    double tpn = prof_ticks_per_ns() * g_vk.props.limits.timestampPeriod;  // CPU ticks per GPU tick
+    uint64_t gpu_now, cpu_now;
+    uint64_t base;  // CPU tick of t[0]
+    if (gp_clocks(&gpu_now, &cpu_now)) base = cpu_now - (uint64_t)((double)((gpu_now - t[0]) & gp_mask()) * tpn);
+    else base = g->submit_ticks;  // (no calibration: the submission started when it was handed over, the GPU not backed up)
+    if (gp_prev_gen != g->gen) { gp_prev_gen = g->gen; gp_prev_end = 0; }
+    static uint32_t idle_site;
+    if (!idle_site) idle_site = prof_site_dyn("(gpu idle)");
+    if (gp_prev_end && base > gp_prev_end) prof_put_gpu(idle_site, gp_prev_end, base, g->frame << 32);
+    for (uint32_t i = 0; i < g->n; i++) {
+        uint64_t a = base + (uint64_t)((double)((t[i] - t[0]) & gp_mask()) * tpn), b = base + (uint64_t)((double)((t[i + 1] - t[0]) & gp_mask()) * tpn);
+        prof_put_gpu(g->site[i], a, b, g->draws[i] | (g->frame << 32));
+    }
+    gp_prev_end = base + (uint64_t)((double)((t[g->n] - t[0]) & gp_mask()) * tpn);
+}
+
+// Read the submissions that have finished, oldest first (all of them, waiting if need be, with `block`).
+static void gp_collect(bool block) {
+    while (gp_head != gp_tail) {
+        unsigned si = gp_fifo[gp_head % SUBS];
+        GpSub *g = &gp_sub[si];
+        if (vk_completed_seq() < g->seq) {
+            if (!block) return;
+            vk_wait_seq(g->seq);
+        }
+        gp_read(g, si);
+        gp_head++;
+    }
+}
+// a mark from code outside this file: the FidelityFX backend's job labels (vulkan/fsr3.cpp)
+void vk_gpuprof_mark(VkCommandBuffer cb, const char *what) { gp_mark(cb, "%s", what); }
+void vk_gpu_collect(void) {
+    if (gp_head != gp_tail) gp_collect(false);
 }
 
 // Submit the pending work (if any). wait/signal: binary semaphores for presentation (may be null).
@@ -372,6 +466,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     }
     vk_cmd();  // (an empty main buffer still carries the semaphores)
     if (s->ts) rec_CmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
+    gp_end(s->main, submit_seq + 1);
     rec_EndCommandBuffer(s->main);
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
     VkSemaphoreSubmitInfo sig[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
@@ -1662,7 +1757,7 @@ static void begin_pass(void) {
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
                 (void *)st.rt.depth);
     }
-    if (g_gpuprof_frame) {
+    if (prof_enabled()) {
         NvnTexture *t0 = st.rt.ncolor ? st.rt.color[0] : NULL;
         NvnTexture *d = st.rt.depth;
         gp_mark(cb, "pass: %d color %ux%u fmt %#x, depth %ux%u", st.rt.ncolor, t0 ? t0->width : 0, t0 ? t0->height : 0,
@@ -6423,12 +6518,9 @@ have_pipe:
     }
     cum_draws++;
     if (g_debug_frame) pick_after_draw();
-    if (g_gpuprof_frame && gp_n) {
-        if (!gp_draws[gp_n - 1]) {  // first draw of the row: its fragment shader hash
-            size_t l = strlen(gp_label[gp_n - 1]);
-            snprintf(gp_label[gp_n - 1] + l, sizeof gp_label[0] - l, ", first fs %016llx", (unsigned long long)g_cur_fs_hash);
-        }
-        gp_draws[gp_n - 1]++;
+    {   // (the profiler) a draw in the GPU row now open
+        GpSub *g = &gp_sub[cur_sub];
+        if (g->started && g->n && g->gen == g_prof_gen) g->draws[g->n - 1]++;
     }
 }
 
@@ -7359,7 +7451,7 @@ static void scene_post(Prog *pr, CmdRec *r) {
         if (grade) {
             TexBackend *g = post_image(32, w, h, b->format);
             VkImageView gi[3] = {src, lut};
-            if (g_gpuprof_frame) gp_mark(cb, "colour grading%s", lut ? " + LUT" : "");
+            gp_mark(cb, "colour grading%s", lut ? " + LUT" : "");
             post_pass_pc(cb, lut ? "grade_lut.frag" : "grade.frag", gi, lut ? 2 : 1, g, gpc, sizeof gpc, false);
             src = post_view(g);
             out = in = g;
@@ -7374,7 +7466,7 @@ static void scene_post(Prog *pr, CmdRec *r) {
             return;
         }
         if (up) {
-            if (g_gpuprof_frame) gp_mark(cb, "scene FSR 1");
+            gp_mark(cb, "scene FSR 1");
             TexBackend *e = post_image(5, ow, oh, b->format), *o = post_image(6, ow, oh, b->format);
             float iw = (float)b->width, ih = (float)b->height;
             // (the scene is linear light - the composite gamma-encodes it -: EASU and RCAS work on its gamma 2.0 in
@@ -7700,7 +7792,7 @@ TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
                         mvec_vectors_img->height == db->height;
             if (!mvec_for_framegen()) objv = false;  // (the default: they break up foliage, mvec.c mvec_for_framegen)
             if (objv) mv = mvec_vectors_img;
-            if (g_gpuprof_frame) gp_mark(cb, "frame generation: motion vectors");
+            gp_mark(cb, "frame generation: motion vectors");
             if (!objv) post_pass_pc(cb, "fg_mv.frag", &dv, 1, mv, pc, sizeof pc, false);
             TexBackend *hl = fg_image(0, b->width, b->height, srgb_of(unorm_of(b->format)), VK_IMAGE_USAGE_TRANSFER_DST_BIT);
             {   // (testing) SAVAGEWIND_FG_INPUTS_AT=<n>: the n-th generated frame's HUD-less image and motion vectors
@@ -7735,14 +7827,14 @@ TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
             memcpy(f.cam_right, right, sizeof right), memcpy(f.cam_fwd, fwd, sizeof fwd);
             if (!g_fg_vk.dev) g_fg_vk = (FgVk){g_vk.phys, g_vk.dev, vk_fg_wait_idle};
             vk_full_barrier(cb);
-            if (g_gpuprof_frame) gp_mark(cb, "frame generation: FSR 3 optical flow + interpolation");
+            gp_mark(cb, "frame generation: FSR 3 optical flow + interpolation");
             static int test = -1;  // (measuring) SAVAGEWIND_FG_TEST=2: no interpolation (the HUD-less copy shown instead)
             if (test < 0) test = getenv("SAVAGEWIND_FG_TEST") ? atoi(getenv("SAVAGEWIND_FG_TEST")) : 0;
             if (test != 2) rec_drain();  // (FidelityFX records into cb itself: what was queued before goes first)
             ok = test == 2 ? true : fg_dispatch(cb, &cfg, &f);
             if (test == 2) o = hl;
             vk_full_barrier(cb);
-            if (g_gpuprof_frame) gp_mark(cb, "frame generation: done");
+            gp_mark(cb, "frame generation: done");
             vk_dyn_forget();
             if (ok) out = o;
             static int logged;
@@ -7971,13 +8063,13 @@ static TexBackend *fsr3_scene(VkCommandBuffer cb, TexBackend *b, uint32_t ow, ui
     TexBackend *out = post_image_ex(13, ow, oh, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
     float pc[8] = {0};
     VkImageView di[3] = {vk_image_view(db, VK_IMAGE_VIEW_TYPE_2D, db->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT)};
-    if (g_gpuprof_frame) gp_mark(cb, "FSR 3 depth copy");
+    gp_mark(cb, "FSR 3 depth copy");
     post_pass(cb, "fsr3_depth.frag", di, 1, dep, pc, false);
     VkImageView ri[3] = {post_view(v)};
     static int reactive = -1;  // SAVAGEWIND_FSR3_REACTIVE=0: (testing) no reactive mask (all zero)
     if (reactive < 0) reactive = !getenv("SAVAGEWIND_FSR3_REACTIVE") || atoi(getenv("SAVAGEWIND_FSR3_REACTIVE")) != 0;
     float rpc[8] = {reactive ? 1.0f : 0.0f};
-    if (g_gpuprof_frame) gp_mark(cb, "FSR 3 reactive mask");
+    gp_mark(cb, "FSR 3 reactive mask");
     post_pass(cb, "fsr3_reactive.frag", ri, 1, rea, rpc, false);
     vk_full_barrier(cb);
     float flip = nvn_window_origin() == 0 ? -1.0f : 1.0f;  // (the game's NDC y to clip y: mvec_fill.frag's a.x)
@@ -7996,10 +8088,10 @@ static TexBackend *fsr3_scene(VkCommandBuffer cb, TexBackend *b, uint32_t ow, ui
         .reset = last == ~0ull || last + 1 != frame,
     };
     last_ns = ns;
-    if (g_gpuprof_frame) gp_mark(cb, "FSR 3 upscaler");
+    gp_mark(cb, "FSR 3 upscaler");
     rec_drain();  // (FidelityFX records into cb itself, and may wait for the device: what was queued before goes first)
     if (!fsr3_dispatch(&d)) return NULL;
-    if (g_gpuprof_frame) gp_mark(cb, "after FSR 3");
+    gp_mark(cb, "after FSR 3");
     last = frame;
     vk_dyn_forget();  // (FSR's own pipelines and sets were bound)
     vk_full_barrier(cb);

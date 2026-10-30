@@ -40,7 +40,7 @@ class SwprofTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
-        sites = {1: 'render', 2: 'draw', 3: 'exec', 4: 'exec/pre', 5: 'queue'}
+        sites = {1: 'render', 2: 'draw', 3: 'exec', 4: 'exec/pre', 5: 'queue', 6: 'pass 1920x1080', 7: '(gpu idle)'}
         recs = []
         # 10 frames of 10 ms, one of them (frame 5) 60 ms because "draw" takes 50 ms in it
         t = 0
@@ -55,6 +55,9 @@ class SwprofTest(unittest.TestCase):
                 # 100 calls of exec, 2 ms in total, 1.5 ms of it in exec/pre
                 recs.append((1, 0, 2 * TPM, f, 3, swprof.ACC | (100 << 8)))
                 recs.append((1, 0, int(1.5 * TPM), f, 4, swprof.ACC | (100 << 8)))
+                # the GPU: a pass of 3 ms (20 draws) and 1 ms idle
+                recs.append((1, (t + 2) * TPM, (t + 5) * TPM, 20 | (f << 32), 6, swprof.GPU))
+                recs.append((1, (t + 5) * TPM, (t + 6) * TPM, f << 32, 7, swprof.GPU))
             t += dur
         self.path = os.path.join(self.dir.name, 'x.swprof')
         with open(self.path, 'wb') as fh:
@@ -62,7 +65,7 @@ class SwprofTest(unittest.TestCase):
 
     def test_reads_the_file(self):
         cap = swprof.Capture(self.path)
-        self.assertEqual([n for n, _ in cap.threads], ['main', 'render'])
+        self.assertEqual([n for n, _ in cap.threads], ['main', 'render', 'gpu'])
         self.assertEqual(len(cap.frame_marks), 11)
         self.assertAlmostEqual(cap.ticks_per_ms, TPM, delta=1)
         self.assertEqual(len(cap.zones[0]), 20)
@@ -95,6 +98,16 @@ class SwprofTest(unittest.TestCase):
         self.assertAlmostEqual(pre['calls_per_frame'], 100, delta=0.1)
         top = {(t['thread'], t['name']): t['self_ms_per_frame'] for t in res['top_self']}
         self.assertAlmostEqual(top[('render', 'exec/pre')], 1.5, delta=0.01)
+
+    def test_gpu(self):
+        res = swprof.analyse(swprof.Capture(self.path))
+        g = res['gpu']
+        self.assertAlmostEqual(g['busy_ms_per_frame'], 3.0, delta=0.01)
+        self.assertAlmostEqual(g['idle_ms_per_frame'], 1.0, delta=0.01)
+        self.assertAlmostEqual(g['busy_percent'], 75.0, delta=0.1)
+        self.assertEqual(g['rows'][0]['name'], 'pass 1920x1080')
+        self.assertAlmostEqual(g['rows'][0]['draws_per_frame'], 20, delta=0.01)
+        self.assertTrue(any(t['name'] == 'gpu' for t in res['threads']))
 
     def test_counters(self):
         res = swprof.analyse(swprof.Capture(self.path))

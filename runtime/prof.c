@@ -100,6 +100,46 @@ void prof_thread_name(const char *name) {
         snprintf(threads[t_prof.thread].name, sizeof threads[0].name, "%s", t_name);
 }
 
+// ---- names made at run time: copied, deduplicated by a hash table (open addressing)
+#define DYN_SLOTS 4096
+static uint16_t dyn_slot[DYN_SLOTS];  // site id, 0: free
+static uint32_t dyn_count;
+
+uint32_t prof_site_dyn(const char *name) {
+    uint32_t h = 2166136261u;
+    for (const char *p = name; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+    uint32_t id = 0;
+    pthread_mutex_lock(&site_lock);
+    for (uint32_t i = 0; i < DYN_SLOTS; i++) {
+        uint16_t e = dyn_slot[(h + i) % DYN_SLOTS];
+        if (!e) {
+            if (nsites + 1 < PROF_MAX_SITES - 1 && dyn_count < DYN_SLOTS / 2) {
+                char *copy = strdup(name);
+                if (copy) {
+                    site_names[++nsites] = copy;
+                    dyn_slot[(h + i) % DYN_SLOTS] = (uint16_t)nsites;
+                    dyn_count++;
+                    id = nsites;
+                }
+            }
+            break;
+        }
+        if (!strcmp(site_names[e], name)) { id = e; break; }
+    }
+    if (!id) {
+        id = PROF_MAX_SITES - 1;  // out of ids: the rest share the last one
+        site_names[id] = "(too many markers)";
+        if (nsites < id) nsites = id;
+    }
+    pthread_mutex_unlock(&site_lock);
+    return id;
+}
+
+double prof_ticks_per_ns(void) {
+    uint64_t dn = plat_now_ns() - ns0, dt = prof_ticks() - ticks0;
+    return dn > 1000000 ? (double)dt / (double)dn : 1.0;  // (less than a millisecond in: no measurement yet)
+}
+
 // A cursor with no chunk, or one from an older capture (register this thread again), or a full one (next chunk).
 bool prof_slow(ProfCursor *c) {
     if (!prof_enabled()) return false;

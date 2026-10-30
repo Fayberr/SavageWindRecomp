@@ -63,7 +63,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
 static void create_instance(void) {
     Uint32 n_sdl = 0;
     const char *const *sdl_ext = SDL_Vulkan_GetInstanceExtensions(&n_sdl);
-    const char *ext[24];
+    const char *ext[28];
     uint32_t n_ext = 0;
     for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
     {   // the HDR10 colour space of an HDR swapchain (Video > HDR) comes with VK_EXT_swapchain_colorspace
@@ -248,6 +248,8 @@ static void create_device(void) {
     if (g_addr_report_hi) LOG("[vk] address binding report %s\n", addr_report ? "on" : "not supported");
     g_vk.custom_border = has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     if (g_vk.custom_border) ext[n_ext++] = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
+    g_vk.calibrated = has_ext(ep, ne, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+    if (g_vk.calibrated) ext[n_ext++] = VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
     g_vk.divisor = has_ext(ep, ne, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
     if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
     g_vk.host_import = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);  // guest heap as a GPU buffer (exec.c)
@@ -1856,17 +1858,8 @@ presented:
     if (debug_n < 0) { const char *e = getenv("SAVAGEWIND_DEBUG_FRAMES"); debug_n = e && atol(e) > 1 ? atol(e) : 1; }
     g_debug_frame = debug_at && total_frames >= (uint64_t)debug_at && total_frames < (uint64_t)debug_at + (uint64_t)debug_n;
     if (!g_debug_frame) { extern void vk_pick_report(void); vk_pick_report(); }  // (SAVAGEWIND_DEBUG_PICK)
-    {   // SAVAGEWIND_GPUPROF_AT=<frame>[,<frame>...]: GPU time per pass of those frames ("[gpuprof]" in the log)
-        extern bool g_gpuprof_frame;
-        extern void vk_gpuprof_report(void);
-        if (g_gpuprof_frame) { g_gpuprof_frame = false; vk_gpuprof_report(); }
-        const char *e = getenv("SAVAGEWIND_GPUPROF_AT");
-        for (const char *p = e; p && *p;) {
-            long at = strtol(p, (char **)&p, 10);
-            if (at == (long)total_frames) { g_gpuprof_frame = true; break; }
-            if (*p == ',') p++; else break;
-        }
-    }
+    extern void vk_gpu_collect(void);
+    vk_gpu_collect();  // (the profiler: GPU time of the submissions that have finished)
     if (g_debug_frame) LOG("===== debug frame %llu =====\n", (unsigned long long)total_frames);
     {   // (testing) SAVAGEWIND_UPSCALE_AT=<frame>:<off|ultra|quality|balanced|performance>,... (ascending): the
         // upscaler from that frame on, as the Video page sets it (A/B of the same view a few frames apart): FSR 1, or

@@ -25,7 +25,8 @@ THREAD = struct.Struct('<IIQ32s')
 CHUNK = struct.Struct('<II')
 REC = struct.Struct('<QQQII')
 
-ZONE, COUNTER, FRAME, ACC = 1, 2, 3, 4
+ZONE, COUNTER, FRAME, ACC, GPU = 1, 2, 3, 4, 5
+GPU_IDLE = '(gpu idle)'
 
 
 class Capture:
@@ -60,6 +61,7 @@ class Capture:
         self.acc = [[] for _ in self.threads]
         self.counters = collections.defaultdict(list)  # name -> [(ms, value)]
         self.frame_marks = []  # (ms, frame number)
+        self.gpu = []  # (start, end, site, draws)
         self.records = 0
         ms = lambda t: (t - t0) / self.ticks_per_ms
         for _ in range(nchunks):
@@ -77,9 +79,16 @@ class Capture:
                     self.counters[self.sites.get(site, '?')].append((ms(a), b))  # the value is in t1
                 elif k == FRAME:
                     self.frame_marks.append((ms(a), val))
+                elif k == GPU:
+                    self.gpu.append((ms(a), ms(b), site, val & 0xffffffff))
             pos += n * REC.size
             self.records += n
         self.frame_marks.sort()
+        self.gpu.sort()
+        if self.gpu:  # the GPU's rows are a thread of their own: flat, one after another
+            self.threads.append(('gpu', 0))
+            self.zones.append([(a, b, site) for a, b, site, _ in self.gpu])
+            self.acc.append([])
 
 
 def percentile(sorted_values, p):
@@ -211,9 +220,35 @@ def analyse(cap, first=None, last=None):
         cause = sorted(per_frame_self.get(i, {}).items(), key=lambda kv: -kv[1])[:6]
         result['slow_frames'].append({'frame': n, 'ms': round(dur, 2), 'at_s': round(start / 1000, 3),
                                       'top': [{'thread': k[0], 'name': k[1], 'ms': round(v, 2)} for k, v in cause]})
+    result['gpu'] = gpu_summary(cap, fr, span, nframes)
     result['_frames'] = fr
     result['_per_frame_self'] = per_frame_self
     return result
+
+
+def gpu_summary(cap, fr, span, nframes):
+    if not cap.gpu:
+        return {}
+    rows = collections.defaultdict(lambda: [0, 0.0, 0, 0.0])  # name -> rows, ms, draws, longest
+    busy = idle = 0.0
+    for a, b, site, draws in cap.gpu:
+        if not (span[0] <= a < span[1]):
+            continue
+        name = cap.sites.get(site, '?')
+        r = rows[name]
+        r[0] += 1
+        r[1] += b - a
+        r[2] += draws
+        r[3] = max(r[3], b - a)
+        if name == GPU_IDLE:
+            idle += b - a
+        else:
+            busy += b - a
+    return {'busy_ms_per_frame': round(busy / nframes, 3), 'idle_ms_per_frame': round(idle / nframes, 3),
+            'busy_percent': round(100 * busy / (busy + idle), 1) if busy + idle else 0,
+            'rows': [{'name': n, 'rows_per_frame': round(v[0] / nframes, 2), 'ms_per_frame': round(v[1] / nframes, 4),
+                      'draws_per_frame': round(v[2] / nframes, 1), 'max_ms': round(v[3], 3)}
+                     for n, v in sorted(rows.items(), key=lambda kv: -kv[1][1])]}
 
 
 def text_report(res, top_n, slow_ms):
@@ -229,8 +264,14 @@ def text_report(res, top_n, slow_ms):
     w(f"\nTop {top_n} places by self time (ms per frame, calls per frame):")
     for t in res['top_self'][:top_n]:
         w(f"  {t['self_ms_per_frame']:8.3f}  {t['calls_per_frame']:9.1f}x  [{t['thread']}] {t['name']}")
+    g = res.get('gpu')
+    if g:
+        w(f"\nGPU: busy {g['busy_ms_per_frame']} ms per frame ({g['busy_percent']}% of the time), idle {g['idle_ms_per_frame']} ms. "
+          f"Passes, dispatches and copies by GPU time (ms per frame):")
+        for r in g['rows'][:top_n]:
+            w(f"  {r['ms_per_frame']:8.3f}  {r['rows_per_frame']:7.2f}x  {r['draws_per_frame']:8.1f} draws  max {r['max_ms']:.2f}  {r['name']}")
     for th in res['threads']:
-        if not th['zones'] and not th['acc']:
+        if not th['zones'] and not th['acc'] or th['name'] == 'gpu':
             continue
         w(f"\nThread {th['name']} (busy in zones {th['busy_ms_per_frame']} ms per frame)")
         for z in th['zones']:
