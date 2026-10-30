@@ -1158,13 +1158,17 @@ int sc_list_slots(const char *save_0_dir, ScSlot **out) {
         s->saved = stat(have_cap ? cp : gd, &sb) == 0 ? sb.st_mtime : 0;
         s->has_picture = is_file(jp);
         s->play_seconds = -1;
-        if (have_cap) {  // caption.sav's own play time, when it has one (a flag called PlayTime, in seconds)
+        // the play time in seconds: the flag a real save keeps in game_data.sav, else a PlayTime flag in caption.sav
+        const char *play_files[] = {gd, cp};
+        const char *play_flags[] = {"PlayReport_PlayTime", "PlayTime"};
+        for (int k = 0; k < 2 && s->play_seconds < 0; k++) {
+            if (!is_file(play_files[k])) continue;
             char why[64];
             size_t len;
-            uint8_t *d = read_file(cp, &len, 1 << 24, why, sizeof why);
+            uint8_t *d = read_file(play_files[k], &len, 1 << 26, why, sizeof why);
             bool le;
             if (d && detect_endian(d, len, &le, why, sizeof why)) {
-                uint32_t want = crc32_name("PlayTime");
+                uint32_t want = crc32_name(play_flags[k]);
                 for (size_t o = HEADER; o + 8 <= len - 4; o += 8)
                     if (rd32(d + o, le) == want) {
                         int32_t sec = (int32_t)rd32(d + o + 4, le);
