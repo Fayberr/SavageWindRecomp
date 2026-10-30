@@ -1,9 +1,10 @@
-// Named game state cells (control_cells.h): for now the orbit camera, which `camera` and `pos` fall back to.
+// Named game state cells (control_cells.h) and the `cell` command (developer only).
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "control.h"
 #include "control_cells.h"
 #include "control_mem.h"
 #include "game_sites.h"
@@ -59,7 +60,61 @@ bool control_cell_camera_angles(double e[3], double t[3], double *yaw, double *p
     return true;
 }
 
+bool control_cell_set(const ControlCell *c, const double *in) {
+    uint64_t a = control_cell_addr(c);
+    uint8_t v[16];
+    if (!a) return false;
+    for (int i = 0; i < c->count; i++) {
+        switch (c->type) {
+        case CELL_F32: { float f = (float)in[i]; memcpy(v + 4 * i, &f, 4); break; }
+        case CELL_U32: { uint32_t u = (uint32_t)in[i]; memcpy(v + 4 * i, &u, 4); break; }
+        case CELL_S32: { int32_t s = (int32_t)in[i]; memcpy(v + 4 * i, &s, 4); break; }
+        }
+    }
+    return control_mem_poke(a, v, elem_size(c->type) * (size_t)c->count);
+}
+
 // ---- the cells
+
+// Link's position: the copy at PlayerInfo +0x88 is what the game rewrites each frame, so a chain is accepted only if it
+// ends on a vec3 within a metre (x and z) of that copy. Primary chain first; the other two reach the same object through
+// an array whose slot moved by 8 between boots (found with mem path, 1.9.0).
+static bool pos_check(const void *value) {
+    uint64_t pinfo = g_site.player_info ? *(const uint64_t *)(uintptr_t)g_site.player_info : 0;
+    if (!pinfo) return false;
+    const float *pp = (const float *)(uintptr_t)(pinfo + 0x88), *v = value;
+    return fabsf(v[0] - pp[0]) <= 1.0f && fabsf(v[2] - pp[2]) <= 1.0f;
+}
+static const CellChain pos_chains[] = {
+    {5, {0x60, 0x578, 0x80, 0x410, 0x1c0}},
+    {5, {0x10, 0xe8, 0x750, 0x78, 0x1c0}},
+    {5, {0x10, 0xe8, 0x758, 0x78, 0x1c0}},
+};
+const ControlCell control_cell_player_pos = {
+    "player.pos", "Link's real position x y z (what `teleport` writes)", offsetof(GameSites, player_info), CELL_F32, 3,
+    pos_chains, (int)(sizeof pos_chains / sizeof *pos_chains), pos_check,
+};
+
+// Fall damage: the game keeps the highest point Link reached since he left the ground and, on landing, takes the drop from
+// there. It lives in two copies on the player object (found by flying up, then down, and reading which slots follow the
+// peak and not the current height, 1.9.0). A reading is accepted when it is not below Link's own height (the copy at
+// PlayerInfo +0x8c) and not absurdly above it.
+static bool fall_check(const void *value) {
+    uint64_t pinfo = g_site.player_info ? *(const uint64_t *)(uintptr_t)g_site.player_info : 0;
+    if (!pinfo) return false;
+    float py = *(const float *)(uintptr_t)(pinfo + 0x8c), v = *(const float *)value;
+    return isfinite(v) && v >= py - 2.0f && v <= py + 20000.0f;
+}
+static const CellChain fall_top_chains[] = {{2, {0x60, 0x860}}};
+static const CellChain fall_top2_chains[] = {{2, {0x60, 0x20d0}}};
+const ControlCell control_cell_player_fall_top = {
+    "player.fall_top", "highest y since Link left the ground (fall damage is the drop from it)", offsetof(GameSites, player_info), CELL_F32, 1,
+    fall_top_chains, 1, fall_check,
+};
+const ControlCell control_cell_player_fall_top2 = {
+    "player.fall_top2", "second copy of player.fall_top (the game keeps both)", offsetof(GameSites, player_info), CELL_F32, 1,
+    fall_top2_chains, 1, fall_check,
+};
 
 // The orbit camera behind Link (found by rotating candidate eye positions around him and watching the camera, 1.9.0).
 // One object holds eye (x y z), target (x y z, a little above Link), up, fov, near and far; the game keeps the eye as
@@ -93,3 +148,74 @@ const ControlCell control_cell_camera_pitch = {
     "camera.pitch", "minus the camera pitch in degrees (positive looks down; the game clamps it to +-89)", offsetof(GameSites, player_info), CELL_F32, 1,
     pitch_chains, 2, pitch_check,
 };
+
+static const ControlCell *const all_cells[] = {&control_cell_player_pos, &control_cell_player_fall_top, &control_cell_player_fall_top2,
+                                               &control_cell_camera_eye, &control_cell_camera_target, &control_cell_camera_pitch};
+
+const ControlCell *control_cell_find(const char *name) {
+    for (size_t i = 0; i < sizeof all_cells / sizeof *all_cells; i++)
+        if (!strcmp(all_cells[i]->name, name)) return all_cells[i];
+    return NULL;
+}
+
+// cell | cell <name> | cell <name> <v> [<v>...]
+static void cmd_cell(int argc, char **argv, ControlReply *r) {
+    if (argc == 1) {
+        for (size_t i = 0; i < sizeof all_cells / sizeof *all_cells; i++) {
+            const ControlCell *c = all_cells[i];
+            control_field_str(r, c->name, c->what);
+        }
+        return;
+    }
+    const ControlCell *c = control_cell_find(argv[1]);
+    if (!c) { control_fail(r, "Unknown cell: %s", argv[1]); return; }
+    if (argc > 2) {
+        if (argc - 2 != c->count) { control_fail(r, "%s needs %d value(s)", c->name, c->count); return; }
+        double v[4];
+        for (int i = 0; i < c->count; i++) {
+            char *end;
+            v[i] = strtod(argv[2 + i], &end);
+            if (end == argv[2 + i] || *end || !isfinite(v[i])) { control_fail(r, "Not a number: \"%s\"", argv[2 + i]); return; }
+        }
+        if (!control_cell_set(c, v)) { control_fail(r, "Cannot write %s", c->name); return; }
+    }
+    double v[4];
+    if (!control_cell_get(c, v)) { control_fail(r, "%s not found", c->name); return; }
+    char a[32];
+    snprintf(a, sizeof a, "0x%llx", (unsigned long long)control_cell_addr(c));
+    control_field_str(r, "address", a);
+    for (int i = 0; i < c->count; i++) {
+        char k[16];
+        snprintf(k, sizeof k, "v%d", i);
+        control_field_num(r, k, v[i]);
+    }
+}
+
+// sites: the game's known root addresses (game_sites.h) and the pointer stored at each, the starting points for mem path
+static void cmd_sites(int argc, char **argv, ControlReply *r) {
+    (void)argv;
+    if (argc != 1) { control_fail(r, "Usage: sites"); return; }
+#define SITE(n)                                                                                                      \
+    do {                                                                                                             \
+        char a[32], k[48];                                                                                           \
+        uint64_t v = 0;                                                                                              \
+        snprintf(k, sizeof k, "%s", #n);                                                                             \
+        snprintf(a, sizeof a, "0x%llx", (unsigned long long)g_site.n);                                               \
+        control_field_str(r, k, a);                                                                                  \
+        if (g_site.n && control_mem_peek(g_site.n, &v, sizeof v)) {                                                  \
+            snprintf(k, sizeof k, "%s.value", #n);                                                                   \
+            snprintf(a, sizeof a, "0x%llx", (unsigned long long)v);                                                  \
+            control_field_str(r, k, a);                                                                              \
+        }                                                                                                            \
+    } while (0);
+    GAME_SITES(SITE)
+#undef SITE
+}
+
+void control_cells_init(void) {
+    static const ControlCmd cmds[] = {
+        {"cell", "[<name> [<value>...]]", "List, read or write a named game state cell", cmd_cell},
+        {"sites", "", "Known root addresses and their values", cmd_sites},
+    };
+    control_register(cmds, (int)(sizeof cmds / sizeof *cmds));
+}
