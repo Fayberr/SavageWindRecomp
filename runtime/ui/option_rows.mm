@@ -33,6 +33,8 @@ void opt_indent(int step) { g_indent = g_indent + step < 0 ? 0 : g_indent + step
 
 void opt_begin(const char *id, float scale) {
     g_scale = scale;
+    static std::string page;  // (another page: its first row's description, not the last page's)
+    if (page != id) page = id, g_desc_shown.clear(), g_img_shown = DescImage();
     g_take_first = g_focus_req;
     g_focus_req = false;
     if (g_take_first) ImGui::NavMoveRequestCancel();  // (this frame's Down goes to the first row instead)
