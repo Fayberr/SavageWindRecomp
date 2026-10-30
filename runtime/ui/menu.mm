@@ -17,6 +17,7 @@
 #include "option_rows.h"
 #include "imgui_internal.h"  // (NavCursorVisible)
 #include "osk.h"
+#include "console.h"
 #ifdef __APPLE__
 #include "imgui_impl_metal.h"
 #else
@@ -159,7 +160,7 @@ extern "C" void menu_size_list_open(void) {
     input_reset();
     g_sizes = true;
 }
-static bool capturing() { return g_open.load() || g_kbd.load() == 1 || g_sizes.load(); }
+static bool capturing() { return g_open.load() || g_kbd.load() == 1 || g_sizes.load() || console_is_open(); }
 // The game gets no input while this is true (runtime/hle/input.c): menu or name entry up, or a binding capture begun
 // from the game's Options screen.
 extern "C" bool menu_input_captured(void) {
@@ -176,6 +177,37 @@ static bool overlay_enabled(void) {
 static std::atomic<bool> g_cursor_free{false};
 extern "C" bool menu_cursor_free(void) { return g_cursor_free.load(); }
 
+// The console (console.mm): ` or F12 opens and closes it; the game gets no input meanwhile (capturing)
+static void set_console(bool open) {
+    if (open == console_is_open()) return;
+    console_set_open(open);
+    input_reset();  // nothing held leaks into the game
+}
+// Ctrl+V: the system clipboard as typed text (ImGui has a clipboard of its own, which is not the system's). One line,
+// at most 1000 bytes, in pieces that fit a text event, each ending on a whole character.
+static void console_paste(void) {
+    char *clip = SDL_GetClipboardText();
+    if (!clip) return;
+    const char *p = clip;
+    int total = 0;
+    while (*p && total < 1000) {
+        QEvent q = {};
+        q.kind = QEvent::TEXT;
+        size_t n = 0;
+        while (*p && n + 4 < sizeof q.text && total < 1000) {
+            unsigned char c = (unsigned char)*p;
+            size_t len = c < 0x80 ? 1 : c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+            if (strnlen(p, len) < len) { p += strnlen(p, len); break; }  // (cut off in the middle of a character)
+            if (c < 0x20 || c == 0x7F) { if (n && q.text[n - 1] != ' ') q.text[n++] = ' '; p++; total++; continue; }
+            memcpy(q.text + n, p, len);
+            n += len; p += len; total += (int)len;
+        }
+        q.text[n] = 0;
+        if (n) push(q);
+    }
+    SDL_free(clip);
+}
+
 bool menu_handle_event(const SDL_Event *e) {
     static bool back_down, start_down;
     // a binding capture (Controls tab, or the game's Options screen) takes the press
@@ -191,13 +223,25 @@ bool menu_handle_event(const SDL_Event *e) {
         return true;
     }
     // typing (a text field, the on-screen keyboard, the name entry): keys are text, not menu shortcuts
-    bool typing = g_kbd.load() == 1 || (g_open.load() && g_text_busy.load());
+    bool typing = g_kbd.load() == 1 || console_is_open() || (g_open.load() && g_text_busy.load());
     if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN && g_cursor_free.load() && !capturing()) {
         g_cursor_free = false;  // (the click only takes the cursor back)
         return true;
     }
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN:
+        if (!e->key.repeat && (e->key.scancode == SDL_SCANCODE_GRAVE || e->key.scancode == SDL_SCANCODE_F12) &&
+            !g_open.load() && g_kbd.load() != 1 && !g_sizes.load()) {
+            set_console(!console_is_open());
+            return true;
+        }
+        if (console_is_open()) {
+            if (e->key.scancode == SDL_SCANCODE_ESCAPE) { if (!e->key.repeat) set_console(false); return true; }
+            if (e->key.scancode == SDL_SCANCODE_V && (e->key.mod & (SDL_KMOD_CTRL | SDL_KMOD_GUI))) {
+                if (!e->key.repeat) console_paste();
+                return true;
+            }
+        }
         if (!e->key.repeat && (e->key.scancode == SDL_SCANCODE_F1 ||
                                (e->key.scancode == SDL_SCANCODE_ESCAPE && !g_open.load()))) {
             if (!overlay_enabled()) {
@@ -243,6 +287,9 @@ bool menu_handle_event(const SDL_Event *e) {
     }
     case SDL_EVENT_TEXT_INPUT:
         if (!capturing()) return false;
+        if (console_is_open() && (!strcmp(e->text.text, "`") || !strcmp(e->text.text, "^") || !strcmp(e->text.text, "~") ||
+                                  !strcmp(e->text.text, "\xC2\xB0")))
+            return true;  // (the key that opens the console is no text; ^ is that key on a German keyboard)
         { QEvent q = {}; q.kind = QEvent::TEXT; strlcpy(q.text, e->text.text, sizeof q.text); push(q); }
         return true;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP: {
@@ -317,6 +364,8 @@ void menu_apply_window_requests(void *win) {
         else SDL_StopTextInput(w);
         text_input = want_text;
     }
+    char *copy;
+    if (console_take_copy(&copy)) { SDL_SetClipboardText(copy); free(copy); }
     // (the window was made at its size and fullscreen mode: ui_window_init)
     uint64_t at = g_size_apply_at.load();
     if (at && SDL_GetTicks() >= at && g_size_apply_at.compare_exchange_strong(at, 0)) g_want_window_apply.store(true);
@@ -328,6 +377,7 @@ void menu_apply_window_requests(void *win) {
 static bool g_inited;
 static ImGuiContext *g_ctx;  // ours: the start screen (back to it after a reboot) has its own context
 static ImFont *g_font, *g_font_big;
+static ImFont *g_font_mono;  // the console (columns line up); NULL: the normal font
 static ImFont *g_menu_font, *g_menu_font_big;  // the menu window (Fira Sans); everything else keeps g_font
 static int g_tab, g_tab_request = -2;  // (-2: no request; -1 is the Prelaunch tab)
 static int g_focus_tab = -99;  // put the nav cursor on this tab next frame (-100: the selected one; -99: none)
@@ -379,7 +429,7 @@ static int g_fonts_lang = -1;
 static void load_fonts(void) {
     ImGuiIO &io = ImGui::GetIO();
     io.Fonts->Clear();
-    g_font = g_font_big = g_menu_font = g_menu_font_big = NULL;
+    g_font = g_font_big = g_menu_font = g_menu_font_big = g_font_mono = NULL;
     g_fonts_lang = ui_lang_generation();
     ImFontConfig cfg;
     cfg.OversampleH = 2;
@@ -396,6 +446,15 @@ static void load_fonts(void) {
         else continue;
         if (!g_font) g_font = add(p, 34, cfg);
         if (g_font && !g_font_big) { ImFontConfig b = cfg; b.FontNo = 0; g_font_big = add(p, 56, b); }
+    }
+    const char *mono_paths[] = {"/System/Library/Fonts/Menlo.ttc", "C:/Windows/Fonts/consola.ttf",
+                                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+                                "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf"};
+    for (const char *p : mono_paths) {
+        if (FILE *f = fopen(p, "rb")) fclose(f);
+        else continue;
+        g_font_mono = add(p, 28, cfg);
+        if (g_font_mono) break;
     }
     // the menu window itself: Fira Sans, as on the start screen (shipped, OFL) - Medium for the rows, SemiBold for the
     // titles - at its Settings window's sizes; the FPS counter, overlays and on-screen keyboard keep the fonts above
@@ -1278,7 +1337,9 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     bool open = g_open.load();
     bool kbd = g_kbd.load() == 1;
     bool sizes = g_sizes.load();
-    if (!open && !kbd && !sizes && g_settings.perf_overlay == PERF_OFF) {
+    bool con = console_is_open();
+    console_collect();
+    if (!open && !kbd && !sizes && !con && g_settings.perf_overlay == PERF_OFF) {
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
         return;
     }
@@ -1373,6 +1434,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
 
     if (kbd) keyboard_draw(io, scale);
     if (sizes) size_list_draw(io, scale);
+    if (con) console_draw(io, scale, g_font_mono ? g_font_mono : g_font);
     ImGui::Render();
     g_text_busy = open && ui_text_busy();
 #ifdef __APPLE__

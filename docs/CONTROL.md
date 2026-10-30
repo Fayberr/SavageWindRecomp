@@ -1,7 +1,7 @@
 # Control commands
 
 One list of named commands that more than one front end can run. Today that is a local socket, for scripts, AI agents
-and `tools/swctl.py`. Each command is either player safe (it only reads state or copies text, it cannot break the game)
+and `tools/swctl.py`, and the in-game console. Each command is either player safe (it only reads state or copies text, it cannot break the game)
 or developer only.
 
 ## Who may run what
@@ -14,7 +14,7 @@ or developer only.
 
 A normal start has no socket and no developer commands: they are not listed by `help`, not run, and answer
 `Unknown command`. `SAVAGEWIND_CONTROL=<port>` also opens the socket, `SAVAGEWIND_DEV=1` only unlocks the developer
-commands for a front end inside the game.
+commands in the in-game console.
 
 The socket listens on `127.0.0.1` only (not reachable from the network).
 
@@ -26,18 +26,29 @@ python tools/swctl.py state
 A command is player safe when its entry in the table has the `CONTROL_PLAYER` flag (`runtime/control.h`). Leave the flag
 off for anything that writes memory or files, moves things or ends the game.
 
+## The in-game console
+
+The same commands can be typed in the game: press `` ` `` (the key left of 1, which is `^` on a German keyboard) or F12.
+The game gets no input while the console is open; `` ` ``, F12 or Esc closes it. Up and Down walk through what you typed,
+Tab completes a command, Ctrl+V pastes from the system clipboard, `clear` empties the screen. The console is in English,
+like the command names and replies it shows.
+
+It runs the same commands as the socket, with the same rights: a normal start offers only the player safe commands
+below, with no socket. Text a command asks to copy (`pos`, `report`) goes to the system clipboard. `exit` closes the
+game the way the window's close button does.
+
 ## Player safe commands
 
 | command | what it does |
 |---|---|
 | `help` | the commands you can use |
 | `version` | game version, operating system and architecture |
-| `report` | one block for an issue: version, graphics card, processor, memory, frame rate, position and every setting (copied where the front end can copy) |
+| `report` | one block for an issue: version, graphics card, processor, memory, frame rate, position and every setting (copied to the clipboard in the console) |
 | `pos` | Link's position (x, y, z) and stamina, and `place`, a line like `swr:1 x=-1234.56 y=250.00 z=789.01 yaw=90.0 pitch=-10.0 hour=18.50`, to say where a bug is. Yaw and pitch work in any AA mode, the hour when known. An error before a save is loaded |
 | `camera` | where the world camera is (`x y z`) and which way it looks (`dx dy dz`, unit vector; `yaw` and `pitch` in degrees: yaw 0 looks along +z and 90 along +x, pitch positive looks up). Read only, works in any AA mode: it uses the renderer's TAA view matrix when there is one, otherwise the game's stored camera. The stored camera reports its stored eye position, which can differ from the drawn one by about two metres; the direction is the same. An error before a world is loaded |
 | `get [key]` | the current settings, or one; keys are `Settings` field names, plus `window_size`, `fps` (`fps_limit`), `left_stick_deadzone` and `right_stick_deadzone`. Enum values use lowercase names; values are the configured ones (environment overrides and hardware fallbacks still apply). Read only |
 | `state` | frame number, uptime, fps over the last second and the hour of the day (left out before a world exists) |
-| `exit` | end the game. Over the socket it exits at once |
+| `exit` | end the game: the console closes the window the normal way, the socket exits at once |
 
 `ping` (data: `pong` = true) answers on the socket in developer mode.
 

@@ -435,3 +435,13 @@ test-control: $(B)/test_control
 	env -u SAVAGEWIND_CONTROL SAVAGEWIND_DEV=1 $(B)/test_control dev
 
 .PHONY: test-control
+
+# the in-game console's lines, history and completion
+$(B)/test_console_core: tools/test_console_core.c runtime/console_core.c runtime/console_core.h
+	@mkdir -p $(B)
+	$(CC) -O1 -g -Wall $(OSFLAGS) -Iruntime -o $@ tools/test_console_core.c runtime/console_core.c
+
+test-console: $(B)/test_console_core
+	$(B)/test_console_core
+
+.PHONY: test-console
