@@ -218,23 +218,30 @@ class Symbols:
             self.delta = (module[0] if module else 0) - image_base
         else:  # ELF / Mach-O: the load bias
             self.delta = module[2] if module else 0
-        tool = next((t for t in ('llvm-nm', 'nm') if shutil.which(t)), None)
-        if not tool:
+        tools = [t for t in ('llvm-nm', 'llvm-nm-20', 'llvm-nm-19', 'llvm-nm-18', 'llvm-nm-17', 'llvm-nm-16', 'nm')
+                 if shutil.which(t)]
+        if not tools:
             self.note = 'nm not found: function names are runtime+offset'
             return
-        try:
-            out = subprocess.run([tool, '-n', '--defined-only', exe], capture_output=True, text=True, timeout=120).stdout
-        except (OSError, subprocess.SubprocessError) as e:
-            self.note = f'{tool} failed: {e}'
-            return
-        for line in out.splitlines():
-            parts = line.split(None, 2)
-            if len(parts) == 3 and parts[1] in ('t', 'T', 'w', 'W', 'i', 'I'):
-                try:
-                    self.addrs.append(int(parts[0], 16))
-                except ValueError:
-                    continue
-                self.names.append(parts[2])
+        # (the plain nm of a Linux host can't read a Windows binary, llvm-nm can: take the first that finds symbols)
+        for tool in tools:
+            try:
+                out = subprocess.run([tool, '-n', '--defined-only', exe], capture_output=True, text=True,
+                                     timeout=120).stdout
+            except (OSError, subprocess.SubprocessError) as e:
+                self.note = f'{tool} failed: {e}'
+                continue
+            for line in out.splitlines():
+                parts = line.split(None, 2)
+                if len(parts) == 3 and parts[1] in ('t', 'T', 'w', 'W', 'i', 'I'):
+                    try:
+                        self.addrs.append(int(parts[0], 16))
+                    except ValueError:
+                        continue
+                    self.names.append(parts[2])
+            if self.addrs:
+                self.note = ''
+                break
         if not self.addrs:
             self.note = 'the binary has no symbols: function names are runtime+offset'
 
@@ -382,9 +389,12 @@ def analyse(cap, first=None, last=None, exe=None):
         vs = [v for t, v in vals if span[0] <= t < span[1]]
         if vs:
             result['counters'][name] = {'min': min(vs), 'avg': round(sum(vs) / len(vs), 2), 'max': max(vs), 'samples': len(vs)}
-    result['top_self'] = [{'thread': k[0], 'name': k[1], 'calls_per_frame': round(v[0] / nframes, 2),
-                           'self_ms_per_frame': round(v[1] / nframes, 4)}
-                          for k, v in sorted(top.items(), key=lambda kv: -kv[1][1])]
+    # waiting is not work: a thread blocked in a wait zone is listed apart, so the list of places leads with work
+    rows = [{'thread': k[0], 'name': k[1], 'calls_per_frame': round(v[0] / nframes, 2),
+             'self_ms_per_frame': round(v[1] / nframes, 4)}
+            for k, v in sorted(top.items(), key=lambda kv: -kv[1][1])]
+    result['top_self'] = [r for r in rows if r['name'].rsplit('/', 1)[-1] not in WAIT_ZONES]
+    result['top_waits'] = [r for r in rows if r['name'].rsplit('/', 1)[-1] in WAIT_ZONES]
     # slow frames: the worst few, with the places that took the most self time inside each
     worst = sorted(fr.items, key=lambda it: -it[3])[:10]
     for i, n, start, dur in worst:
@@ -442,6 +452,11 @@ def text_report(res, top_n, slow_ms):
     w(f"\nTop {top_n} places by self time (ms per frame, calls per frame):")
     for t in res['top_self'][:top_n]:
         w(f"  {t['self_ms_per_frame']:8.3f}  {t['calls_per_frame']:9.1f}x  [{t['thread']}] {t['name']}")
+    waits = res.get('top_waits') or []
+    if waits:
+        w(f"  Waiting, not counted above (the {min(5, len(waits))} longest of {len(waits)} threads and places):")
+        for t in waits[:5]:
+            w(f"  {t['self_ms_per_frame']:8.3f}  {t['calls_per_frame']:9.1f}x  [{t['thread']}] {t['name']}")
     g = res.get('gpu')
     if g:
         w(f"\nGPU: busy {g['busy_ms_per_frame']} ms per frame ({g['busy_percent']}% of the time), idle {g['idle_ms_per_frame']} ms. "
