@@ -12,6 +12,11 @@ The synthetic cases build a small Bootup.pack by hand (SARC, Yaz0 and BYML write
 exercised: reading the pack, the flag tables, the conversion, the folder level and the refusals. One PASS / FAIL line
 per case; the exit status is 1 when anything failed. Needs a C compiler (cc, clang or gcc; CC=... picks one) unless
 --exe gives a test program that is already built (make test-save-convert builds build/test_save_convert).
+
+The last cases run the start screen's Saves tab itself without a window (tools/test_saves_tab.cpp: Dear ImGui builds its
+frames in memory, the real importer runs on its worker thread, the question is answered with a click on Import or the Escape key) on copies
+of a synthetic save folder. They need a C++ compiler and SDL3's headers (SDL3_INCLUDE=<folder> if they are not on the
+default path); without those they are skipped, and --no-ui skips them.
 """
 import argparse
 import os
@@ -455,6 +460,20 @@ def synthetic(r):
     r.both('picked folder above the profile (with other folders beside it)', os.path.join(tmp, 'cemu'), boot)
     os.makedirs(os.path.join(tmp, 'cemu', 'mlc01', 'usr', 'save', '00050000', '101c9500', 'user', 'common'), exist_ok=True)
 
+    # the Saves tab dates a slot by the file time of its caption.sav: converted and copied files keep their source's
+    dated = make_profile(os.path.join(tmp, 'dated', 'user', '80000001'), seed=8)
+    stamps = {'0/caption.sav': 1500000000, '1/game_data.sav': 1500000100, '0/caption.jpg': 1500000200,
+              'tracker/trackblock00.sav': 1500000300, 'album/img000.jpg': 1500000400, 'option.sav': 1500000500}
+    for rel, t in stamps.items():
+        os.utime(os.path.join(dated, *rel.split('/')), (t, t))
+    cf, _, _, cerr, _ = run_c(r.exe, dated, boot, os.path.join(tmp, 'dated_c'))
+    problems = [cerr] if cf is None else []
+    for rel, t in stamps.items():
+        out = os.path.join(tmp, 'dated_c', 'save_0', *rel.split('/'))
+        if cf is not None and int(os.stat(out).st_mtime) != t:
+            problems.append('%s: file time %d, wanted %d' % (rel, int(os.stat(out).st_mtime), t))
+    r.result('converted and copied files keep the file time of their source', problems)
+
     only = make_profile(os.path.join(tmp, 'only_game_data'), seed=2, slots=(0,), tracker=False, extras=False, options=False,
                         captions=False)
     r.both('a single slot with nothing but game_data.sav', only, boot)
@@ -537,6 +556,183 @@ def synthetic(r):
              (p.stdout + p.stderr).splitlines()[-8:])
 
 
+def build_ui(tmp):
+    """Builds tools/test_saves_tab.cpp -> path, or (None, why)."""
+    cxx = next((c for c in (os.environ.get('CXX'), 'c++', 'clang++', 'g++') if c and shutil.which(c)), None)
+    cc = next((c for c in (os.environ.get('CC'), 'cc', 'clang', 'gcc') if c and shutil.which(c)), None)
+    if not cxx or not cc:
+        return None, 'no C++ compiler'
+    sdl = []
+    if os.environ.get('SDL3_INCLUDE'):
+        sdl = ['-isystem', os.environ['SDL3_INCLUDE']]
+    elif shutil.which('pkg-config'):
+        p = subprocess.run(['pkg-config', '--cflags', 'sdl3'], capture_output=True, text=True)
+        sdl = p.stdout.split() if p.returncode == 0 else []
+    im, rt, st = (os.path.join(ROOT, 'third_party', 'imgui'), os.path.join(ROOT, 'runtime'),
+                  os.path.join(ROOT, 'third_party', 'stb'))
+    d = os.path.join(tmp, 'ui')
+    os.makedirs(d)
+    cxxflags = ['-std=c++17', '-O0', '-D_FILE_OFFSET_BITS=64', '-I' + im, '-I' + rt, '-I' + os.path.join(rt, 'ui'), '-I' + st] + sdl
+    jobs = [(cxx, ['-x', 'c++'] + cxxflags, os.path.join(im, n + '.cpp')) for n in ('imgui', 'imgui_draw', 'imgui_tables', 'imgui_widgets')]
+    jobs += [(cxx, ['-x', 'c++'] + cxxflags, os.path.join(rt, 'ui', 'option_rows.mm')),
+             (cxx, cxxflags, os.path.join(HERE, 'test_saves_tab.cpp'))]
+    cflags = ['-std=gnu11', '-O1', '-D_FILE_OFFSET_BITS=64', '-I' + rt, '-I' + st]
+    jobs += [(cc, cflags, os.path.join(rt, 'imageload.c')), (cc, cflags, os.path.join(rt, 'services', 'save_convert.c')),
+             (cc, cflags, os.path.join(rt, 'services', 'archive.c'))]
+    procs, objs = [], []
+    for i, (c, flags, src) in enumerate(jobs):
+        o = os.path.join(d, '%d.o' % i)
+        objs.append(o)
+        procs.append(subprocess.Popen([c, '-c'] + flags + ['-o', o, src], stderr=subprocess.PIPE, text=True))
+    errs = [p.communicate()[1] for p in procs]
+    bad = [e for p, e in zip(procs, errs) if p.returncode]
+    if bad:
+        return None, ('SDL3 headers not found (set SDL3_INCLUDE)' if 'SDL3/SDL.h' in bad[0] else bad[0][-600:])
+    exe = os.path.join(d, 'test_saves_tab' + ('.exe' if os.name == 'nt' else ''))
+    p = subprocess.run([cxx, '-o', exe] + objs + ['-lpthread'], capture_output=True, text=True)
+    return (exe, None) if p.returncode == 0 else (None, p.stderr[-600:])
+
+
+def ui_run(exe, scenario, save, game, src=None, cwd=None):
+    cmd = [exe, scenario, '--save', save, '--game', game] + (['--src', src] if src else [])
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=180, cwd=cwd)
+    out = {}
+    for line in p.stdout.splitlines():
+        k, _, v = line.partition(' ')
+        out[k] = v
+    return p.returncode, out, p.stdout + p.stderr[-500:]
+
+
+def ui_cases(r):
+    exe, why = build_ui(r.tmp)
+    if not exe:
+        print('SKIP  the Saves tab on its own (%s)' % why)
+        return
+    base = os.path.join(r.tmp, 'ui_world')
+    game = os.path.join(base, 'game')
+    os.makedirs(os.path.join(game, 'romfs', 'Pack'))
+    make_bootup(os.path.join(game, 'romfs', 'Pack', 'Bootup.pack'))
+    cemu = make_profile(os.path.join(base, 'cemu', 'user', '80000001'), seed=11)
+    py_out = run_python(cemu, os.path.join(game, 'romfs', 'Pack', 'Bootup.pack'), os.path.join(base, 'py_expected'))[0]
+
+    picture = os.path.join(r.tmp, 'picture.jpg')   # a picture the tab can show (the synthetic saves hold random bytes)
+    subprocess.run([exe, 'jpeg', picture], check=True)
+    with open(picture, 'rb') as f:
+        picture = f.read()
+
+    def fresh(name, saves=True):
+        """A data folder with the player's Switch save in data/save (and an SD card folder), and its copy."""
+        data = os.path.join(r.tmp, 'ui_' + name)
+        save = os.path.join(data, 'save')
+        os.makedirs(data)
+        if saves:
+            make_profile(os.path.join(save, 'save_0'), seed=9, e='<', slots=(0, 1), tracker=True, extras=True)
+            for slot in (0, 1):
+                with open(os.path.join(save, 'save_0', str(slot), 'caption.jpg'), 'wb') as f:
+                    f.write(picture)
+            os.makedirs(os.path.join(save, 'sdcard'))
+            with open(os.path.join(save, 'sdcard', 'note.txt'), 'w') as f:
+                f.write('SD')
+        return data, save, (tree(save) if saves else {})
+
+    def leftovers(data):
+        return sorted(n for n in os.listdir(data) if n.startswith('save-import-'))
+
+    # import over an existing save, the question answered with a click on Import
+    data, save, before = fresh('import')
+    rc, o, log = ui_run(exe, 'import', save, game, os.path.dirname(os.path.dirname(cemu)), cwd=data)
+    problems = []
+    if rc != 0 or o.get('DONE') is None:
+        problems.append('the harness failed (exit %d): %s' % (rc, log[-400:]))
+    else:
+        if o.get('KIND') != '1':
+            problems.append('not imported: %s' % o)
+        problems += ['new save: ' + x for x in compare(py_out, {k[len('save_0/'):]: v for k, v in tree(save).items() if k.startswith('save_0/')})]
+        backups = os.path.join(data, 'save-backups')
+        names = os.listdir(backups) if os.path.isdir(backups) else []
+        if len(names) != 1:
+            problems.append('wanted one backup folder, found %s' % names)
+        else:
+            if tree(os.path.join(backups, names[0])) != before:
+                problems.append('the backup is not the old save folder')
+            if os.path.join(backups, names[0]) != o.get('BACKUP'):
+                problems.append('the popup named another folder: %s' % o.get('BACKUP'))
+        if tree(save).get('sdcard/note.txt') != b'SD':
+            problems.append('the SD card folder was not carried over')
+        if leftovers(data):
+            problems.append('staging folder left behind: %s' % leftovers(data))
+        if o.get('TEXTURES') != 'created=2 freed=2':
+            problems.append('pictures: %s' % o.get('TEXTURES'))
+        if o.get('PICTURES') != '2' or o.get('SLOTS') != '2' or o.get('SLOTS_AFTER') != '3':
+            problems.append('slot list: %s' % {k: o.get(k) for k in ('SLOTS', 'PICTURES', 'SLOTS_AFTER')})
+    r.result('Saves tab: import over an existing save (popup, backup, swap, list)', problems)
+
+    # Escape on the popup: everything as it was
+    data, save, before = fresh('cancel')
+    rc, o, log = ui_run(exe, 'cancel', save, game, os.path.dirname(os.path.dirname(cemu)), cwd=data)
+    problems = []
+    if rc != 0 or o.get('KIND') != '5':
+        problems.append('not cancelled: %s' % log[-300:])
+    if tree(save) != before:
+        problems.append('the save folder changed')
+    if leftovers(data) or os.path.exists(os.path.join(data, 'save-backups')):
+        problems.append('left behind: %s' % os.listdir(data))
+    r.result('Saves tab: Escape on the confirmation changes nothing and removes the staged copy', problems)
+
+    # no save yet: nothing to back up, the import just makes the folder
+    data, save, _ = fresh('first', saves=False)
+    rc, o, log = ui_run(exe, 'import', save, game, os.path.dirname(os.path.dirname(cemu)), cwd=data)
+    problems = []
+    if rc != 0 or o.get('KIND') != '1':
+        problems.append('not imported: %s' % log[-300:])
+    else:
+        problems += compare(py_out, {k[len('save_0/'):]: v for k, v in tree(save).items() if k.startswith('save_0/')})
+        if os.path.exists(os.path.join(data, 'save-backups')) or leftovers(data):
+            problems.append('left behind: %s' % os.listdir(data))
+    r.result('Saves tab: first import, with no save folder yet', problems)
+
+    # refusals picked in the tab: the message, and the save folder exactly as it was
+    sw = make_profile(os.path.join(base, 'switch_pick', 'user', '80000001'), seed=4, e='<')
+    empty = os.path.join(base, 'empty_pick')
+    os.makedirs(empty)
+    bad = make_profile(os.path.join(base, 'bad_pick', 'user', '80000001'), seed=5)
+    with open(os.path.join(bad, '1', 'game_data.sav'), 'r+b') as f:
+        f.truncate(100)
+    for name, folder, code, g in (('a Switch save', os.path.dirname(os.path.dirname(sw)), '2', game),
+                                  ('a folder with no save', empty, '1', game),
+                                  ('a damaged save', os.path.dirname(os.path.dirname(bad)), '3', game),
+                                  ('game files without Bootup.pack', os.path.dirname(os.path.dirname(cemu)), '4', os.path.join(base, 'nogame'))):
+        data, save, before = fresh('refuse_' + re.sub(r'\W', '_', name))
+        rc, o, log = ui_run(exe, 'pick', save, g, folder, cwd=data)
+        problems = []
+        if rc != 0 or o.get('KIND') != '2' or o.get('CODE') != code:
+            problems.append('wanted a refusal with code %s: %s' % (code, {k: o.get(k) for k in ('KIND', 'CODE', 'DETAIL')}))
+        if tree(save) != before:
+            problems.append('the save folder changed')
+        if leftovers(data) or os.path.exists(os.path.join(data, 'save-backups')):
+            problems.append('left behind: %s' % os.listdir(data))
+        r.result('Saves tab: %s is refused and nothing changes' % name, problems)
+
+    # the Back up saves button
+    data, save, before = fresh('backup')
+    rc, o, log = ui_run(exe, 'backup', save, game, cwd=data)
+    problems = []
+    backups = os.path.join(data, 'save-backups')
+    names = os.listdir(backups) if os.path.isdir(backups) else []
+    if rc != 0 or o.get('KIND') != '3' or len(names) != 1:
+        problems.append('no backup: %s' % log[-300:])
+    else:
+        if tree(os.path.join(backups, names[0])) != before or tree(save) != before:
+            problems.append('the copy or the save folder differs')
+        if o.get('FILES') != str(len(before)):
+            problems.append('files counted: %s, copied: %d' % (o.get('FILES'), len(before)))
+    r.result('Saves tab: Back up saves copies the save folder and leaves it where it is', problems)
+    data, save, before = fresh('backup_none', saves=False)
+    rc, o, log = ui_run(exe, 'backup', save, game, cwd=data)
+    r.result('Saves tab: Back up saves with no saves says so and makes nothing',
+             [] if (rc == 0 and o.get('KIND') == '4' and o.get('CODE') == '1' and not os.path.exists(os.path.join(data, 'save-backups'))) else [log[-300:]])
+
+
 def real(r, src, bootup, allow_switch):
     if not os.path.isfile(bootup):
         sys.exit('Bootup.pack not found: %s' % bootup)
@@ -550,6 +746,7 @@ def main():
     ap.add_argument('--exe', help='a built test_save_convert (default: built from the sources into a temporary folder)')
     ap.add_argument('--cc', help='C compiler to build it with')
     ap.add_argument('--allow-switch', action='store_true', help='with --src: the save is a Switch one')
+    ap.add_argument('--no-ui', action='store_true', help='skip the cases that run the Saves tab (they need a C++ compiler and SDL3 headers)')
     ap.add_argument('--keep', action='store_true', help='keep the temporary folder (printed at the end)')
     a = ap.parse_args()
     if bool(a.src) != bool(a.bootup):
@@ -562,6 +759,8 @@ def main():
             real(r, a.src, a.bootup, a.allow_switch)
         else:
             synthetic(r)
+            if not a.no_ui:
+                ui_cases(r)
         print('%d of %d cases passed' % (r.n - r.failed, r.n))
         return 1 if r.failed else 0
     finally:

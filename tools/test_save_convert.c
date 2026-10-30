@@ -196,8 +196,21 @@ static void selftest(const char *base) {
     // 4. a backup copy: the save stays, the copy is the same; a backup that can't be made leaves nothing
     memset(&r, 0, sizeof r);
     sc_backup_path(save, backup, sizeof backup);
+    {   // (an old file time on the original)
+        char a1[1100];
+        struct utimbuf old = {1500000000, 1500000000};
+        snprintf(a1, sizeof a1, "%s/save_0/0/game_data.sav", save);
+        utime(a1, &old);
+    }
     CHECK(sc_backup(save, backup, &r) == SC_OK && r.n_written == 1);
     CHECK(is_text(backup, "save_0/0/game_data.sav", "NEW") && is_text(save, "save_0/0/game_data.sav", "NEW"));
+    {   // (the file time of a copy is the original's)
+        char a1[1100], b1[1100];
+        struct stat sa, sb;
+        snprintf(a1, sizeof a1, "%s/save_0/0/game_data.sav", save);
+        snprintf(b1, sizeof b1, "%s/save_0/0/game_data.sav", backup);
+        CHECK(stat(a1, &sa) == 0 && stat(b1, &sb) == 0 && sa.st_mtime == sb.st_mtime && sb.st_mtime == 1500000000);
+    }
     CHECK(sc_backup(save, backup, &r) == SC_IO);  // (exists already: untouched)
     CHECK(is_text(backup, "save_0/0/game_data.sav", "NEW"));
     char nosave[1100], blocked[1100];
@@ -250,6 +263,26 @@ static void selftest(const char *base) {
     snprintf(nosave, sizeof nosave, "%s/cemu/mlc01/usr/save/00050000/101c9500/user/common", root3);
     CHECK(sc_find_profile(nosave, prof, sizeof prof) == SC_NO_SAVE);
 
+    // a folder holding a Switch profile first in name order and a Wii U one after it: the Wii U one
+    {
+        static const char sw[] = {0x30, 0x47, 0, 0}, wiiu[] = {0, 0, 0x47, 0x1B};
+        char f[1100];
+        put(root3, "both/a/0/game_data.sav", "");
+        snprintf(f, sizeof f, "%s/both/a/0/game_data.sav", root3);
+        FILE *fp = fopen(f, "wb");
+        assert(fp);
+        fwrite(sw, 1, 4, fp), fclose(fp);
+        put(root3, "both/b/0/game_data.sav", "");
+        snprintf(f, sizeof f, "%s/both/b/0/game_data.sav", root3);
+        fp = fopen(f, "wb");
+        assert(fp);
+        fwrite(wiiu, 1, 4, fp), fclose(fp);
+        snprintf(nosave, sizeof nosave, "%s/both", root3);
+        CHECK(sc_find_profile(nosave, prof, sizeof prof) == SC_OK && strstr(prof, "/both/b") != NULL);
+        remove(f);
+        CHECK(sc_find_profile(nosave, prof, sizeof prof) == SC_OK && strstr(prof, "/both/a") != NULL);
+    }
+
     // 8. slots
     put(root3, "ls/2/game_data.sav", "x");
     put(root3, "ls/10/caption.sav", "x");
@@ -265,6 +298,24 @@ static void selftest(const char *base) {
     snprintf(nosave, sizeof nosave, "%s/not-there", root3);
     CHECK(sc_list_slots(nosave, &slots) == 0);
     free(slots);
+#ifndef _WIN32
+    // 9. a save folder that is a link is not moved (that would move the link, not the saves)
+    {
+        char real[1100], link[1100];
+        put(root3, "real/save_0/0/game_data.sav", "OLD");
+        snprintf(real, sizeof real, "%s/real", root3);
+        snprintf(link, sizeof link, "%s/linked", root3);
+        CHECK(symlink(real, link) == 0);
+        sc_backup_path(link, backup, sizeof backup);
+        sc_stage_path(link, stage, sizeof stage);
+        st = fake_stage(root3, stage);
+        memset(&r, 0, sizeof r);
+        CHECK(sc_stage_install(st, link, backup, &r) == SC_LINKED);
+        CHECK(is_text(real, "save_0/0/game_data.sav", "OLD") && !has(backup, ""));
+        sc_stage_discard(st);
+        sc_report_free(&r);
+    }
+#endif
     printf(failures ? "SELFTEST FAIL (%d)\n" : "SELFTEST PASS\n", failures);
 }
 
