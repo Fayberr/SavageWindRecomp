@@ -198,6 +198,21 @@ class SamplerTest(unittest.TestCase):
         self.assertIn('Do not put game addresses', text)
         self.assertNotIn(hex(GAME)[2:], text)
 
+    def test_wait_found_by_the_stack(self):
+        # the driver samples sit under a runtime wait function with no zone around them: waiting, not driver/system
+        exe = os.path.join(self.dir.name, 'swr')
+        with open(exe, 'wb') as fh:
+            fh.write(b'\x7fELF' + b'\0' * 100)
+        done = mock.Mock(stdout='0000000000000100 T render_frame\n0000000000000200 t kwait\n')
+        with mock.patch.object(swprof.shutil, 'which', return_value='/usr/bin/nm'), \
+                mock.patch.object(swprof.subprocess, 'run', return_value=done):
+            res = swprof.analyse(swprof.Capture(self.path), exe=exe)
+        sp = res['sampler']
+        main = next(t for t in sp['threads'] if t['name'] == 'main')
+        self.assertEqual((main['game'], main['runtime'], main['driver/system'], main['waiting']), (60.0, 10.0, 0.0, 30.0))
+        self.assertEqual([(r['name'], r['samples']) for r in sp['runtime_waits']], [('kwait', 10)])
+        self.assertEqual(sp['runtime_callers_of_driver'], [])
+
     def test_symbols(self):
         exe = os.path.join(self.dir.name, 'swr')
         with open(exe, 'wb') as fh:

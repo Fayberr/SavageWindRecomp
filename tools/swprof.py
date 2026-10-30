@@ -36,6 +36,10 @@ GPU_IDLE = '(gpu idle)'
 # zones in which a thread is waiting for something, not working: a sample inside one counts as waiting
 WAIT_ZONES = {'kernel wait', 'kernel wait (handles)', 'gpu_wait', 'present pace', 'wait for recorder submit',
               'recorder drain', 'recorder ring full'}
+# Runtime functions that only wait (for a kernel object, for work, for one of the four cores). A sample whose stack is in
+# the system below one of them is waiting even with no wait zone around it: a wait that began before the capture did has
+# no zone (its stamp was not taken), and some waits have none.
+WAIT_FUNCS = {'kwait', 'block_current', 'queue_wait', 'core_acquire'}
 COPYRIGHT_NOTE = ('Reminder: the game code is shown as one total on purpose. Do not put game addresses, game names or '
                   'generated code into pull requests or issues.')
 
@@ -291,6 +295,7 @@ def sampler_summary(cap, fr, span, nframes, symbols):
     split = collections.defaultdict(lambda: collections.Counter())  # thread -> category -> samples
     times = collections.defaultdict(list)
     rt_self, rt_incl, rt_callers = collections.Counter(), collections.Counter(), collections.Counter()
+    rt_waits = collections.Counter()  # waits found by the stack (WAIT_FUNCS), not by a zone
     per_frame = collections.defaultdict(collections.Counter)  # frame mark index -> category -> samples
     total = 0
     for t, tid, handle, pcs in cap.samples:
@@ -314,6 +319,13 @@ def sampler_summary(cap, fr, span, nframes, symbols):
         if not rt:
             continue
         names = [symbols.name(a) for a in rt]
+        if cat == 'driver/system' and names[0] in WAIT_FUNCS:
+            split[tname][cat] -= 1
+            split[tname]['waiting'] += 1
+            per_frame[fr.index_at(t)][cat] -= 1
+            per_frame[fr.index_at(t)]['waiting'] += 1
+            rt_waits[names[0]] += 1
+            continue
         if cat == 'runtime':
             rt_self[names[0]] += 1
         elif cat == 'driver/system':
@@ -336,6 +348,7 @@ def sampler_summary(cap, fr, span, nframes, symbols):
                      **{k: round(100 * c[k] / sum(c.values()), 1) for k in CATEGORIES}}
                     for n, c in sorted(split.items(), key=lambda kv: -sum(kv[1].values()))],
         'runtime_self': rows(rt_self), 'runtime_inclusive': rows(rt_incl), 'runtime_callers_of_driver': rows(rt_callers),
+        'runtime_waits': rows(rt_waits),
         '_per_frame': per_frame,
     }
 
@@ -471,6 +484,7 @@ def text_report(res, top_n, slow_ms):
             w(f"  {t['name']:<24}{t['samples']:>8}" + ''.join(f'{t[c]:>14}%' for c in CATEGORIES))
         for key, title in (('runtime_self', 'Runtime functions by self time (the top frame was in the runtime)'),
                            ('runtime_callers_of_driver', 'Runtime functions that were calling into the driver or system'),
+                           ('runtime_waits', 'Waits found by the stack, not by a zone (counted as waiting above)'),
                            ('runtime_inclusive', 'Runtime functions by inclusive time (anywhere in the stack)')):
             if sp[key]:
                 w(f'\n{title}; percent of all samples, ms per frame:')
