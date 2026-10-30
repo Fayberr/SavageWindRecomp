@@ -29,6 +29,7 @@
 //                       use them is done on the GPU - again after R recorded and submitted it
 //   stats               RecStats: T's fields plain, R's and the waits' _Atomic relaxed adds; read by T
 #include "record.h"
+#include "../../prof.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -132,6 +133,7 @@ static inline void *after(const void *args, size_t args_size) { return (uint8_t 
 // ---- the thread
 static void *run(void *arg) {
     (void)arg;
+    prof_thread_name("vk-record");
     uint64_t t = 0;
     for (;;) {
         uint64_t h = atomic_load_explicit(&head, memory_order_acquire);

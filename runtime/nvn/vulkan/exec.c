@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "../../kernel.h"
+#include "../../prof.h"
 #include "shaders.h"
 #include "vk.h"
 #include "fsr3.h"
@@ -60,6 +61,10 @@ uint64_t prof_up_ns = ~0ull;  // textures.c upload checks (~0: profiling off)
 static int profd;
 #define PROFD_T0() uint64_t prof_t0_ = profd ? SDL_GetTicksNS() : 0
 #define PROFD_ADD(v) do { if (profd) v += SDL_GetTicksNS() - prof_t0_; } while (0)
+// The profiler's draw-path timers (runtime/prof.h): stamps taken only while a capture runs, the time between two of them
+// added up per frame under a name ("/" nests it under the one before it in the report)
+#define PZ_NOW() (prof_enabled() ? prof_ticks() : 0)
+#define PZ_SPAN(name, a, b) do { static ProfSite pz_site_ = {name, 0}; if ((a) && (b)) prof_acc_add(&pz_site_, (b) - (a)); } while (0)
 
 // Command buffer state draw_ recorded last, so a draw records only what differs (one draw set ~20 pieces of state;
 // the open world has ~5000 draws a frame). dyn_epoch changes with each command buffer begun and wherever other code
@@ -380,6 +385,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
                         .waitSemaphoreInfoCount = wait ? 1 : 0, .pWaitSemaphoreInfos = &wt};
     {
         PROF_T0();
+        SW_ACC("submit");
         dl_note("submit %llu", (unsigned long long)submit_seq + 1);
         rec_QueueSubmit2(&si, submit_seq + 1);  // (the recorder: in order with the commands)
         PROF_ADD(prof_submit);
@@ -720,6 +726,7 @@ static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
 static void *worker(void *a) {
     (void)a;
+    prof_thread_name("shader-worker");
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
@@ -753,6 +760,7 @@ static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
 static void *translator(void *a) {
     (void)a;
+    prof_thread_name("translator");
     for (;;) {
         pthread_mutex_lock(&tjobs_lock);
         while (!tjobs_head) pthread_cond_wait(&tjobs_cond, &tjobs_lock);
@@ -5308,6 +5316,7 @@ static void pso_warm_one(const PsoRec *r) {
 
 static void *pso_worker(void *arg) {
     (void)arg;
+    prof_thread_name("pso-worker");
     // (debugging) SAVAGEWIND_PSO_SLOW_MS=<n>: each pipeline takes n ms longer, to see the wait and its bar (device.c
     // then saves the first bar frame as build/pso_wait.png)
     int slow = getenv("SAVAGEWIND_PSO_SLOW_MS") ? atoi(getenv("SAVAGEWIND_PSO_SLOW_MS")) : 0;
@@ -5680,6 +5689,7 @@ static void draw(CmdRec *r, bool indexed) {
     // has nothing left to do (a vertex shader writing storage buffers or images would be the one difference).
     if (st.rasterizer_discard) { stat_discarded++; return; }
     PROFD_T0();
+    SW_ACC("exec/draw");
     draw_(r, indexed);
     PROFD_ADD(prof_draw);
 }
@@ -5713,6 +5723,7 @@ static void wait_built(_Atomic int *state) {  // (0 building: until built or fai
 
 static void draw_(CmdRec *r, bool indexed) {
     if (profd) prof_tp_ = SDL_GetTicksNS();
+    uint64_t pz0 = PZ_NOW();
     fg_before_draw();
     if (!st.program) { stat_skipped++; return; }
     static int no_key_gen = -1;
@@ -5981,6 +5992,8 @@ static void draw_(CmdRec *r, bool indexed) {
 
     uint64_t prof_tk_ = profd ? SDL_GetTicksNS() : 0;
     if (profd) prof_pre += prof_tk_ - prof_tp_;
+    uint64_t pz1 = PZ_NOW();
+    PZ_SPAN("exec/draw/pre", pz0, pz1);
     // ---- pipeline
     static struct { uint64_t gen; Prog *pr; uint8_t cls, fb; } km;
     Pipe *pp;
@@ -6075,6 +6088,8 @@ have_pipe:
     if (!DYN_SAME(pipe, pp->pipe)) rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe);
     uint64_t prof_td_ = profd ? SDL_GetTicksNS() : 0;
     if (profd) prof_key += prof_td_ - prof_tk_;
+    uint64_t pz2 = PZ_NOW();
+    PZ_SPAN("exec/draw/key", pz1, pz2);
 
     // ---- depth / stencil (dynamic)
     static int nodt = -1;
@@ -6165,12 +6180,16 @@ have_pipe:
     // fragment textures are bound before deciding the viewport (tex_sc / tex_wh), rscale depends on the decision:
     // build the vertex set now and the fragment set after the decision (stage_set fills tex_sc for stage 1).
     if (profd) prof_dyn += SDL_GetTicksNS() - prof_td_;
+    uint64_t pz3 = PZ_NOW();
+    PZ_SPAN("exec/draw/dyn", pz2, pz3);
     PROFD_T0();
     uint32_t dyn[64];
     int ndyn = 0;
     hud_clip = false;  // (hud_patch, while the vertex stage's constant buffers are bound)
     VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndyn);
     PROFD_ADD(prof_sets);
+    uint64_t pz4 = PZ_NOW();
+    PZ_SPAN("exec/draw/sets", pz3, pz4);
     VkDescriptorImageInfo fii[64];
     uint64_t prof_tx_ = profd ? SDL_GetTicksNS() : 0;
     sdw_fix.s = 0;
@@ -6207,6 +6226,8 @@ have_pipe:
         }
     }
     if (profd) prof_tex += SDL_GetTicksNS() - prof_tx_;
+    uint64_t pz5 = PZ_NOW();
+    PZ_SPAN("exec/draw/tex", pz4, pz5);
     if (fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
         // Draws into the swapchain image (see renderer.m): composites fill the window, UI goes in a centred 16:9 box.
         bool reads_scene = false;
@@ -6252,9 +6273,11 @@ have_pipe:
     apply_scissor();
     float rs0[4] = {vp_sx, vp_sy, vp_ox, vp_oy};
     uint64_t prof_t1_ = profd ? SDL_GetTicksNS() : 0;
+    uint64_t pz6 = PZ_NOW();
     VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn, &ndyn);
     sdw_fix.s = 0, up_fix.sx = 0;
     if (profd) prof_sets += SDL_GetTicksNS() - prof_t1_;
+    PZ_SPAN("exec/draw/sets", pz6, PZ_NOW());
     VkDescriptorSet sets[2] = {vset, fset};
     if (ndyn > 32) ndyn = 32;
     if (dc.layout != pr->layout || dc.sets[0] != vset || dc.sets[1] != fset || dc.ndyn != (uint32_t)ndyn ||
@@ -6267,6 +6290,7 @@ have_pipe:
     if (mvec_draw) rec_CmdPushConstants(cb, pr->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, MVEC_PUSH, mvec_pc);
 
     uint64_t prof_t2_ = profd ? SDL_GetTicksNS() : 0;
+    uint64_t pz7 = PZ_NOW();
     // ---- indices (copied; the largest index bounds the vertex data copied below)
     uint32_t first = 0, count = (uint32_t)r->x[2], inst, base_inst, max_index = 0;
     int32_t base_vertex = 0;
@@ -6367,6 +6391,7 @@ have_pipe:
     }
 
     if (profd) prof_vtx += SDL_GetTicksNS() - prof_t2_;
+    PZ_SPAN("exec/draw/vtx", pz7, PZ_NOW());
     // ---- draw (inside an occlusion query while SAMPLES_PASSED counts)
     int oq = -1;
     if (oq_counting && oq_nrun < OQ_RUN && oq_on()) {
@@ -8499,12 +8524,16 @@ static void exec_list(uint64_t handle, int depth) {
 
 void backend_execute(uint64_t handle) {
     readbacks_apply();
-    gpu_lock();
+    SW_ZONE("backend_execute");
+    { SW_ACC("exec_lock"); gpu_lock(); }
     if (g_debug_frame && getenv("SAVAGEWIND_LOG_OPS")) LOG("[submit] %llx\n", (unsigned long long)handle);
     PROF_T0();
     in_execute = true;
-    guest_copy_flush();  // (a new list: the game may have written the memory of the last one's copies since)
-    exec_list(handle, 0);
+    {
+        SW_ACC("exec");
+        guest_copy_flush();  // (a new list: the game may have written the memory of the last one's copies since)
+        exec_list(handle, 0);
+    }
     in_execute = false;
     PROF_ADD(prof_exec);
     if (prof) cum_exec += SDL_GetTicksNS() - prof_t0_;

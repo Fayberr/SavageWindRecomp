@@ -5,6 +5,7 @@
 #include "../framepace.h"
 #include "../game_sites.h"
 #include "../kernel.h"
+#include "../prof.h"
 #include "../perfmon.h"
 #include "nvn.h"
 
@@ -222,6 +223,7 @@ static void qop_run(const QOp *o) {
 
 static void *queue_thread(void *arg) {
     (void)arg;
+    prof_thread_name("nvn-queue");
     kernel_sample_host_thread();
     pthread_mutex_lock(&g_q_lock);
     for (;;) {
