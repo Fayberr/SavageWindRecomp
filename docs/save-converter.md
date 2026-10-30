@@ -9,8 +9,8 @@ a save Savage Wind can load. You do not need Python or a terminal. It reads only
    screen, not in the in-game menu, because the game must not be running while its saves change.
 2. Choose **Import from Wii U / Cemu...** and pick the Wii U profile folder. In Cemu it is
    `mlc01/usr/save/00050000/<title id>/user/80000001`, the folder with the numbered slots `0`, `1`, ... and
-   `option.sav`. A folder above it works too: the importer looks up to seven levels down and prefers a Wii U save to
-   anything else it finds.
+   `option.sav`. A folder above it works too: the importer looks up to ten levels down and prefers a Wii U save to
+   anything else it finds. The search stops after four seconds or 100,000 folders.
 3. The save is converted into a new folder next to your `save` folder. Your saves are not touched yet. When that is done,
    a question names the backup folder and shows which slots come in. Choose **Import**, or **Cancel** to leave
    everything as it is (the converted copy is removed again).
@@ -38,9 +38,12 @@ It needs your game files set up: the importer reads the flag tables from `Pack/B
 Each of these ends with "Nothing was changed.", and your saves are exactly as they were:
 
 - **No Breath of the Wild save found in that folder.** Pick the folder with the numbered slots, or one above it.
+- **The search took too long. Choose a folder closer to the save.** The time or folder limit was reached.
 - **That is a Switch save already.** Switch saves are used as they are: copy their files into the save folder instead.
 - **A save file is damaged or incomplete.** The message names the file. A half-copied save lands here.
 - **The game files weren't found / can't be read.** Set up the game files on the start screen first.
+- **Savage Wind is running in a game.** Another Savage Wind has the save folder open (see below). Close the game first,
+  then try again.
 - **The save folder is a link.** Moving a link would move the link, not the saves, so the importer stops.
 - **Files could not be read or written.** Close anything that has the save folder open (a file manager window, a
   backup program) and try again.
@@ -48,6 +51,26 @@ Each of these ends with "Nothing was changed.", and your saves are exactly as th
 If the last step fails after the old folder has been moved, the move is undone. In the rare case that cannot be undone
 either, the message says "The import stopped halfway" and names the backup folder: rename it to `save` to get your
 saves back.
+
+A running game holds a lock on its save folder: the empty file `save.lock` next to `save` (not inside it, so the swap
+never moves it). The operating system drops the lock when the game ends, however it ends, so a crash leaves nothing to
+clean up; the file itself stays. While another Savage Wind holds it, the tab refuses to import or to back up, because
+the running game could save over an imported slot, or a backup could copy a file that is half written. Choosing a
+folder to import from is refused straight away, before anything is converted. The game does not wait for the lock: a
+second game started on the same save folder still starts, and logs that the lock is taken. The tab also holds the lock
+while it swaps or copies, so two Savage Winds cannot do that at once. If the lock file cannot be made (a read-only
+folder), nothing is locked and nothing is refused.
+
+Closing the start screen or quitting waits for its save worker. A conversion can stop between files and removes its
+staged copy. Once installation starts, quitting waits for the two moves and the carry-over copy to finish; it does not
+cancel an installation between moves. This covers normal Quit and window close, not a crash, power failure or forced
+process termination. A blocked operating-system file read or move can delay quitting until it returns.
+
+When the tab opens, it removes abandoned dated `save-import-*` folders beside `save`, leaving a live or unconfirmed
+stage alone. If `save` is missing, it keeps every import folder and shows a recovery message naming the newest import
+and dated backup folders. Close Savage Wind and rename the desired folder to `save` to recover it. Imports and backups
+are disabled while this recovery is needed. **Open save folder** opens the preserved import without creating an empty
+`save` folder. Cleanup does not follow symbolic links or Windows junctions.
 
 ## What it does
 
@@ -75,7 +98,8 @@ Slots keep their number. The game decides which slot "Continue" loads.
 
 The code is in `runtime/services/save_convert.c` (the importer, with no SDL in it), `runtime/services/archive.c` (the
 Yaz0 and SARC readers it shares with `fs.c`) and `runtime/ui/saves_tab.mm` (the tab). The conversion runs on a worker
-thread, so the start screen is not held up while it reads the game's tables and writes the files.
+thread. The slot list is also read on that worker, with a loading message while it is being read, so the start
+screen is not held up while it reads the game's tables and writes the files.
 
 ## The Python tool
 
@@ -106,8 +130,11 @@ the swap and its rollback. No game files are needed.
 The script also runs the Saves tab itself without a window (`tools/test_saves_tab.cpp`: Dear ImGui builds the frames in
 memory, the importer runs on its worker thread, and the question is answered with a click) on copies of a synthetic save
 folder, and checks the files on disk afterwards: import over an existing save, a first import, Cancel, the refusals and
-Back up saves. That part needs a C++ compiler and SDL3's headers; set `SDL3_INCLUDE=<folder with SDL3/SDL.h>` if they
-are not on the default path (without them it says SKIP), and `--no-ui` leaves it out. It draws no pixels and uses no real
+Back up saves, and an import and a backup refused while another process holds the save folder's lock (a second test
+process stands in for the game, also killed to check that its lock goes with it). It also quits during conversion, at confirmation, and between the two installation moves, and checks
+recovery after an interrupted installation. The C cases cover cancellation, stale cleanup and keeping live stages or
+all imported copies when `save` is missing. That part needs a C++ compiler and SDL3's headers; set
+`SDL3_INCLUDE=<folder with SDL3/SDL.h>` if they are not on the default path (without them it says SKIP), and `--no-ui` leaves it out. It draws no pixels and uses no real
 window, mouse or controller, so it does not replace looking at the tab.
 
 With your own files, the same script compares both implementations on your real save:

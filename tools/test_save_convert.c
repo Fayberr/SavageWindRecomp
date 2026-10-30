@@ -6,6 +6,8 @@
 //       reports it; exit status 0 when it converted, 1 when it refused (the reason follows RESULT)
 //   test_save_convert slots <save_0 folder>
 //       sc_list_slots: SLOT <name> <saved (unix time)> <play seconds or -1> <has picture>
+//   test_save_convert holdlock <save folder> / locked <save folder>
+//       a second process holding the game's lock on the save folder, and one asking whether it is held
 //   test_save_convert selftest <scratch folder>
 //       the safety of backup, install and discard in folders made under <scratch folder> (left for the caller to
 //       remove): the player's saves are never lost
@@ -17,7 +19,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+static int fail_realloc_at, realloc_calls;
+static void *test_realloc(void *p, size_t n) {
+    if (++realloc_calls == fail_realloc_at) { errno = ENOMEM; return NULL; }
+    return realloc(p, n);
+}
+#define realloc test_realloc
 #include "../runtime/services/save_convert.c"  // (the whole file: the test reaches its helpers)
+#undef realloc
 
 static int convert_cmd(int argc, char **argv) {
     const char *src = NULL, *bootup = NULL, *dst = NULL;
@@ -50,7 +59,54 @@ static int convert_cmd(int argc, char **argv) {
     printf("RESULT ok\n");
     sc_format_free(fmt);
     sc_report_free(&r);
-    free(stage);  // (the converted folder stays: the caller compares it)
+    sc_stage_keep(stage);  // (the converted folder stays: the caller compares it)
+    return 0;
+}
+
+// Fail each reallocation in turn, including after files have already been written.
+static int oom_cmd(const char *src, const char *bootup, const char *dst) {
+    for (int at = 1; ; at++) {
+        realloc_calls = 0, fail_realloc_at = at;
+        ScReport r = {0};
+        ScFormat *fmt = NULL;
+        ScStage *st = NULL;
+        ScCode c = sc_format_load(bootup, &fmt, &r);
+        if (c == SC_OK) c = sc_convert(src, dst, fmt, 0, &st, &r);
+        bool reached = realloc_calls >= at;
+        fail_realloc_at = 0;
+        if (c != SC_OK && (st || exists(dst))) {
+            fprintf(stderr, "allocation %d left a stage behind\n", at);
+            return 1;
+        }
+        sc_stage_discard(st);
+        sc_format_free(fmt);
+        sc_report_free(&r);
+        if (!reached) { printf("PASS %d allocation failures\n", at - 1); return 0; }
+    }
+}
+
+typedef struct { int checks, after; } CancelAfter;
+static bool cancel_after(void *p) {
+    CancelAfter *c = p;
+    return ++c->checks >= c->after;
+}
+
+static int cancel_cmd(const char *src, const char *bootup, const char *dst) {
+    ScReport r = {0};
+    ScFormat *fmt = NULL;
+    if (sc_format_load(bootup, &fmt, &r) != SC_OK) return 1;
+    for (int at = 1; ; at++) {
+        CancelAfter state = {0, at};
+        ScCancel cancel = {cancel_after, &state};
+        ScStage *st = NULL;
+        ScCode c = sc_convert_cancel(src, dst, fmt, 0, &cancel, &st, &r);
+        if ((c != SC_OK && c != SC_CANCELLED) || (c == SC_CANCELLED && (st || exists(dst)))) return 1;
+        sc_stage_discard(st);
+        sc_report_free(&r);
+        if (c == SC_OK) break;
+    }
+    sc_format_free(fmt);
+    puts("PASS cancellation removes the stage");
     return 0;
 }
 
@@ -178,6 +234,11 @@ static void selftest(const char *base) {
     CHECK(is_text(save, "save_0/0/game_data.sav", "OLD"));
     CHECK(is_text(save, "sdcard/note.txt", "SD"));
     CHECK(!has(backup, ""));
+    CHECK(!has(root2, "save-backups"));
+    // A retry must keep a backup folder that was already there, and everything in it.
+    put(root2, "save-backups/keep.txt", "KEEP");
+    CHECK(sc_stage_install(st, save, backup, &r) == SC_IO);
+    CHECK(is_text(root2, "save-backups/keep.txt", "KEEP"));
     sc_stage_discard(st);
     sc_report_free(&r);
 
@@ -263,6 +324,21 @@ static void selftest(const char *base) {
     snprintf(nosave, sizeof nosave, "%s/cemu/mlc01/usr/save/00050000/101c9500/user/common", root3);
     CHECK(sc_find_profile(nosave, prof, sizeof prof) == SC_NO_SAVE);
 
+    // An expired search has its own result, including when the chosen folder has no save.
+    CHECK(find_profile_root(nosave, prof, sizeof prof, time(NULL) - PROFILE_SECONDS - 1, NULL) == SC_SEARCH_LIMIT);
+    Search over = {0};
+    over.t0 = time(NULL), over.visits = PROFILE_VISITS + 1;
+    find_profile(nosave, 0, &over);
+    CHECK(search_over(&over) && !over.have_any);
+    for (int depth = 9; depth <= 10; depth++) {
+        scratch(base, root, sizeof root);
+        char deep[1100];
+        snprintf(deep, sizeof deep, "%s", root);
+        for (int i = 0; i < depth; i++) strcat(deep, "/d");
+        put(deep, "0/game_data.sav", "x");
+        CHECK(sc_find_profile(root, prof, sizeof prof) == SC_OK && !strcmp(prof, deep));
+    }
+
     // a folder holding a Switch profile first in name order and a Wii U one after it: the Wii U one
     {
         static const char sw[] = {0x30, 0x47, 0, 0}, wiiu[] = {0, 0, 0x47, 0x1B};
@@ -281,6 +357,49 @@ static void selftest(const char *base) {
         CHECK(sc_find_profile(nosave, prof, sizeof prof) == SC_OK && strstr(prof, "/both/b") != NULL);
         remove(f);
         CHECK(sc_find_profile(nosave, prof, sizeof prof) == SC_OK && strstr(prof, "/both/a") != NULL);
+    }
+
+    // Cleanup removes only dated import folders, keeps a live stage, and never touches unrelated folders.
+    {
+        scratch(base, root, sizeof root);
+        setup(root, true);
+        snprintf(save, sizeof save, "%s/save", root);
+        const char *old = "save-import-20261029-100000", *live = "save-import-20261030-100000";
+        put(root, "save-import-20261029-100000/save_0/0/game_data.sav", "STALE");
+        put(root, "save-import-20261030-100000/save_0/0/game_data.sav", "LIVE");
+        put(root, "save-import-not-ours/mine", "KEEP");
+        put(root, "other/mine", "KEEP");
+        snprintf(stage, sizeof stage, "%s/%s/", root, live);
+        ScRecovery recovery;
+        CHECK(sc_cleanup_stages(save, stage, &recovery, &r) == SC_OK);
+        CHECK(!recovery.imported[0] && !has(root, old) && has(root, live));
+        CHECK(is_text(root, "save-import-not-ours/mine", "KEEP") && is_text(root, "other/mine", "KEEP"));
+        CHECK(is_text(save, "save_0/0/game_data.sav", "OLD"));
+
+        // A missing save means an interrupted swap: keep every import, and name the newest dated backup.
+        snprintf(gone, sizeof gone, "%s/gone", root);
+        CHECK(rename(save, gone) == 0);
+        CHECK(sc_cleanup_stages(save, NULL, &recovery, &r) == SC_OK);
+        CHECK(recovery.imported[0] && !recovery.backup[0] && has(root, live));
+        put(root, "save-import-20261029-100000/save_0/0/game_data.sav", "STALE");
+        put(root, "save-backups/save-20261029-100000/save_0/0/game_data.sav", "OLDER");
+        put(root, "save-backups/save-20261030-100000-9/save_0/0/game_data.sav", "OLD");
+        put(root, "save-backups/save-20261030-100000-10/save_0/0/game_data.sav", "NEWER");
+        CHECK(sc_cleanup_stages(save, NULL, &recovery, &r) == SC_OK);
+        CHECK(has(root, old) && has(root, live) && !has(save, ""));
+        CHECK(strstr(recovery.imported, live) && strstr(recovery.backup, "save-20261030-100000-10"));
+        sc_report_free(&r);
+#ifndef _WIN32
+        // A link that looks like an abandoned stage never exposes its target to the cleanup.
+        CHECK(rename(gone, save) == 0);
+        snprintf(stage, sizeof stage, "%s/save-import-20261028-100000", root);
+        CHECK(symlink(gone, stage) == 0);
+        CHECK(sc_cleanup_stages(save, NULL, &recovery, &r) == SC_OK);
+        struct stat link_st;
+        CHECK(lstat(stage, &link_st) == 0 && S_ISLNK(link_st.st_mode));
+        CHECK(is_text(save, "save_0/0/game_data.sav", "OLD"));
+        sc_report_free(&r);
+#endif
     }
 
     // 8. slots
@@ -316,11 +435,69 @@ static void selftest(const char *base) {
         sc_report_free(&r);
     }
 #endif
+    // 10. a running game's lock: import and backup refuse and change nothing; once the lock is let go they work, and a lock
+    // file that is there but not held (a game that has ended) is no obstacle
+    {
+        char root5[1100];
+        scratch(base, root5, sizeof root5);
+        setup(root5, true);
+        char save5[1100], backup5[1100], stage5[1100];
+        snprintf(save5, sizeof save5, "%s/save", root5);
+        sc_backup_path(save5, backup5, sizeof backup5);
+        sc_stage_path(save5, stage5, sizeof stage5);
+        ScLock *game = NULL, *second = NULL;
+        CHECK(sc_lock_take(save5, &game) == SC_LOCK_OK && game);
+        CHECK(has(root5, "save.lock") && !has(save5, ".lock"));  // (next to the folder: the swap never moves it)
+        CHECK(sc_lock_take(save5, &second) == SC_LOCK_BUSY && !second);
+        memset(&r, 0, sizeof r);
+        CHECK(sc_backup(save5, backup5, &r) == SC_IN_USE && !has(backup5, ""));
+        st = fake_stage(root5, stage5);
+        memset(&r, 0, sizeof r);
+        CHECK(sc_stage_install(st, save5, backup5, &r) == SC_IN_USE);
+        CHECK(is_text(save5, "save_0/0/game_data.sav", "OLD") && has(stage5, "save_0") && !has(backup5, ""));
+        sc_lock_drop(game);
+        memset(&r, 0, sizeof r);
+        CHECK(sc_backup(save5, backup5, &r) == SC_OK && is_text(backup5, "save_0/0/game_data.sav", "OLD"));
+        sc_report_free(&r);
+        char backup5b[1100];
+        snprintf(backup5b, sizeof backup5b, "%s/backup-2", root5);
+        memset(&r, 0, sizeof r);
+        CHECK(sc_stage_install(st, save5, backup5b, &r) == SC_OK && is_text(save5, "save_0/0/game_data.sav", "NEW"));
+        sc_report_free(&r);
+        CHECK(sc_lock_take(save5, &second) == SC_LOCK_OK);  // (the import let go of it again)
+        sc_lock_drop(second);
+        // a folder the lock file can't be made in: nothing to wait for
+        char nowhere[1100];
+        snprintf(nowhere, sizeof nowhere, "%s/no-such-folder/save", root5);
+        CHECK(sc_lock_take(nowhere, &second) == SC_LOCK_UNAVAILABLE && !second);
+    }
     printf(failures ? "SELFTEST FAIL (%d)\n" : "SELFTEST PASS\n", failures);
+}
+
+// holdlock <save folder>: holds the game's lock until the process is stopped (tests: a second process as the game)
+static int holdlock_cmd(const char *save) {
+    ScLock *l = NULL;
+    if (sc_lock_take(save, &l) != SC_LOCK_OK) { puts("NOLOCK"); return 1; }
+    puts("READY");
+    fflush(stdout);
+    for (;;) sleep(60);
+}
+
+// locked <save folder>: BUSY, FREE (and let go again) or UNAVAILABLE
+static int locked_cmd(const char *save) {
+    ScLock *l = NULL;
+    ScLockResult c = sc_lock_take(save, &l);
+    puts(c == SC_LOCK_BUSY ? "BUSY" : c == SC_LOCK_OK ? "FREE" : "UNAVAILABLE");
+    sc_lock_drop(l);
+    return 0;
 }
 
 int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "convert")) return convert_cmd(argc, argv);
+    if (argc == 5 && !strcmp(argv[1], "cancel")) return cancel_cmd(argv[2], argv[3], argv[4]);
+    if (argc == 5 && !strcmp(argv[1], "oom")) return oom_cmd(argv[2], argv[3], argv[4]);
+    if (argc == 3 && !strcmp(argv[1], "holdlock")) return holdlock_cmd(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "locked")) return locked_cmd(argv[2]);
     if (argc >= 3 && !strcmp(argv[1], "slots")) return slots_cmd(argv[2]);
     if (argc >= 3 && !strcmp(argv[1], "selftest")) {
         selftest(argv[2]);

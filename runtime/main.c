@@ -14,6 +14,7 @@
 #include "nvn/vulkan/shaders.h"  // (the shader key log: --scan-shaders)
 #endif
 #include "romfs_image.h"
+#include "services/save_convert.h"
 #include "settings.h"
 #include "hle.h"
 #include "kernel.h"
@@ -359,9 +360,17 @@ int main(int argc, char **argv) {
         mode = test_mode && !strcmp(test_mode, "setup") ? LAUNCHER_SETUP : LAUNCHER_CONFIG;
     for (;;) {
         if (mode != LAUNCHER_NONE) launcher_run(root, mode);
+        // The game holds the lock on its save folder while it runs, so the Saves tab of another Savage Wind refuses to
+        // swap or copy saves under it. Not getting it (somebody else has it, or no lock file can be made) never stops
+        // the game; it is let go before the start screen of a reboot, which is this same process.
+        ScLock *save_lock = NULL;
+        const char *save_env = getenv("SAVAGEWIND_SAVE_DIR");
+        if (sc_lock_take(save_env && *save_env ? save_env : "save", &save_lock) == SC_LOCK_BUSY)
+            fprintf(stderr, "[saves] another Savage Wind is running with this save folder; saving from both can overwrite saves\n");
         boot(root);
         int kind = ui_run();  // window and input on the main thread; returns when a reboot is requested
         teardown();
+        sc_lock_drop(save_lock);
         mode = kind == RT_REBOOT_TITLE ? LAUNCHER_CONFIG : LAUNCHER_NONE;
     }
 }

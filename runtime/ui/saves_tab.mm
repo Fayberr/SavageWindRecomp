@@ -48,14 +48,17 @@ void reveal_folder(const std::string &dir);  // launcher.mm: Explorer / Finder /
 
 namespace {
 
-enum Phase { IDLE, WORKING, CONFIRM, DONE };  // of the worker; DONE: the result stays shown until the next job
+enum Phase { IDLE, WORKING, CONFIRM, DONE, LOADING };  // of the worker; DONE: the result stays shown until the next job
 enum Kind { NONE, IMPORTED, IMPORT_FAILED, BACKED_UP, BACKUP_FAILED, CANCELLED };
-enum Job { JOB_CONVERT, JOB_INSTALL, JOB_BACKUP };
+enum Job { JOB_CONVERT, JOB_INSTALL, JOB_BACKUP, JOB_LIST };
 
 std::string g_game_root;                // <root>/romfs/Pack/Bootup.pack has the flag tables
 std::atomic<int> g_phase{IDLE};         // written by the worker, read here (release / acquire: the fields below follow it)
 pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 std::string g_picked;                   // the folder the dialog gave (SDL calls back on any thread)
+pthread_t g_worker;
+bool g_joinable;                       // only the UI / exit thread starts and joins workers
+std::atomic<bool> g_cancel{false};
 std::atomic<bool> g_dialog{false};      // the folder dialog is open
 
 // the last job's outcome
@@ -73,6 +76,12 @@ bool g_seen_done = true, g_popup_shown;
 // the slots in the save folder
 struct Thumb { uint64_t tex = 0; int w = 0, h = 0; bool tried = false; };
 std::vector<ScSlot> g_slots;
+std::vector<ScSlot> g_loaded_slots;      // worker writes; the UI takes it after the phase is published
+bool g_slots_ready;
+int g_list_return_phase;
+ScRecovery g_recovery;                  // worker writes it with the slot list
+ScCode g_cleanup_code = SC_OK;
+std::string g_cleanup_detail;
 std::vector<Thumb> g_thumbs;
 int g_last_frame = -100;                // the frame the tab was last drawn in: a gap means it was left and is back
 
@@ -138,32 +147,56 @@ void load_one_thumb() {
     }
 }
 
-void reload_slots() {
-    free_thumbs();
+void read_slots() {  // (worker only: no UI or texture calls)
+    ScReport r = {};
+    g_cleanup_code = sc_cleanup_stages(save_dir().c_str(), g_stage ? g_stage_dir.c_str() : NULL, &g_recovery, &r);
+    g_cleanup_detail = r.detail;
     ScSlot *v = NULL;
     int n = sc_list_slots((save_dir() + "/save_0").c_str(), &v);
-    g_slots.assign(v, v + n);
+    g_loaded_slots.clear();
+    if (n) g_loaded_slots.assign(v, v + n);
     free(v);
-    g_thumbs.assign(n, Thumb());
+    g_slots_ready = true;
+}
+
+void take_slots() {
+    free_thumbs();
+    g_slots.swap(g_loaded_slots);
+    g_loaded_slots.clear();
+    g_thumbs.assign(g_slots.size(), Thumb());
+    g_slots_ready = false;
 }
 
 // ------------------------------------------------------------------ the worker
 struct Work { int what; std::string src; };
 
+bool cancel_work(void *) { return g_cancel.load(std::memory_order_relaxed); }
+
 void *worker(void *p) {
     Work *w = (Work *)p;
     std::string save = save_dir();
     ScReport r = {};
-    if (w->what == JOB_CONVERT) {
+    if (w->what == JOB_LIST) {
+        read_slots();
+        g_phase.store(g_list_return_phase, std::memory_order_release);
+    } else if (w->what == JOB_CONVERT) {
         ScFormat *fmt = NULL;
         ScStage *st = NULL;
         char stage[1100], backup[1100];
         sc_stage_path(save.c_str(), stage, sizeof stage);
         sc_backup_path(save.c_str(), backup, sizeof backup);
-        if (rt_is_link(save.c_str()) || rt_is_link((save + "/save_0").c_str())) {
+        ScLock *probe = NULL;  // (only a look: the install takes the lock again for the swap itself)
+        bool in_use = sc_lock_take(save.c_str(), &probe) == SC_LOCK_BUSY;
+        sc_lock_drop(probe);
+        if (in_use) {  // (a game is running: not worth converting for)
+            r.code = SC_IN_USE;
+        } else if (cancel_work(NULL)) {
+            r.code = SC_CANCELLED;
+        } else if (rt_is_link(save.c_str()) || rt_is_link((save + "/save_0").c_str())) {
             r.code = SC_LINKED;
         } else if (sc_format_load((g_game_root + "/romfs/Pack/Bootup.pack").c_str(), &fmt, &r) == SC_OK) {
-            sc_convert(w->src.c_str(), stage, fmt, 0, &st, &r);
+            ScCancel cancel = {cancel_work, NULL};
+            sc_convert_cancel(w->src.c_str(), stage, fmt, 0, &cancel, &st, &r);
             sc_format_free(fmt);
         }
         g_code = r.code, g_detail = r.detail;
@@ -174,7 +207,7 @@ void *worker(void *p) {
             g_had_saves = stat(save.c_str(), &sb) == 0;
             g_phase.store(CONFIRM, std::memory_order_release);
         } else {
-            g_kind = IMPORT_FAILED;
+            g_kind = r.code == SC_CANCELLED ? CANCELLED : IMPORT_FAILED;
             g_phase.store(DONE, std::memory_order_release);
         }
     } else if (w->what == JOB_INSTALL) {
@@ -185,11 +218,13 @@ void *worker(void *p) {
             g_kind = IMPORTED;
             if (!g_had_saves) g_backup.clear();
         } else {
-            sc_stage_discard(g_stage);  // (the saves are as they were)
+            if (c == SC_MOVED) sc_stage_keep(g_stage);  // (both copies must stay available for recovery)
+            else sc_stage_discard(g_stage);
             g_stage = NULL;
             g_kind = IMPORT_FAILED;
         }
         sc_report_free(&r);
+        if (c == SC_OK || c == SC_MOVED) read_slots();
         g_phase.store(DONE, std::memory_order_release);
     } else {
         char backup[1100];
@@ -204,23 +239,39 @@ void *worker(void *p) {
     return NULL;
 }
 
-// The start screen can end the process (QUIT, the window's close button) with a converted copy waiting for the yes
+// No worker takes g_lock or waits for the UI. Join without holding that lock, including on exit from the launcher.
+void join_worker() {
+    if (g_joinable) pthread_join(g_worker, NULL), g_joinable = false;
+}
+
 void drop_stage_at_exit() {
-    if (g_phase.load() != WORKING && g_stage) sc_stage_discard(g_stage), g_stage = NULL;
+    g_cancel.store(true, std::memory_order_relaxed);  // conversion can stop between files; installation always finishes
+    join_worker();
+    if (g_stage) sc_stage_discard(g_stage), g_stage = NULL;
 }
 
 void start(int what, const std::string &src = "") {
     static bool registered;
     if (!registered) registered = true, atexit(drop_stage_at_exit);
-    if (what != JOB_INSTALL) {
+    join_worker();  // (the last job has published its result and can now be reaped)
+    g_cancel.store(false, std::memory_order_relaxed);
+    if (what == JOB_LIST) g_list_return_phase = g_phase.load();
+    if (what != JOB_INSTALL && what != JOB_LIST) {
         sc_report_free(&g_rep);
         g_kind = NONE, g_code = 0, g_detail.clear(), g_backup.clear(), g_warnings = 0, g_files = 0;
     }
     g_seen_done = false;
-    g_phase.store(WORKING, std::memory_order_release);
-    pthread_t t;
-    pthread_create(&t, NULL, worker, new Work{what, src});
-    pthread_detach(t);
+    g_phase.store(what == JOB_LIST ? LOADING : WORKING, std::memory_order_release);
+    Work *w = new Work{what, src};
+    int err = pthread_create(&g_worker, NULL, worker, w);
+    if (!err) g_joinable = true;
+    else {
+        delete w;
+        if (g_stage) sc_stage_discard(g_stage), g_stage = NULL;
+        g_code = SC_IO, g_detail = strerror(err);
+        g_kind = what == JOB_BACKUP ? BACKUP_FAILED : IMPORT_FAILED;
+        g_phase.store(DONE, std::memory_order_release);
+    }
 }
 
 void SDLCALL folder_picked(void *, const char *const *files, int) {
@@ -288,6 +339,9 @@ void failure_text(int code, bool backup, std::string *head, std::string *hint) {
         *head = tr("No Breath of the Wild save found in that folder");
         *hint = tr("Choose the Cemu profile folder (.../user/80000001) or a folder above it.");
         break;
+    case SC_SEARCH_LIMIT:
+        *head = tr("The search took too long. Choose a folder closer to the save.");
+        break;
     case SC_SWITCH_SAVE:
         *head = tr("That is a Switch save already");
         *hint = tr("Savage Wind uses those as they are: copy its files into the save folder instead.");
@@ -304,6 +358,10 @@ void failure_text(int code, bool backup, std::string *head, std::string *hint) {
     case SC_LINKED:
         *head = tr("The save folder is a link");
         *hint = tr("Savage Wind doesn't replace a linked folder. Use a normal save folder.");
+        break;
+    case SC_IN_USE:
+        *head = tr("Savage Wind is running in a game");
+        *hint = tr("Close the game first, then try again.");
         break;
     case SC_MOVED:
         *head = tr("The import stopped halfway");
@@ -324,7 +382,7 @@ void draw_result(int phase) {
     } else if (g_kind == IMPORTED) {
         ImGui::TextColored(gold, "%s", tr("Import finished"));
         ImGui::TextWrapped("%s", fmt("Slots imported: %s", slot_list(g_rep).c_str()).c_str());
-        ImGui::TextDisabled("%s", fmt("From: %s", g_rep.root).c_str());
+        ImGui::TextDisabled("%s", fmt("From: %s", shown_path(g_rep.root).c_str()).c_str());
         ImGui::TextWrapped("%s", fmt("Flags: %u kept, %u set to defaults (not in the old save), %u dropped (not in this game "
                                      "version).", g_rep.kept, g_rep.defaulted, g_rep.dropped).c_str());
         for (int i = 0; i < g_rep.nslots; i++) {  // (per slot: what the older game did not have, and what the new one dropped)
@@ -369,7 +427,7 @@ void draw_confirm(int phase) {
     ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", tr("Import this save?"));
     ImGui::PushTextWrapPos(fminf(ImGui::GetFontSize() * 34, ImGui::GetIO().DisplaySize.x * 0.7f));  // (a small window too)
     ImGui::TextWrapped("%s", fmt("Slots: %s", slot_list(g_rep).c_str()).c_str());
-    ImGui::TextDisabled("%s", fmt("From: %s", g_rep.root).c_str());
+    ImGui::TextDisabled("%s", fmt("From: %s", shown_path(g_rep.root).c_str()).c_str());
     ImGui::Spacing();
     if (g_had_saves) {
         ImGui::TextWrapped("%s", tr("Your current saves are moved to this backup folder first. Nothing is deleted:"));
@@ -404,43 +462,44 @@ void saves_tab_set_game_files(const char *root) { g_game_root = root; }
 
 bool saves_tab_busy(void) {
     int p = g_phase.load(std::memory_order_acquire);
-    return p == WORKING || p == CONFIRM;
+    return p == WORKING || p == CONFIRM || p == LOADING;
 }
 
 void saves_tab_unload(void) {
+    drop_stage_at_exit();
     free_thumbs();
     g_slots.clear();
-    if (g_phase.load() != WORKING && g_stage) sc_stage_discard(g_stage), g_stage = NULL;
-    if (g_phase.load() != WORKING) {  // (the result belongs to this visit)
-        g_phase.store(IDLE);
-        sc_report_free(&g_rep);
-        g_kind = NONE;
-    }
+    g_loaded_slots.clear();
+    g_slots_ready = false;
+    g_phase.store(IDLE);
+    sc_report_free(&g_rep);
+    g_kind = NONE;
     g_last_frame = -100;
 }
 
 void saves_tab_draw(void) {
     int frame = ImGui::GetFrameCount();
     if (g_last_frame + 3 < frame) {  // first time, or back after another tab (files may have changed)
-        reload_slots();
+        int p = g_phase.load(std::memory_order_acquire);
+        if (p == IDLE || p == DONE) start(JOB_LIST);
         pthread_mutex_lock(&g_lock);
         g_picked.clear();  // (a folder chosen while the tab was away: not started by surprise)
         pthread_mutex_unlock(&g_lock);
     }
     g_last_frame = frame;
     int phase = g_phase.load(std::memory_order_acquire);
-    if (phase == DONE && !g_seen_done) {
-        g_seen_done = true;
-        if (g_kind == IMPORTED || g_code == SC_MOVED) reload_slots();  // (the new saves, or none: a backup or a failure changed nothing else)
-    }
+    if (phase != WORKING && phase != LOADING && g_slots_ready) take_slots();
+    if (phase == DONE && !g_seen_done) g_seen_done = true;
     std::string picked;
     pthread_mutex_lock(&g_lock);
     picked.swap(g_picked);
     pthread_mutex_unlock(&g_lock);
-    if (!picked.empty() && (phase == IDLE || phase == DONE)) start(JOB_CONVERT, picked), phase = WORKING;
+    if (!picked.empty() && (phase == IDLE || phase == DONE) && !g_recovery.imported[0]) start(JOB_CONVERT, picked), phase = WORKING;
     load_one_thumb();
 
-    bool busy = phase == WORKING || phase == CONFIRM;
+    bool working = phase == WORKING || phase == CONFIRM || phase == LOADING;
+    bool recovery = !working && g_recovery.imported[0];
+    bool busy = working || recovery;
     opt_begin("##saves", ImGui::GetFontSize() / 34);
     opt_section("Import");
     if (busy) opt_disable_next();
@@ -455,17 +514,36 @@ void saves_tab_draw(void) {
     if (opt_action("Back up saves", "",
                    "Copies the whole save folder to a new dated folder in save-backups, next to it. Your saves stay "
                    "where they are.") && !busy)
-        start(JOB_BACKUP);
-    if (opt_action("Open save folder", "", "Opens the folder with your saves in your file manager.")) {
-        SDL_CreateDirectory(save_dir().c_str());  // (no save yet: the folder is made so there is something to open)
-        reveal_folder(save_dir());
+        start(JOB_BACKUP), phase = WORKING, working = busy = true;
+    if (working) opt_disable_next();
+    if (opt_action("Open save folder", "", "Opens the folder with your saves in your file manager.") && !working) {
+        if (recovery) reveal_folder(g_recovery.imported);
+        else {
+            SDL_CreateDirectory(save_dir().c_str());  // (no save yet: the folder is made so there is something to open)
+            reveal_folder(save_dir());
+        }
+    }
+    if (recovery) {
+        opt_section("Result");
+        ImGui::TextWrapped("%s", tr("An earlier import was interrupted. The save folder is missing."));
+        if (g_recovery.backup[0])
+            ImGui::TextWrapped("%s", fmt("Previous saves (if any): %s", shown_path(g_recovery.backup).c_str()).c_str());
+        ImGui::TextWrapped("%s", fmt("Imported saves: %s", shown_path(g_recovery.imported).c_str()).c_str());
+        ImGui::TextWrapped("%s", tr("Close Savage Wind and rename one of these folders to save to recover it. These folders have been kept."));
+    } else if (!working && g_cleanup_code != SC_OK) {
+        opt_section("Result");
+        ImGui::TextWrapped("%s", tr("Files could not be read or written"));
+        ImGui::TextDisabled("%s", g_cleanup_detail.c_str());
     }
     if (phase == WORKING || phase == DONE) {  // (the worker's fields are read only once it has published them)
         opt_section("Result");
         draw_result(phase);
     }
     opt_section("Slots");
-    if (g_slots.empty()) {
+    if (phase == LOADING) {
+        opt_disable_next();
+        opt_action("Working...", "", "");
+    } else if (g_slots.empty()) {
         opt_disable_next();
         opt_action("No saves yet", "",
                    "There are no saves in the save folder yet. They show up here once you have played, or imported one.");

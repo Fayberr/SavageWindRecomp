@@ -9,6 +9,7 @@
 //               cancel   pick the folder, then Escape in the question
 //               pick     only pick the folder (a refusal shows as the result)
 //               backup   the Back up saves button
+//               locked-import, locked-backup   the same, with another "game" holding the save folder's lock
 // Output: lines "KEY value" for the script to read (KIND is the Kind enum, CODE an ScCode); exit status 1 when the tab
 // itself misbehaved.
 #ifdef _WIN32
@@ -20,12 +21,39 @@
 #include <thread>
 
 #include "imgui_internal.h"  // (a window by name)
+#include "../runtime/services/save_convert.h"
+static ScCode tab_convert(const char *, const char *, const ScFormat *, unsigned, const ScCancel *, ScStage **, ScReport *);
+#define sc_convert_cancel tab_convert
 #include "../runtime/ui/saves_tab.mm"  // (the whole file: the test reaches its state)
+#undef sc_convert_cancel
 
 #include "stb_image_write.h"
 
+// Pause at an actual file boundary, or between the installation renames. Exit must release the worker and join it.
+static std::atomic<bool> g_pause_convert{false}, g_pause_install{false}, g_paused{false};
+struct Gate { const ScCancel *cancel; ScReport *report; };
+static bool gated_cancel(void *p) {
+    Gate *g = (Gate *)p;
+    if (g_pause_convert && g->report->n_written) {
+        g_paused = true;
+        while (!g->cancel->requested(g->cancel->data)) std::this_thread::yield();
+    }
+    return g->cancel->requested(g->cancel->data);
+}
+static ScCode tab_convert(const char *src, const char *dst, const ScFormat *fmt, unsigned flags,
+                          const ScCancel *cancel, ScStage **stage, ScReport *r) {
+    Gate gate = {cancel, r};
+    ScCancel check = {gated_cancel, &gate};
+    return sc_convert_cancel(src, dst, fmt, flags, &check, stage, r);
+}
+extern "C" void sc_test_before_install(void) {
+    if (!g_pause_install) return;
+    g_paused = true;
+    while (!g_cancel.load()) std::this_thread::yield();
+}
+
 // ---------------------------------------------------------------- stand-ins
-static int g_created, g_freed, g_dialog_opened;
+static int g_created, g_freed;
 
 extern "C" {
 SDL_Window *ui_window(void) { return NULL; }
@@ -46,7 +74,7 @@ bool SDL_CreateDirectory(const char *p) { return _mkdir(p) == 0 || errno == EEXI
 #else
 bool SDL_CreateDirectory(const char *p) { return mkdir(p, 0755) == 0 || errno == EEXIST; }
 #endif
-void SDL_ShowOpenFolderDialog(SDL_DialogFileCallback, void *, SDL_Window *, const char *, bool) { g_dialog_opened++; }
+void SDL_ShowOpenFolderDialog(SDL_DialogFileCallback, void *, SDL_Window *, const char *, bool) {}
 }
 void reveal_folder(const std::string &dir) { printf("REVEAL %s\n", dir.c_str()); }
 const char *tr(const char *en) { return en; }
@@ -111,6 +139,8 @@ static int run(const std::string &scenario, const std::string &src) {
         printf("%s %s\n", ok ? "ok" : "BAD", what);
         bad += !ok;
     };
+    frame();
+    check(until([] { return g_phase.load() != LOADING; }), "the slot list loads on the worker");
     frames(40);  // (the list and its pictures, one a frame)
     printf("SLOTS %zu\n", g_slots.size());
     int shown = 0;
@@ -123,7 +153,23 @@ static int run(const std::string &scenario, const std::string &src) {
     }
     check(g_slots.empty() || shown == 0 || g_picture_drawn, "a slot's picture is drawn when its row is hovered");
     g_io->AddMousePosEvent(-1000, -1000);
-    if (scenario == "backup") {
+    if (scenario == "recovery") {
+        check(g_recovery.imported[0] && g_recovery.backup[0], "the recovery message names both folders");
+        check(!saves_tab_busy(), "recovery has no running worker");
+        printf("RECOVERY_IMPORT %s\nRECOVERY_BACKUP %s\n", g_recovery.imported, g_recovery.backup);
+        return bad;
+    }
+    if (scenario == "quit-convert") {
+        g_pause_convert = true;
+        start(JOB_CONVERT, src);
+        check(until([] { return g_paused.load(); }), "conversion has written a file and is still working");
+        check(is_working(), "exit begins during WORKING");
+        exit(bad ? 1 : 0);  // (the launcher's Quit and window close use this same path)
+    }
+    ScLock *game = NULL;  // (held to the end of the run: the running game of another Savage Wind)
+    if (scenario == "locked-import" || scenario == "locked-backup")
+        check(sc_lock_take(save_dir().c_str(), &game) == SC_LOCK_OK, "the stand-in game takes the lock");
+    if (scenario == "backup" || scenario == "locked-backup") {
         start(JOB_BACKUP);
         check(until(is_done), "the backup finishes");
         frames(10);
@@ -140,12 +186,27 @@ static int run(const std::string &scenario, const std::string &src) {
     }
     frames(10);  // (the question is up)
     printf("STAGE %s\nBACKUP %s\nHADSAVES %d\n", g_stage_dir.c_str(), g_backup.c_str(), (int)g_had_saves);
+    if (scenario == "quit-confirm") exit(bad ? 1 : 0);
+    if (scenario == "quit-install") {
+        g_pause_install = true;
+        start(JOB_INSTALL);
+        check(until([] { return g_paused.load(); }), "installation is between the two renames");
+        check(is_working(), "exit begins during WORKING");
+        drop_stage_at_exit();  // also runs again at exit: joining and cleanup must be idempotent
+        check(!g_joinable && !g_stage, "cleanup joins the installer and releases the stage");
+        check(g_kind == IMPORTED, "installation finishes before cleanup returns");
+        return bad;
+    }
     if (scenario == "pick") {
         key(ImGuiKey_Escape);
         until(is_done, 60);
         return bad;
     }
     if (scenario == "cancel") {
+        g_last_frame = -100;  // returning to the tab must not clean up the copy waiting for confirmation
+        frame();
+        struct stat st;
+        check(in_confirm() && g_stage && stat(g_stage_dir.c_str(), &st) == 0, "a waiting stage survives reopening the tab");
         key(ImGuiKey_Escape);
         check(until(is_done, 120), "Escape in the question ends it");
         frames(10);

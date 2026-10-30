@@ -6,6 +6,7 @@
 #include <time.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,10 +17,15 @@
 
 #include "../platform.h"
 #include "archive.h"
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/file.h>
+#endif
 
 #define PATH_CAP 1100
 #define HEADER 0xC          // flag save files: revision, 0xFFFFFFFF, 1; then {hash, value} entries; then 0xFFFFFFFF
-#define PROFILE_DEPTH 7     // how far below the picked folder the profile may be (find_profile_root)
+#define PROFILE_DEPTH 10    // how far below the picked folder the profile may be (find_profile_root)
 #define PROFILE_VISITS 100000  // folders looked at at most, and for at most PROFILE_SECONDS: a drive or a big projects
 #define PROFILE_SECONDS 4      // folder picked by mistake must not run for minutes
 
@@ -73,15 +79,26 @@ static char **names_list(const char *dir, int *n) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         if (cnt == cap) {
             cap = cap ? cap * 2 : 16;
-            v = realloc(v, sizeof *v * cap);
+            char **nv = realloc(v, sizeof *v * cap);
+            if (!nv) goto fail;
+            v = nv;
         }
-        v[cnt++] = strdup(e->d_name);
+        v[cnt] = strdup(e->d_name);
+        if (!v[cnt]) goto fail;
+        cnt++;
     }
-    closedir(d);
     if (!v) v = malloc(sizeof *v);
+    if (!v) goto fail;
     qsort(v, cnt, sizeof *v, cmp_str);
     *n = cnt;
+    closedir(d);
     return v;
+fail:
+    for (int i = 0; i < cnt; i++) free(v[i]);
+    free(v);
+    closedir(d);
+    errno = ENOMEM;
+    return NULL;
 }
 
 static void names_free(char **v, int n) {
@@ -154,17 +171,32 @@ static bool buf_put(Buf *b, const void *d, size_t n) {
     return true;
 }
 
+static bool cancel_requested(const ScCancel *cancel) {
+    return cancel && cancel->requested && cancel->requested(cancel->data);
+}
+
+static bool cancelled(const ScCancel *cancel, ScReport *r) {
+    if (!cancel_requested(cancel)) return false;
+    fail(r, SC_CANCELLED, "");
+    return true;
+}
+
 // ------------------------------------------------------------------ files and folders this run made
 // Everything a conversion or a backup creates is noted here, so that undoing it removes those and nothing else.
 typedef struct { char *path; bool dir; } Made;
 typedef struct { Made *v; int n, cap; } MadeList;
 
-static void made_add(MadeList *m, const char *path, bool dir) {
+static bool made_add(MadeList *m, const char *path, bool dir) {
     if (m->n == m->cap) {
-        m->cap = m->cap ? m->cap * 2 : 64;
-        m->v = realloc(m->v, sizeof *m->v * m->cap);
+        int cap = m->cap ? m->cap * 2 : 64;
+        Made *v = realloc(m->v, sizeof *m->v * cap);
+        if (!v) return false;
+        m->v = v, m->cap = cap;
     }
-    m->v[m->n++] = (Made){strdup(path), dir};
+    char *copy = strdup(path);
+    if (!copy) return false;
+    m->v[m->n++] = (Made){copy, dir};
+    return true;
 }
 
 static void made_clear(MadeList *m) {
@@ -201,8 +233,13 @@ static bool make_dirs(const char *path, MadeList *made, ScReport *r) {
         char c = *q;
         *q = 0;
         if (!is_dir(p)) {
-            if (mkdir(p, 0755) != 0 && !is_dir(p)) { fail(r, SC_IO, "%s: %s", p, strerror(errno)); return false; }
-            if (made) made_add(made, p, true);
+            if (mkdir(p, 0755) != 0) {
+                if (!is_dir(p)) { fail(r, SC_IO, "%s: %s", p, strerror(errno)); return false; }
+            } else if (made && !made_add(made, p, true)) {
+                rmdir(p);
+                fail(r, SC_IO, "out of memory");
+                return false;
+            }
         }
         *q = c;
         if (!c) break;
@@ -223,7 +260,12 @@ static bool write_file(const char *path, const void *d, size_t n, MadeList *made
     if (!parent_dirs(path, made, r)) return false;
     FILE *f = fopen(path, "wb");
     if (!f) { fail(r, SC_IO, "%s: %s", path, strerror(errno)); return false; }
-    made_add(made, path, false);
+    if (!made_add(made, path, false)) {
+        fclose(f);
+        remove(path);
+        fail(r, SC_IO, "out of memory");
+        return false;
+    }
     bool ok = fwrite(d, 1, n, f) == n;
     ok = fclose(f) == 0 && ok;
     if (!ok) fail(r, SC_IO, "%s: could not be written (disk full?)", path);
@@ -246,7 +288,12 @@ static bool copy_file(const char *from, const char *to, MadeList *made, ScReport
     if (!parent_dirs(to, made, r)) { fclose(in); return false; }
     FILE *out = fopen(to, "wb");
     if (!out) { fail(r, SC_IO, "%s: %s", to, strerror(errno)); fclose(in); return false; }
-    made_add(made, to, false);
+    if (!made_add(made, to, false)) {
+        fclose(in), fclose(out);
+        remove(to);
+        fail(r, SC_IO, "out of memory");
+        return false;
+    }
     static __thread uint8_t chunk[1 << 16];
     size_t got;
     bool ok = true;
@@ -480,6 +527,7 @@ static bool load_flags(ScFormat *f, const uint8_t *arc, size_t arcn, char *why, 
     uint32_t seq = 0;
     if (nodes < 0) { snprintf(why, whycap, "gamedata.ssarc is not an archive"); return false; }
     f->docs = calloc(nodes ? nodes : 1, sizeof *f->docs);
+    if (!f->docs) { snprintf(why, whycap, "out of memory"); return false; }
     for (int i = 0; i < nodes; i++) {
         const char *name;
         const uint8_t *blob;
@@ -491,8 +539,8 @@ static bool load_flags(ScFormat *f, const uint8_t *arc, size_t arcn, char *why, 
             return false;
         }
         f->ndocs++;
-        uint32_t nkinds;
-        by_count(root, &nkinds);
+        uint32_t nkinds = 0;
+        if (!by_count(root, &nkinds)) { snprintf(why, whycap, "gamedata: bad root"); return false; }
         for (uint32_t k = 0; k < nkinds; k++) {
             const char *kind;
             bool array;
@@ -518,7 +566,9 @@ static bool load_flags(ScFormat *f, const uint8_t *arc, size_t arcn, char *why, 
                 }
                 if (f->nflags == cap) {
                     cap = cap ? cap * 2 : 1 << 14;
-                    f->flags = realloc(f->flags, sizeof *f->flags * cap);
+                    Flag *v = realloc(f->flags, sizeof *f->flags * cap);
+                    if (!v) { snprintf(why, whycap, "out of memory"); return false; }
+                    f->flags = v;
                 }
                 f->flags[f->nflags++] = (Flag){h, (uint8_t)base, words, iv, seq++};
             }
@@ -561,12 +611,16 @@ static bool load_files(ScFormat *f, const uint8_t *arc, size_t arcn, char *why, 
             if (!strcmp(f->files[k].name, fname)) ff = &f->files[k];
         if (!ff) {
             if (strlen(fname) >= sizeof ff->name) { snprintf(why, whycap, "savedataformat: a file name is too long"); return false; }
-            f->files = realloc(f->files, sizeof *f->files * (f->nfiles + 1));
+            FmtFile *v = realloc(f->files, sizeof *f->files * (f->nfiles + 1));
+            if (!v) { snprintf(why, whycap, "out of memory"); return false; }
+            f->files = v;
             ff = &f->files[f->nfiles++];
             *ff = (FmtFile){0};
             strcpy(ff->name, fname);
         }
-        ff->hashes = realloc(ff->hashes, sizeof *ff->hashes * (ff->n + cnt + 1));
+        uint32_t *v = realloc(ff->hashes, sizeof *ff->hashes * (ff->n + cnt + 1));
+        if (!v) { snprintf(why, whycap, "out of memory"); return false; }
+        ff->hashes = v;
         for (uint32_t k = 0; k < cnt; k++) {
             uint32_t h;
             if (!by_at(hashes, k, &hv) || !by_get(hv, "HashValue", &hh) || !by_scalar(hh, &s) || !scalar_u32(&s, &h)) {
@@ -756,7 +810,9 @@ static ScCode convert_flags(const uint8_t *d, size_t n, const ScFormat *fmt, con
         if (!buf_reserve(out, (size_t)fl->words * 8)) { snprintf(why, whycap, "out of memory"); rc = SC_IO; break; }
         if (!raw || rawcap < (size_t)fl->words * 4) {
             rawcap = (size_t)fl->words * 4;
-            raw = realloc(raw, rawcap ? rawcap : 1);
+            uint8_t *v = realloc(raw, rawcap ? rawcap : 1);
+            if (!v) { snprintf(why, whycap, "out of memory"); rc = SC_IO; break; }
+            raw = v;
         }
         if (!have || have != fl->words) {
             if (!encode_init(fl, raw)) {
@@ -843,16 +899,16 @@ static bool profile_is_big_endian(const char *p) {
 
 // What the search found: the first Wii U profile, else the first profile of any kind (so that a Switch save can be
 // told apart from no save, and a folder holding both Savage Wind's own saves and a Cemu profile finds the latter)
-typedef struct { int visits; time_t t0; bool have_be, have_any; char be[PATH_CAP], any[PATH_CAP]; } Search;
+typedef struct { int visits; time_t t0; const ScCancel *cancel; bool have_be, have_any; char be[PATH_CAP], any[PATH_CAP]; } Search;
 
 static bool search_over(Search *s) {  // (out of folders or of time: stop looking)
-    if (s->visits > PROFILE_VISITS) return true;
+    if (cancel_requested(s->cancel) || s->visits > PROFILE_VISITS) return true;
     if (time(NULL) - s->t0 > PROFILE_SECONDS) s->visits = PROFILE_VISITS + 1;
     return s->visits > PROFILE_VISITS;
 }
 
 static void find_profile(const char *dir, int depth, Search *s) {
-    if (s->have_be || ++s->visits > PROFILE_VISITS) return;
+    if (s->have_be || search_over(s) || ++s->visits > PROFILE_VISITS) return;
     if ((s->visits & 63) == 0 && search_over(s)) return;
     if (looks_like_profile(dir)) {
         if (profile_is_big_endian(dir)) s->have_be = snprintf(s->be, sizeof s->be, "%s", dir) < (int)sizeof s->be;
@@ -862,7 +918,7 @@ static void find_profile(const char *dir, int depth, Search *s) {
     if (depth >= PROFILE_DEPTH) return;
     int n;
     char **v = names_list(dir, &n);
-    for (int i = 0; v && i < n && !s->have_be; i++) {
+    for (int i = 0; v && i < n && !s->have_be && !search_over(s); i++) {
         char sub[PATH_CAP];
         if (!strcmp(v[i], ".git") || !strcmp(v[i], "node_modules")) continue;  // (never a save; often huge)
         if ((i & 63) == 63 && search_over(s)) break;
@@ -871,14 +927,20 @@ static void find_profile(const char *dir, int depth, Search *s) {
     if (v) names_free(v, n);
 }
 
-ScCode sc_find_profile(const char *dir, char *root, size_t cap) {
-    Search *s = calloc(1, sizeof *s);
-    s->t0 = time(NULL);
-    find_profile(dir, 0, s);
-    const char *found = s->have_be ? s->be : s->have_any ? s->any : NULL;
+// The start time is passed separately so the tests can exercise an expired search without waiting.
+static ScCode find_profile_root(const char *dir, char *root, size_t cap, time_t started, const ScCancel *cancel) {
+    Search s = {0};
+    s.t0 = started, s.cancel = cancel;
+    find_profile(dir, 0, &s);
+    if (cancel_requested(cancel)) return SC_CANCELLED;
+    if (!s.have_be && search_over(&s)) return SC_SEARCH_LIMIT;
+    const char *found = s.have_be ? s.be : s.have_any ? s.any : NULL;
     if (found) snprintf(root, cap, "%s", found);
-    free(s);
     return found ? SC_OK : SC_NO_SAVE;
+}
+
+ScCode sc_find_profile(const char *dir, char *root, size_t cap) {
+    return find_profile_root(dir, root, cap, time(NULL), NULL);
 }
 
 // ------------------------------------------------------------------ converting a profile
@@ -887,18 +949,27 @@ struct ScStage {
     MadeList made;
 };
 
-static void report_add_file(ScReport *r, const char *file, const ScFlagFile *st) {
-    r->files = realloc(r->files, sizeof *r->files * (r->nfiles + 1));
+static bool report_add_file(ScReport *r, const char *file, const ScFlagFile *st) {
+    ScFlagFile *v = realloc(r->files, sizeof *r->files * (r->nfiles + 1));
+    if (!v) { fail(r, SC_IO, "out of memory"); return false; }
+    r->files = v;
     r->files[r->nfiles] = *st;
     snprintf(r->files[r->nfiles].file, sizeof r->files[r->nfiles].file, "%s", file);
     r->nfiles++;
     r->kept += st->kept, r->defaulted += st->defaulted, r->dropped += st->dropped, r->resized += st->resized;
+    return true;
 }
 
 void sc_report_free(ScReport *r) {
     for (int i = 0; i < r->nslots; i++) free(r->slots[i]);
     free(r->slots), free(r->files);
     memset(r, 0, sizeof *r);
+}
+
+void sc_stage_keep(ScStage *st) {
+    if (!st) return;
+    made_clear(&st->made);
+    free(st);
 }
 
 void sc_stage_discard(ScStage *st) {
@@ -909,7 +980,8 @@ void sc_stage_discard(ScStage *st) {
 
 // A flag file of the profile -> converted file under dst (rel is the name shown in the report)
 static bool convert_one(const char *from, const char *to, const char *rel, const ScFormat *fmt, const FmtFile *ff,
-                        bool to_le, bool *src_le, MadeList *made, ScReport *r) {
+                        bool to_le, bool *src_le, const ScCancel *cancel, MadeList *made, ScReport *r) {
+    if (cancelled(cancel, r)) return false;
     char why[512];
     size_t n;
     uint8_t *data = read_file(from, &n, (size_t)1 << 28, why, sizeof why);
@@ -931,7 +1003,7 @@ static bool convert_one(const char *from, const char *to, const char *rel, const
     }
     bool ok = write_file(to, out.p, out.n, made, r);
     free(out.p);
-    if (ok) keep_time(from, to), report_add_file(r, rel, &st);
+    if (ok) keep_time(from, to), ok = report_add_file(r, rel, &st);
     return ok;
 }
 
@@ -941,13 +1013,14 @@ static bool has_jpg_suffix(const char *s) {
 }
 
 // tracker/ and the picture folders: every file (pictures: the .jpg ones) copied; swap: the Hero's Path's byte order
-static bool copy_folder(const char *from, const char *to, bool pictures_only, bool swap, int *count, MadeList *made,
+static bool copy_folder(const char *from, const char *to, bool pictures_only, bool swap, int *count, const ScCancel *cancel, MadeList *made,
                         ScReport *r) {
     int n;
     char **v = names_list(from, &n);
     if (!v) { fail(r, SC_IO, "%s: %s", from, strerror(errno)); return false; }
     bool ok = true;
     for (int i = 0; i < n && ok; i++) {
+        if (cancelled(cancel, r)) { ok = false; break; }
         char a[PATH_CAP], b[PATH_CAP];
         if (pictures_only && !has_jpg_suffix(v[i])) continue;
         if (!path_join(a, sizeof a, from, v[i]) || !path_join(b, sizeof b, to, v[i])) {
@@ -976,13 +1049,20 @@ static bool copy_folder(const char *from, const char *to, bool pictures_only, bo
 
 ScCode sc_convert(const char *src, const char *stage_dir, const ScFormat *fmt, unsigned flags, ScStage **stage,
                   ScReport *r) {
+    return sc_convert_cancel(src, stage_dir, fmt, flags, NULL, stage, r);
+}
+
+ScCode sc_convert_cancel(const char *src, const char *stage_dir, const ScFormat *fmt, unsigned flags,
+                         const ScCancel *cancel, ScStage **stage, ScReport *r) {
     *stage = NULL;
     r->code = SC_OK;
+    if (cancelled(cancel, r)) return r->code;
     const bool to_le = true;  // the Switch (Savage Wind); the Python tool's --to wiiu is not offered here
     const FmtFile *gd = fmt_file(fmt, "game_data.sav"), *cap = fmt_file(fmt, "caption.sav"), *opt = fmt_file(fmt, "option.sav");
     if (!gd) { fail(r, SC_BAD_BOOTUP, "the game has no game_data.sav format"); return r->code; }
-    if (sc_find_profile(src, r->root, sizeof r->root) != SC_OK) {
-        fail(r, SC_NO_SAVE, "%s", src);
+    ScCode found = find_profile_root(src, r->root, sizeof r->root, time(NULL), cancel);
+    if (found != SC_OK) {
+        fail(r, found, "%s", src);
         return r->code;
     }
     if (exists(stage_dir)) { fail(r, SC_IO, "%s: exists already", stage_dir); return r->code; }
@@ -1004,7 +1084,7 @@ ScCode sc_convert(const char *src, const char *stage_dir, const ScFormat *fmt, u
         snprintf(to, sizeof to, "%s/%s/game_data.sav", dst, slots[i]);
         snprintf(rel, sizeof rel, "%s/game_data.sav", slots[i]);
         bool first = !src_known;
-        if (!convert_one(gp, to, rel, fmt, gd, to_le, first ? &src_le : NULL, &st->made, r)) { names_free(slots, ns); goto fail; }
+        if (!convert_one(gp, to, rel, fmt, gd, to_le, first ? &src_le : NULL, cancel, &st->made, r)) { names_free(slots, ns); goto fail; }
         if (first) {
             src_known = true;
             if (src_le && !(flags & SC_ALLOW_SWITCH)) {
@@ -1013,18 +1093,22 @@ ScCode sc_convert(const char *src, const char *stage_dir, const ScFormat *fmt, u
                 goto fail;
             }
         }
-        r->slots = realloc(r->slots, sizeof *r->slots * (r->nslots + 1));
-        r->slots[r->nslots++] = strdup(slots[i]);
+        char **v = realloc(r->slots, sizeof *r->slots * (r->nslots + 1));
+        if (!v) { fail(r, SC_IO, "out of memory"); names_free(slots, ns); goto fail; }
+        r->slots = v;
+        char *name = strdup(slots[i]);
+        if (!name) { fail(r, SC_IO, "out of memory"); names_free(slots, ns); goto fail; }
+        r->slots[r->nslots++] = name;
         path_join(from, sizeof from, sd, "caption.sav");
         if (is_file(from) && cap) {
             snprintf(to, sizeof to, "%s/%s/caption.sav", dst, slots[i]);
             snprintf(rel, sizeof rel, "%s/caption.sav", slots[i]);
-            if (!convert_one(from, to, rel, fmt, cap, to_le, NULL, &st->made, r)) { names_free(slots, ns); goto fail; }
+            if (!convert_one(from, to, rel, fmt, cap, to_le, NULL, cancel, &st->made, r)) { names_free(slots, ns); goto fail; }
         }
         path_join(from, sizeof from, sd, "caption.jpg");
         if (is_file(from)) {
             snprintf(to, sizeof to, "%s/%s/caption.jpg", dst, slots[i]);
-            if (!copy_file(from, to, &st->made, r)) { names_free(slots, ns); goto fail; }
+            if (cancelled(cancel, r) || !copy_file(from, to, &st->made, r)) { names_free(slots, ns); goto fail; }
         }
     }
     names_free(slots, ns);
@@ -1032,24 +1116,94 @@ ScCode sc_convert(const char *src, const char *stage_dir, const ScFormat *fmt, u
     path_join(from, sizeof from, r->root, "option.sav");
     if (is_file(from) && opt) {
         path_join(to, sizeof to, dst, "option.sav");
-        if (!convert_one(from, to, "option.sav", fmt, opt, to_le, NULL, &st->made, r)) goto fail;
+        if (!convert_one(from, to, "option.sav", fmt, opt, to_le, NULL, cancel, &st->made, r)) goto fail;
     }
     // (the Hero's Path swaps only when the byte order changes: a Switch save converted for the Switch stays as it is)
     path_join(from, sizeof from, r->root, "tracker");
     path_join(to, sizeof to, dst, "tracker");
-    if (is_dir(from) && !copy_folder(from, to, false, src_known && src_le != to_le, &r->n_tracker, &st->made, r)) goto fail;
+    if (is_dir(from) && !copy_folder(from, to, false, src_known && src_le != to_le, &r->n_tracker, cancel, &st->made, r)) goto fail;
     path_join(from, sizeof from, r->root, "album");
     path_join(to, sizeof to, dst, "album");
-    if (is_dir(from) && !copy_folder(from, to, true, false, &r->n_album, &st->made, r)) goto fail;
+    if (is_dir(from) && !copy_folder(from, to, true, false, &r->n_album, cancel, &st->made, r)) goto fail;
     path_join(from, sizeof from, r->root, "pict_book");
     path_join(to, sizeof to, dst, "pict_book");
-    if (is_dir(from) && !copy_folder(from, to, true, false, &r->n_pict, &st->made, r)) goto fail;
+    if (is_dir(from) && !copy_folder(from, to, true, false, &r->n_pict, cancel, &st->made, r)) goto fail;
+    if (cancelled(cancel, r)) goto fail;
     if (!r->nslots) { fail(r, SC_NO_SAVE, "%s", src); goto fail; }
     *stage = st;
     return SC_OK;
 fail:
     sc_stage_discard(st);
     return r->code;
+}
+
+// ------------------------------------------------------------------ the lock on the save folder
+// The game holds <save>.lock (next to the save folder, so the import's rename of the folder never moves it) for as long as
+// it runs; the Saves tab refuses to import or back up while somebody else holds it. The operating system drops the lock
+// when the process ends, however it ends, so a crash leaves nothing stale behind (the file itself stays, empty).
+struct ScLock {
+#ifdef _WIN32
+    HANDLE h;
+#else
+    int fd;
+#endif
+};
+
+static bool lock_path(const char *save_dir, char *out, size_t cap) {
+    size_t n = strlen(save_dir);
+    while (n > 1 && (save_dir[n - 1] == '/' || save_dir[n - 1] == '\\')) n--;
+    return n + 6 < cap && snprintf(out, cap, "%.*s.lock", (int)n, save_dir) > 0;
+}
+
+ScLockResult sc_lock_take(const char *save_dir, ScLock **out) {
+    *out = NULL;
+    char path[PATH_CAP];
+    if (!lock_path(save_dir, path, sizeof path)) return SC_LOCK_UNAVAILABLE;
+    ScLock *l = calloc(1, sizeof *l);
+    if (!l) return SC_LOCK_UNAVAILABLE;
+#ifdef _WIN32
+    l->h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
+                       FILE_ATTRIBUTE_NORMAL, NULL);
+    if (l->h == INVALID_HANDLE_VALUE) { free(l); return SC_LOCK_UNAVAILABLE; }
+    OVERLAPPED ov = {0};
+    if (!LockFileEx(l->h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov)) {
+        bool busy = GetLastError() == ERROR_LOCK_VIOLATION;
+        CloseHandle(l->h);
+        free(l);
+        return busy ? SC_LOCK_BUSY : SC_LOCK_UNAVAILABLE;
+    }
+#else
+    l->fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (l->fd < 0) { free(l); return SC_LOCK_UNAVAILABLE; }
+    if (flock(l->fd, LOCK_EX | LOCK_NB) != 0) {
+        bool busy = errno == EWOULDBLOCK;
+        close(l->fd);
+        free(l);
+        return busy ? SC_LOCK_BUSY : SC_LOCK_UNAVAILABLE;
+    }
+#endif
+    *out = l;
+    return SC_LOCK_OK;
+}
+
+void sc_lock_drop(ScLock *l) {
+    if (!l) return;
+#ifdef _WIN32
+    CloseHandle(l->h);  // (closing the handle releases the lock)
+#else
+    close(l->fd);
+#endif
+    free(l);
+}
+
+// Import and backup take the lock for their whole run: the game can't be started into a folder that is being swapped
+// without noticing (it logs that the lock is held), and two Saves tabs can't swap at the same time. A lock file that
+// can't be made (a read-only data root) protects nothing, and does not stop the player either.
+static bool save_in_use(const char *save_dir, ScLock **held, ScReport *r) {
+    *held = NULL;
+    if (sc_lock_take(save_dir, held) != SC_LOCK_BUSY) return false;
+    fail(r, SC_IN_USE, "%s", save_dir);
+    return true;
 }
 
 // ------------------------------------------------------------------ backups and the swap
@@ -1091,7 +1245,7 @@ void sc_stage_path(const char *save_dir, char *out, size_t cap) {
     unique_path(out, cap, prefix);
 }
 
-ScCode sc_backup(const char *save_dir, const char *backup_dir, ScReport *r) {
+static ScCode backup_locked(const char *save_dir, const char *backup_dir, ScReport *r) {
     MadeList made = {0};
     r->code = SC_OK;
     if (!is_dir(save_dir)) { fail(r, SC_NO_SAVE, "%s", save_dir); return r->code; }
@@ -1104,7 +1258,16 @@ ScCode sc_backup(const char *save_dir, const char *backup_dir, ScReport *r) {
     return SC_OK;
 }
 
-ScCode sc_stage_install(ScStage *st, const char *save_dir, const char *backup_dir, ScReport *r) {
+ScCode sc_backup(const char *save_dir, const char *backup_dir, ScReport *r) {
+    r->code = SC_OK;
+    ScLock *lock;
+    if (save_in_use(save_dir, &lock, r)) return r->code;  // (a game that is saving may have a file half written)
+    ScCode c = backup_locked(save_dir, backup_dir, r);
+    sc_lock_drop(lock);
+    return c;
+}
+
+static ScCode install_locked(ScStage *st, const char *save_dir, const char *backup_dir, ScReport *r) {
     r->code = SC_OK;
     bool had = exists(save_dir);
     if (had && !is_dir(save_dir)) { fail(r, SC_IO, "%s: not a folder", save_dir); return r->code; }
@@ -1112,14 +1275,20 @@ ScCode sc_stage_install(ScStage *st, const char *save_dir, const char *backup_di
     struct stat ls;  // (renaming a link moves the link, not the saves it points to; Windows junctions: the caller checks)
     if (had && lstat(save_dir, &ls) == 0 && S_ISLNK(ls.st_mode)) { fail(r, SC_LINKED, "%s", save_dir); return r->code; }
 #endif
+    MadeList parents = {0};
     if (had) {
         if (exists(backup_dir)) { fail(r, SC_IO, "%s: exists already", backup_dir); return r->code; }
-        if (!parent_dirs(backup_dir, NULL, r)) return r->code;
+        if (!parent_dirs(backup_dir, &parents, r)) { made_undo(&parents); return r->code; }
         if (rename(save_dir, backup_dir) != 0) {
             fail(r, SC_IO, "%s: %s", save_dir, strerror(errno));  // (nothing has moved; on Windows: a program has it open)
+            made_undo(&parents);
             return r->code;
         }
     }
+#ifdef SC_TEST
+    extern void sc_test_before_install(void);
+    sc_test_before_install();  // (tests pause between the two renames; production has no pause)
+#endif
     if (rename(st->dir, save_dir) != 0) {
         int err = errno;
         if (had && rename(backup_dir, save_dir) != 0) {
@@ -1127,8 +1296,10 @@ ScCode sc_stage_install(ScStage *st, const char *save_dir, const char *backup_di
             fail(r, SC_MOVED, "%s", backup_dir);
         } else
             fail(r, SC_IO, "%s: %s", st->dir, strerror(err));
+        made_undo(&parents);
         return r->code;
     }
+    made_clear(&parents);
     made_clear(&st->made);  // (it is the save folder now: nothing to undo)
     snprintf(st->dir, sizeof st->dir, "%s", save_dir);
     if (had) {  // what the old folder held besides save_0 (the SD card folder, ...) goes on being there
@@ -1148,6 +1319,139 @@ ScCode sc_stage_install(ScStage *st, const char *save_dir, const char *backup_di
     }
     free(st);
     return SC_OK;
+}
+
+ScCode sc_stage_install(ScStage *st, const char *save_dir, const char *backup_dir, ScReport *r) {
+    r->code = SC_OK;
+    ScLock *lock;
+    if (save_in_use(save_dir, &lock, r)) return r->code;  // (the caller still owns the stage)
+    ScCode c = install_locked(st, save_dir, backup_dir, r);
+    sc_lock_drop(lock);
+    return c;
+}
+
+// Only the dated names this importer makes. A similarly named folder can belong to something else.
+static bool dated_name(const char *name, const char *prefix) {
+    size_t n = strlen(prefix);
+    if (strncmp(name, prefix, n)) return false;
+    const char *p = name + n;
+    if (strlen(p) < 15) return false;
+    for (int i = 0; i < 15; i++)
+        if (i == 8 ? p[i] != '-' : !isdigit((unsigned char)p[i])) return false;
+    return !p[15] || (p[15] == '-' && all_digits(p + 16));
+}
+
+static bool path_is_link(const char *path) {
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(path);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_REPARSE_POINT);
+#else
+    struct stat st;
+    return lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
+#endif
+}
+
+// Never descend through a link, including a junction inside an abandoned stage.
+static bool remove_stale(const char *dir, int depth, ScReport *r) {
+    if (depth > 32 || path_is_link(dir)) { fail(r, SC_IO, "%s: linked or too deeply nested", dir); return false; }
+    int n;
+    char **v = names_list(dir, &n);
+    if (!v) { fail(r, SC_IO, "%s: %s", dir, strerror(errno)); return false; }
+    bool ok = true;
+    for (int i = 0; i < n && ok; i++) {
+        char p[PATH_CAP];
+        if (!path_join(p, sizeof p, dir, v[i])) { fail(r, SC_IO, "%s: path too long", dir); ok = false; }
+        else if (path_is_link(p)) { fail(r, SC_IO, "%s: linked", p); ok = false; }
+        else if (is_dir(p)) ok = remove_stale(p, depth + 1, r);
+        else if (remove(p) != 0) { fail(r, SC_IO, "%s: %s", p, strerror(errno)); ok = false; }
+    }
+    names_free(v, n);
+    if (ok && rmdir(dir) != 0) { fail(r, SC_IO, "%s: %s", dir, strerror(errno)); ok = false; }
+    return ok;
+}
+
+// Compare the date first, then the collision suffix as a number (10 is newer than 9).
+static bool newer_dated(const char *a, const char *b) {
+    int c = strncmp(a, b, 15);
+    return c > 0 || (!c && strtoul(a + 15 + (a[15] == '-'), NULL, 10) > strtoul(b + 15 + (b[15] == '-'), NULL, 10));
+}
+
+static bool same_path(const char *a, const char *b) {
+    while (a[0] == '.' && a[1] == '/') a += 2;
+    while (b[0] == '.' && b[1] == '/') b += 2;
+#ifdef _WIN32
+    return !_stricmp(a, b);
+#else
+    return !strcmp(a, b);
+#endif
+}
+
+ScCode sc_cleanup_stages(const char *save_dir, const char *keep_dir, ScRecovery *recovery, ScReport *r) {
+    memset(recovery, 0, sizeof *recovery);
+    r->code = SC_OK;
+    char base[PATH_CAP], parent[PATH_CAP], prefix[PATH_CAP], keep[PATH_CAP];
+    strip_slash(base, sizeof base, save_dir);
+#ifdef _WIN32
+    for (char *p = base; *p; p++) if (*p == '\\') *p = '/';
+#endif
+    snprintf(parent, sizeof parent, "%s", base);
+    char *slash = strrchr(parent, '/');
+    const char *name = strrchr(base, '/');
+    name = name ? name + 1 : base;
+    if (snprintf(prefix, sizeof prefix, "%s-import-", name) >= (int)sizeof prefix) {
+        fail(r, SC_IO, "%s: path too long", base);
+        return r->code;
+    }
+    if (slash) { if (slash == parent || (slash == parent + 2 && parent[1] == ':')) slash[1] = 0; else *slash = 0; }
+    else strcpy(parent, ".");
+    strip_slash(keep, sizeof keep, keep_dir ? keep_dir : "");
+#ifdef _WIN32
+    for (char *p = keep; *p; p++) if (*p == '\\') *p = '/';
+#endif
+    int n;
+    char **v = names_list(parent, &n);
+    if (!v) {
+        if (errno != ENOENT) fail(r, SC_IO, "%s: %s", parent, strerror(errno));
+        return r->code;
+    }
+    bool missing = !exists(base);
+    const char *newest = NULL;
+    for (int i = 0; i < n; i++) {
+        char p[PATH_CAP];
+        if (!dated_name(v[i], prefix)) continue;
+        if (!path_join(p, sizeof p, parent, v[i])) { fail(r, SC_IO, "%s: path too long", parent); break; }
+        if (!is_dir(p) || path_is_link(p)) continue;
+        if (missing) {
+            const char *date = v[i] + strlen(prefix);
+            if (!newest || newer_dated(date, newest)) {
+                newest = date;
+                snprintf(recovery->imported, sizeof recovery->imported, "%s", p);
+            }
+        } else if (!same_path(p, keep)) {
+            if (!remove_stale(p, 0, r)) break;
+        }
+    }
+    if (recovery->imported[0]) {
+        char backups[PATH_CAP];
+        if (snprintf(backups, sizeof backups, "%s-backups", base) >= (int)sizeof backups) {
+            fail(r, SC_IO, "%s: path too long", base);
+        } else {
+            int nb;
+            char **b = names_list(backups, &nb);
+            const char *latest = NULL;
+            for (int i = 0; b && i < nb; i++) {
+                char p[PATH_CAP];
+                if (!dated_name(b[i], "save-") || !path_join(p, sizeof p, backups, b[i]) || !is_dir(p) || path_is_link(p)) continue;
+                if (!latest || newer_dated(b[i] + 5, latest)) {
+                    latest = b[i] + 5;
+                    snprintf(recovery->backup, sizeof recovery->backup, "%s", p);
+                }
+            }
+            if (b) names_free(b, nb);
+        }
+    }
+    names_free(v, n);
+    return r->code;
 }
 
 // ------------------------------------------------------------------ slots

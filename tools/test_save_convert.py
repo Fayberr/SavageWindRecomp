@@ -457,6 +457,12 @@ def synthetic(r):
 
     prof = make_profile(os.path.join(tmp, 'cemu', 'mlc01', 'usr', 'save', '00050000', '101c9500', 'user', '80000001'), seed=1)
     r.both('Wii U save, 3 slots, options, Hero\'s Path, album, compendium', prof, boot)
+    p = subprocess.run([r.exe, 'oom', prof, boot, os.path.join(tmp, 'oom_stage')], capture_output=True, text=True)
+    r.result('each reallocation can fail without a crash or a leftover stage',
+             [] if p.returncode == 0 and p.stdout.startswith('PASS ') else [p.stdout + p.stderr])
+    p = subprocess.run([r.exe, 'cancel', prof, boot, os.path.join(tmp, 'cancel_stage')], capture_output=True, text=True)
+    r.result('cancellation during search and between files discards the stage',
+             [] if p.returncode == 0 and p.stdout.startswith('PASS ') else [p.stdout + p.stderr])
     r.both('picked folder above the profile (with other folders beside it)', os.path.join(tmp, 'cemu'), boot)
     os.makedirs(os.path.join(tmp, 'cemu', 'mlc01', 'usr', 'save', '00050000', '101c9500', 'user', 'common'), exist_ok=True)
 
@@ -556,8 +562,29 @@ def synthetic(r):
     # the C safety tests: backup, install, rollback, discard
     scratch = os.path.join(tmp, 'selftest')
     p = subprocess.run([r.exe, 'selftest', scratch], capture_output=True, text=True)
-    r.result('backup, install, rollback and discard keep the player\'s saves', [] if 'SELFTEST PASS' in p.stdout else
+    r.result('backup, install, rollback, discard and stale cleanup keep the player\'s saves', [] if 'SELFTEST PASS' in p.stdout else
              (p.stdout + p.stderr).splitlines()[-8:])
+
+    # a second process as the running game: it holds the save folder's lock, the importer sees it, and the lock goes away
+    # with the process however that ends (a crashed game leaves nothing stale)
+    held = os.path.join(tmp, 'lock_held', 'save')
+    os.makedirs(os.path.dirname(held))
+
+    def lock_state():
+        return subprocess.run([r.exe, 'locked', held], capture_output=True, text=True).stdout.strip()
+    problems = []
+    if lock_state() != 'FREE':
+        problems.append('a lock nobody holds is not free: ' + lock_state())
+    game = subprocess.Popen([r.exe, 'holdlock', held], stdout=subprocess.PIPE, text=True)
+    if game.stdout.readline().strip() != 'READY':
+        problems.append('the holder did not get the lock')
+    elif lock_state() != 'BUSY':
+        problems.append('a lock held by another process is not seen as held: ' + lock_state())
+    game.kill()   # (not a clean exit: the game crashed)
+    game.wait()
+    if lock_state() != 'FREE':
+        problems.append('the lock outlived its process: ' + lock_state())
+    r.result('the game\'s lock on the save folder is seen by another process and ends with it', problems)
 
 
 def build_ui(tmp):
@@ -581,7 +608,7 @@ def build_ui(tmp):
     jobs += [(cxx, ['-x', 'c++'] + cxxflags, os.path.join(rt, 'ui', 'option_rows.mm')),
              (cxx, cxxflags, os.path.join(HERE, 'test_saves_tab.cpp'))]
     cflags = ['-std=gnu11', '-O1', '-D_FILE_OFFSET_BITS=64', '-I' + rt, '-I' + st]
-    jobs += [(cc, cflags, os.path.join(rt, 'imageload.c')), (cc, cflags, os.path.join(rt, 'services', 'save_convert.c')),
+    jobs += [(cc, cflags, os.path.join(rt, 'imageload.c')), (cc, cflags + ['-DSC_TEST'], os.path.join(rt, 'services', 'save_convert.c')),
              (cc, cflags, os.path.join(rt, 'services', 'archive.c'))]
     procs, objs = [], []
     for i, (c, flags, src) in enumerate(jobs):
@@ -716,6 +743,48 @@ def ui_cases(r):
         if leftovers(data) or os.path.exists(os.path.join(data, 'save-backups')):
             problems.append('left behind: %s' % os.listdir(data))
         r.result('Saves tab: %s is refused and nothing changes' % name, problems)
+
+    # another Savage Wind is in game (its lock is held): import and backup refuse, with the message, and change nothing
+    for scenario, kind in (('locked-import', '2'), ('locked-backup', '4')):
+        data, save, before = fresh(scenario.replace('-', '_'))
+        rc, o, log = ui_run(exe, scenario, save, game, cemu, cwd=data)
+        problems = []
+        if rc != 0 or o.get('KIND') != kind or o.get('CODE') != '11':
+            problems.append('wanted a refusal with code 11 (in use): %s' % {k: o.get(k) for k in ('KIND', 'CODE', 'DETAIL')} or log[-300:])
+        if tree(save) != before:
+            problems.append('the save folder changed')
+        if leftovers(data) or os.path.exists(os.path.join(data, 'save-backups')):
+            problems.append('left behind: %s' % [x for x in os.listdir(data) if x != 'save'])
+        r.result('Saves tab: %s while a game is running is refused and nothing changes' % scenario.split('-')[1], problems)
+
+    for scenario in ('quit-convert', 'quit-confirm', 'quit-install'):
+        data, save, before = fresh(scenario)
+        rc, o, log = ui_run(exe, scenario, save, game, cemu, cwd=data)
+        problems = []
+        if rc != 0:
+            problems.append(log[-600:])
+        if leftovers(data):
+            problems.append('staged folder left behind: %s' % leftovers(data))
+        if scenario == 'quit-install':
+            backups = os.path.join(data, 'save-backups')
+            names = os.listdir(backups) if os.path.isdir(backups) else []
+            if len(names) != 1 or tree(os.path.join(backups, names[0])) != before:
+                problems.append('the previous saves were not backed up intact')
+            problems += compare(py_out, {k[len('save_0/'):]: v for k, v in tree(save).items() if k.startswith('save_0/')})
+        elif tree(save) != before:
+            problems.append('the original save folder changed')
+        r.result('Saves tab: %s joins the worker and leaves intact saves' % scenario, problems)
+
+    data, save, before = fresh('recovery', saves=False)
+    stage = os.path.join(data, 'save-import-20261030-123456')
+    backup = os.path.join(data, 'save-backups', 'save-20261030-123456')
+    make_profile(os.path.join(stage, 'save_0'), seed=21)
+    make_profile(os.path.join(backup, 'save_0'), seed=22)
+    old_stage, old_backup = tree(stage), tree(backup)
+    rc, o, log = ui_run(exe, 'recovery', save, game, cwd=data)
+    r.result('Saves tab: interrupted installation keeps both copies and names the recovery folders',
+             [] if (rc == 0 and o.get('RECOVERY_IMPORT') == stage and o.get('RECOVERY_BACKUP') == backup
+                    and not os.path.exists(save) and tree(stage) == old_stage and tree(backup) == old_backup) else [log[-600:]])
 
     # the Back up saves button
     data, save, before = fresh('backup')
