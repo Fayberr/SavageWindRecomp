@@ -16,6 +16,7 @@
 #include "../../settings.h"
 #include "../../ui/menu.h"
 #include "../../window_size.h"
+#include "mvec.h"
 #include "vk.h"
 #include "record.h"
 #include "../output_scale.h"
@@ -1692,6 +1693,16 @@ static bool fg_wanted(void) {
     return !framepace_title_ui() && !framepace_menu_ui() && !framepace_paused() && !menu_is_open();
 }
 
+// The world camera's view matrix (3x4, row-major, as the shaders read it) of the last finished frame, for the control
+// endpoint's `camera` (runtime/control_game.c). false: none (motion recording is off, or no scene was drawn).
+bool control_camera_view(float view[12]) {
+    if (!mvec_enabled()) return false;  // switching TAA off leaves the old camera cached; it no longer follows the game
+    const MvecCamera *c = mvec_camera(true);
+    if (!c) return false;
+    memcpy(view, c->view, 12 * sizeof(float));
+    return true;
+}
+
 static void present_locked(NvnTexture *t) {
     g_last_presented = t;
     TexBackend *b = vk_tex(t, true);
@@ -1836,6 +1847,8 @@ presented:
     reboot_test_frame(total_frames);
     extern void test_warp_frame(uint64_t frame);  // runtime/services/test_warp.c (SAVAGEWIND_TEST_TIME)
     test_warp_frame(total_frames);
+    extern void control_frame(uint64_t frame);  // runtime/control.c (SAVAGEWIND_CONTROL)
+    control_frame(total_frames);
     static long shot_every = -1;
     if (shot_every < 0) { const char *e = getenv("SAVAGEWIND_SCREENSHOT_EVERY"); shot_every = e ? atol(e) : 0; }
     extern bool g_debug_frame;
