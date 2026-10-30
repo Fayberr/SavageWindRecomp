@@ -114,6 +114,46 @@ populated bypass, and 4.03 s for the empty case. The populated screenshot and
 bypass screenshot were inspected. Timing instrumentation, page overrides and
 the bypass were removed from the tracked runtime files after the experiment.
 
+## Windows scan-speed follow-up
+
+A standalone prototype reuses the size and reparse-point attributes provided by
+Windows directory enumeration, avoiding a separate link check and `stat()` for
+every child. The existing `GAME_FILES` list is reused unchanged. Only the known
+top-level paths need `GetFileAttributesExA()`; directory children use
+`FindFirstFileExA(..., FindExInfoBasic, ...)` and `FindNextFileA()` metadata.
+[Windows directory-entry fields](https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-win32_find_dataa).
+
+Two passes per path alternated the actual upstream size function, the native
+prototype with default flags, and the same prototype with
+`FIND_FIRST_EX_LARGE_FETCH`. No threading or application-level size cache was
+used. All populated totals matched exactly: 15,157,992,803 bytes, with the native
+scanner visiting 41,067 files and 874 directories.
+
+| Path | Pass | Upstream | Native enumeration | Native, large fetch |
+| --- | ---: | ---: | ---: | ---: |
+| Direct X: folder | 1 | 11,920 ms | 169 ms | 164 ms |
+| Direct X: folder | 2 | 11,727 ms | 174 ms | 185 ms |
+| C: scratch-root junction | 1 | 16,468 ms | 320 ms | 259 ms |
+| C: scratch-root junction | 2 | 16,750 ms | 253 ms | 257 ms |
+
+Default native enumeration was about 67 to 70 times faster on the direct path.
+Large fetch did not consistently improve these runs, so the basic change does
+not require it. This measures a stable, already-accessed tree on this machine;
+it is not a cold-boot, network-drive or cross-machine benchmark.
+
+A separate fixture returned the expected 40 bytes in both implementations:
+two ordinary files, a dot-prefixed filename, nested directories, an unrelated
+top-level folder excluded by `GAME_FILES`, and a junction to an outside folder
+excluded by the reparse-point check. The empty fixture returned zero. Synthetic
+metadata also checked a file size above 4 GiB and skipping a reparse entry.
+This does not exhaustively test permissions, concurrent mutations, Unicode paths
+or every reparse-point type.
+
+The optimized scanner remains an ignored benchmark prototype under
+`build/probe/fastscan/`; the production runtime is unchanged. The speedup itself
+is a small Windows-specific scanner change. Background scanning and a shared
+cache are still useful to keep the window responsive on slower filesystems.
+
 ## Recommended fix and verification
 
 Run size enumeration on a worker and expose a shared cached result to both
@@ -127,9 +167,9 @@ Sharing the existing synchronous caches alone would remove the duplicate scan
 but leave the first freeze. Deferring Settings' scan until its delete dialog is
 open would also leave Game Files and the dialog vulnerable.
 
-A Windows directory-enumeration implementation that reuses entry metadata may
-reduce the scanning cost, but that optimization was not implemented or measured
-here. Asynchronous operation should not depend on a particular disk being fast.
+Windows directory-entry metadata reuse substantially reduced the scan cost in
+the follow-up above. Asynchronous operation should not depend on a particular
+disk being fast.
 
 For a fix, verify both page orders, first and repeat opens, empty and populated
 roots, and that event processing continues while a deliberately slow scan is
