@@ -28,8 +28,8 @@ off for anything that writes memory or files, moves things or ends the game.
 
 ## The in-game console
 
-The same commands can be typed in the game: press `` ` `` (the key left of 1, which is `^` on a German keyboard) or F12.
-The game gets no input while the console is open; `` ` ``, F12 or Esc closes it. Up and Down walk through what you typed,
+The same commands can be typed in the game: press F12 or the key below Esc, left of 1.
+The game gets no input while the console is open. The same key, F12 or Esc closes it. Up and Down walk through what you typed,
 Tab completes a command, Ctrl+V pastes from the system clipboard, `clear` empties the screen. The console is in English,
 like the command names and replies it shows.
 
