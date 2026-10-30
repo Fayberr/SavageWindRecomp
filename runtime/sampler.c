@@ -33,6 +33,7 @@ static void emit(uint64_t t, uint64_t tid, uint32_t handle, const uint64_t *pc, 
 
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 
 static uint64_t os_tid(HANDLE h) { return GetThreadId(h); }
 
