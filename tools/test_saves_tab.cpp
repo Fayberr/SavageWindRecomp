@@ -1,7 +1,7 @@
 // Runs the start screen's Saves tab (runtime/ui/saves_tab.mm) without a window or a renderer: Dear ImGui builds its
 // frames and draw lists as usual (its asserts catch an unbalanced ID stack, a popup that isn't closed, ...), the SDL
 // folder dialog and the GPU textures are replaced by stand-ins, and a scenario clicks through the tab with synthetic
-// keys. tools/test_save_convert.py --ui builds and drives it and checks the files afterwards.
+// keys and a click. tools/test_save_convert.py builds and drives it (skipped with --no-ui) and checks the files afterwards.
 //
 //   test_saves_tab jpeg <path>                 a small real JPEG (the synthetic saves hold random bytes as pictures)
 //   test_saves_tab <scenario> --save <save folder> --game <game files folder> [--src <folder>]

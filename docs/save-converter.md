@@ -103,6 +103,13 @@ file has to match byte for byte, along with the per-file flag counts. It also co
 save, damaged saves, a missing or broken `Bootup.pack`), folders with non-ASCII names, and the safety of the backup,
 the swap and its rollback. No game files are needed.
 
+The script also runs the Saves tab itself without a window (`tools/test_saves_tab.cpp`: Dear ImGui builds the frames in
+memory, the importer runs on its worker thread, and the question is answered with a click) on copies of a synthetic save
+folder, and checks the files on disk afterwards: import over an existing save, a first import, Cancel, the refusals and
+Back up saves. That part needs a C++ compiler and SDL3's headers; set `SDL3_INCLUDE=<folder with SDL3/SDL.h>` if they
+are not on the default path (without them it says SKIP), and `--no-ui` leaves it out. It draws no pixels and uses no real
+window, mouse or controller, so it does not replace looking at the tab.
+
 With your own files, the same script compares both implementations on your real save:
 
 ```
