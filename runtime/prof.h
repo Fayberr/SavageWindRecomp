@@ -10,6 +10,8 @@
 //   SW_ACC("a/b");        like a zone, but the time and the calls are added up per thread and frame and written once a
 //                         frame: for work done thousands of times a frame (a draw's steps), where an event each would
 //                         fill the buffer. "/" in the name nests it under "a" in the report.
+//   SW_TALLY("name");     only counts the calls (per thread and frame, like SW_ACC but with no clock reads): for events
+//                         thousands of times a frame, like cache misses
 //   SW_COUNT("name", n);  a number for this moment (draws, bytes, queue depth)
 //   prof_frame(n);        the presenting thread, once per frame: frame n starts
 //   prof_thread_name(s);  names the calling thread in the report
@@ -113,6 +115,7 @@ static inline void prof_acc_exit(ProfZone *z) {
 #define SW_ZONE(name) ((void)0)
 #define SW_ACC(name) ((void)0)
 #define SW_COUNT(name, n) ((void)0)
+#define SW_TALLY(name) ((void)0)
 #else
 #define SW_ZONE(name) \
     static ProfSite PROF_CAT(prof_site_, __LINE__) = {name, 0}; \
@@ -122,6 +125,11 @@ static inline void prof_acc_exit(ProfZone *z) {
     static ProfSite PROF_CAT(prof_site_, __LINE__) = {name, 0}; \
     __attribute__((cleanup(prof_acc_exit), unused)) ProfZone PROF_CAT(prof_zone_, __LINE__) = { \
         &PROF_CAT(prof_site_, __LINE__), prof_enabled() ? prof_ticks() : 0}
+#define SW_TALLY(name) \
+    do { \
+        static ProfSite prof_ts_ = {name, 0}; \
+        if (prof_enabled()) prof_acc_add(&prof_ts_, 0); \
+    } while (0)
 #define SW_COUNT(name, n) \
     do { \
         static ProfSite prof_cs_ = {name, 0}; \

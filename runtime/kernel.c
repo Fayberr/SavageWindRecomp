@@ -566,8 +566,7 @@ static uint32_t block_current(int64_t timeout_ns) {
     KThread *t = t_cur;
     struct timespec ts;
     WaitKind kind = t->wait_kind;
-    extern bool nvn_timeline(void);
-    uint64_t tl_t0 = nvn_timeline() ? plat_now_ns() : 0, tl_addr = t->wait_addr;
+    SW_ZONE("kernel wait");  // (the profiler: a guest thread blocked on a mutex, condvar, address or handle)
     if (timeout_ns >= 0) deadline(&ts, timeout_ns);
     waitlist_add(t);
     while (t->wait_kind != WAIT_NONE) {
@@ -598,9 +597,6 @@ static uint32_t block_current(int64_t timeout_ns) {
         }
     }
     waitlist_remove(t);
-    if (tl_t0 && plat_now_ns() - tl_t0 > 200000)
-        LOG("[tl] %.3f %x block %.3f ms (kind %d addr %llx lr %llx)\n", plat_now_ns() / 1e6, t->handle,
-            (plat_now_ns() - tl_t0) / 1e6, kind, (unsigned long long)tl_addr, (unsigned long long)t->cpu.x[30]);
     return t->wait_result;
 }
 
@@ -787,12 +783,11 @@ static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, in
         t->in_sync_wait = true;
         t->snext = g_syncwaiters;
         g_syncwaiters = t;
-        extern bool nvn_timeline(void);
-        uint64_t tl_t0 = nvn_timeline() ? plat_now_ns() : 0;
-        bool ok = kwait(timeout < 0 ? -1 : timeout, &ts);
-        if (tl_t0 && plat_now_ns() - tl_t0 > 200000)
-            LOG("[tl] %.3f %x waitsync %.3f ms (handle %x lr %llx)\n", plat_now_ns() / 1e6, t->handle,
-                (plat_now_ns() - tl_t0) / 1e6, hs[0], (unsigned long long)t->cpu.x[30]);
+        bool ok;
+        {
+            SW_ZONE("kernel wait (handles)");
+            ok = kwait(timeout < 0 ? -1 : timeout, &ts);
+        }
         for (KThread **p = &g_syncwaiters; *p; p = &(*p)->snext)
             if (*p == t) { *p = t->snext; break; }
         t->in_sync_wait = false;

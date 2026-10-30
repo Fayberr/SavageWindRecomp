@@ -43,24 +43,7 @@ static int pass_nblock;
 static bool draw_feedback;           // the current draw samples a target it writes (its pipeline allows the loop)
 static uint64_t stat_upload_bytes;
 static uint64_t stat_sets, stat_sets_reused;  // descriptor sets asked for / shared with an identical one
-// SAVAGEWIND_VK_PROF=1: render-thread time per category in the fps log (exec = whole command lists, draw = draw(),
-// sets = descriptor sets incl. cbuf copies, vtx = index scan + vertex copies, submit = vkQueueSubmit2)
-static int prof = -1;
-static uint64_t prof_exec, prof_draw, prof_sets, prof_vtx, prof_submit, prof_pre, prof_key, prof_dyn, prof_tex, prof_up, prof_gpu;
-static VkQueryPool prof_qp;
-static uint64_t cum_exec, cum_wait, cum_draws, cum_submits;  // (profiling) never reset: hitch log
-static uint64_t cum_xwait;  // (profiling) the part of cum_wait spent inside backend_execute
-static __thread bool in_execute;  // (this thread is in backend_execute)
-static uint32_t prof_end_line[4096];  // passes ended, by the exec.c line that ended them (0: submit / present)
-uint64_t prof_views_created;  // textures.c vk_image_view cache misses
-uint64_t prof_up_ns = ~0ull;  // textures.c upload checks (~0: profiling off)
-#define PROF_T0() uint64_t prof_t0_ = prof ? SDL_GetTicksNS() : 0
-#define PROF_ADD(v) do { if (prof) v += SDL_GetTicksNS() - prof_t0_; } while (0)
-// The per-draw timers (draw, pre, key, dyn, sets, tex, vtx) cost ~0.3 us a draw themselves: SAVAGEWIND_VK_PROF=2
-// keeps only the whole-list ones (exec, submit, gpu), for timing the draw path itself.
-static int profd;
-#define PROFD_T0() uint64_t prof_t0_ = profd ? SDL_GetTicksNS() : 0
-#define PROFD_ADD(v) do { if (profd) v += SDL_GetTicksNS() - prof_t0_; } while (0)
+static uint64_t cum_draws;  // draws so far (vk_pso_wait_needed)
 // The profiler's draw-path timers (runtime/prof.h): stamps taken only while a capture runs, the time between two of them
 // added up per frame under a name ("/" nests it under the one before it in the report)
 #define PZ_NOW() (prof_enabled() ? prof_ticks() : 0)
@@ -103,7 +86,6 @@ static void dyn_check(void) {  // (after vk_cmd) a new command buffer or foreign
 static _Atomic int stat_compiles;  // programs and pipelines built where first needed
 static _Atomic int stat_warm;      // ... found built: by the pre-warm (pso_init) or for other programs with the same stages
 static void pso_init(void);
-static _Atomic uint64_t prof_c_tr, prof_c_prog, prof_c_pipe, prof_c_comp, prof_c_ntr, prof_c_nprog, prof_c_npipe;  // (VK_PROF) compile ns / counts
 static uint64_t op_counts[CMD_COUNT];
 bool g_debug_frame;
 static char stats_text[2048];
@@ -114,7 +96,7 @@ void vk_collect_dead(void);
 #define SUBS 32  // (several a frame: long command lists go to the GPU in pieces, see begin_pass)
 typedef struct {
     VkCommandBuffer main, upload;
-    bool main_begun, upload_begun, ts;  // ts: GPU timestamps written (profiling)
+    bool main_begun, upload_begun;
     uint64_t seq;
     VkDescriptorPool pools[64];  // (BOTW 1.8.2 records thousands of draws into one submission)
     int npools, cur_pool;
@@ -164,10 +146,12 @@ void vk_wait_seq(uint64_t seq) {
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
                               .pValues = &seq};
     uint64_t t0 = SDL_GetTicksNS();
-    VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
+    VkResult r;
+    {
+        SW_ACC("gpu_wait");
+        r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
+    }
     stat_wait_ns += SDL_GetTicksNS() - t0;
-    cum_wait += SDL_GetTicksNS() - t0;
-    if (in_execute) cum_xwait += SDL_GetTicksNS() - t0;
     if (r == VK_TIMEOUT) LOG("[vk] GPU did not finish submission %llu within 10 s (device lost?)\n", (unsigned long long)seq);
     else if (r != VK_SUCCESS) {
         extern void vk_devlost_dump(void);
@@ -187,12 +171,6 @@ static Sub *sub(void) {
     if (s->seq != submit_seq + 1) {  // slot reused: its previous submission must be done
         vk_wait_seq(s->seq);
         gp_collect(false);  // (the profiler: that submission's GPU time, and any older)
-        if (s->ts) {  // (profiling) GPU time of that submission
-            uint64_t t[2];
-            if (vkGetQueryPoolResults(g_vk.dev, prof_qp, (uint32_t)cur_sub * 2, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
-                prof_gpu += (uint64_t)((double)(t[1] - t[0]) * g_vk.props.limits.timestampPeriod);
-            s->ts = false;
-        }
         for (int i = 0; i < s->npools; i++) vkResetDescriptorPool(g_vk.dev, s->pools[i], 0);
         s->cur_pool = 0;
         s->seq = submit_seq + 1;
@@ -215,11 +193,6 @@ VkCommandBuffer vk_cmd(void) {
         begin_cb(&s->main, &s->main_begun);
         dyn_epoch++;
         gp_begin(s->main);
-        if (prof && prof_qp) {
-            rec_CmdResetQueryPool(s->main, prof_qp, (uint32_t)cur_sub * 2, 2);
-            rec_CmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_NONE, prof_qp, (uint32_t)cur_sub * 2);
-            s->ts = true;
-        }
     }
     return s->main;
 }
@@ -465,7 +438,6 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
         cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->upload};
     }
     vk_cmd();  // (an empty main buffer still carries the semaphores)
-    if (s->ts) rec_CmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
     gp_end(s->main, submit_seq + 1);
     rec_EndCommandBuffer(s->main);
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
@@ -479,18 +451,15 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
                         .signalSemaphoreInfoCount = signal ? 2 : 1, .pSignalSemaphoreInfos = sig,
                         .waitSemaphoreInfoCount = wait ? 1 : 0, .pWaitSemaphoreInfos = &wt};
     {
-        PROF_T0();
         SW_ACC("submit");
         dl_note("submit %llu", (unsigned long long)submit_seq + 1);
         rec_QueueSubmit2(&si, submit_seq + 1);  // (the recorder: in order with the commands)
-        PROF_ADD(prof_submit);
     }
     pthread_mutex_lock(&seq_lock);
     submit_seq++;
     pthread_mutex_unlock(&seq_lock);
     cur_sub = (cur_sub + 1) % SUBS;
     stat_flushes++;
-    cum_submits++;
     chunk_draws = 0;
     chunk_hold = false;
     ring_retire();
@@ -947,35 +916,6 @@ uint32_t nvn_window_origin(void);
 uint32_t nvn_depth_mode(void);
 bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
 
-// (SAVAGEWIND_VK_PROF) called once per presented frame: frames over 50 ms are logged with where their time went.
-// present_ns: time in backend_present's acquire/blit/present.
-extern uint64_t g_pace_sleep_ns;  // (objects.c present_pace)
-void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
-    if (!prof) return;
-    static uint64_t last_t, l_exec, l_wait, l_xwait, l_draws, l_subs, l_comp, hitch_ns;
-    if (!hitch_ns) hitch_ns = getenv("SAVAGEWIND_HITCH_MS") ? (uint64_t)atoi(getenv("SAVAGEWIND_HITCH_MS")) * 1000000ull : 50000000ull;
-    uint64_t now = SDL_GetTicksNS();
-    uint64_t comp = prof_c_tr + prof_c_prog + prof_c_pipe + prof_c_comp;
-    if (comp < l_comp) l_comp = 0;  // (the fps line took the counters)
-    if (last_t && now - last_t > hitch_ns) {
-        uint64_t dt = now - last_t, ex = cum_exec - l_exec, wt = cum_wait - l_wait;
-        extern uint64_t g_present_split[6];
-        LOG("[hitch] frame %llu: %.0f ms = backend exec %.1f (of which GPU waits %.1f, compiles %.1f) + present %.1f (acquire %.1f "
-            "end %.1f draw %.1f submit %.1f present %.1f slot %.1f) + other %.1f (pace %.1f); %llu draws, %llu submits, compiles %d pending; "
-            "exec waits %.1f\n",
-            (unsigned long long)frame, dt / 1e6, ex / 1e6, wt / 1e6, (comp - l_comp) / 1e6, present_ns / 1e6,
-            g_present_split[0] / 1e6, g_present_split[1] / 1e6, g_present_split[2] / 1e6, g_present_split[3] / 1e6,
-            g_present_split[4] / 1e6, g_present_split[5] / 1e6,
-            ((double)dt - ex - present_ns) / 1e6, g_pace_sleep_ns / 1e6, (unsigned long long)(cum_draws - l_draws),
-            (unsigned long long)(cum_submits - l_subs),
-            atomic_load(&stat_compiles), (cum_xwait - l_xwait) / 1e6);
-    }
-    { extern uint64_t g_present_split[6]; memset(g_present_split, 0, sizeof g_present_split); }
-    g_pace_sleep_ns = 0;
-    l_comp = comp;
-    last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_xwait = cum_xwait; l_draws = cum_draws; l_subs = cum_submits;
-}
-
 const char *renderer_stats(void) {
     static int dumps, always = -1;
     if (always < 0) always = getenv("SAVAGEWIND_LOG_CMD_COUNTS") != NULL;  // (debugging) every interval, not just the first 3
@@ -1008,44 +948,6 @@ const char *renderer_stats(void) {
         stat_feedback_loops = stat_feedback_barriers = 0;
     }
     stat_feedback_copies = stat_feedback_live = stat_upload_bytes = 0;
-    if (prof) {
-        prof_up = prof_up_ns;
-        prof_up_ns = 0;
-        size_t n = strlen(stats_text);
-        snprintf(stats_text + n, sizeof stats_text - n, " | gpu %.0f cpu exec %.0f draw %.0f (pre %.0f key %.0f dyn %.0f sets %.0f tex %.0f (upload %.0f) vtx %.0f) submit %.0f ms",
-                 prof_gpu / 1e6, prof_exec / 1e6, prof_draw / 1e6, prof_pre / 1e6, prof_key / 1e6, prof_dyn / 1e6, prof_sets / 1e6,
-                 prof_tex / 1e6, prof_up / 1e6, prof_vtx / 1e6, prof_submit / 1e6);
-        extern uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn;
-        n = strlen(stats_text);
-        snprintf(stats_text + n, sizeof stats_text - n, " | tex checks %llu samples %llu full %llu (%.1f MB, dynamic %llu)",
-                 (unsigned long long)prof_tex_checks, (unsigned long long)prof_tex_samples, (unsigned long long)prof_tex_full,
-                 prof_tex_full_bytes / 1048576.0, (unsigned long long)prof_tex_dyn);
-        n = strlen(stats_text);
-        snprintf(stats_text + n, sizeof stats_text - n, " | pass ends:");
-        for (int l = 0; l < 4096; l++)
-            if (prof_end_line[l] > 20) { n = strlen(stats_text); snprintf(stats_text + n, sizeof stats_text - n, " %d:%u", l, prof_end_line[l]); }
-        memset(prof_end_line, 0, sizeof prof_end_line);
-        RecStats rs;  // (record.c: the recorder thread's work and every wait on it, this interval)
-        rec_stats_take(&rs);
-        n = strlen(stats_text);
-        snprintf(stats_text + n, sizeof stats_text - n,
-                 " | recorder %s: %llu packets (%.1f MB) busy %.0f ms (%llu wakes) submit %.0f ms, waits: drain %llux %.1f ms,"
-                 " seq %llux %.1f ms, full %llux %.1f ms",
-                 rec_on() ? "on" : "off", (unsigned long long)rs.packets, rs.bytes / 1048576.0, rs.busy_ns / 1e6,
-                 (unsigned long long)rs.wakeups, rs.submit_ns / 1e6, (unsigned long long)rs.drains, rs.drain_ns / 1e6,
-                 (unsigned long long)rs.seq_waits, rs.seq_wait_ns / 1e6, (unsigned long long)rs.full_waits, rs.full_ns / 1e6);
-        n = strlen(stats_text);
-        snprintf(stats_text + n, sizeof stats_text - n, " | views created %llu", (unsigned long long)prof_views_created);
-        n = strlen(stats_text);
-        snprintf(stats_text + n, sizeof stats_text - n, " | compile ms: translate %.0f (%llu) program %.0f (%llu) pipeline %.0f (%llu) compute %.0f",
-                 atomic_exchange(&prof_c_tr, 0) / 1e6, (unsigned long long)atomic_exchange(&prof_c_ntr, 0),
-                 atomic_exchange(&prof_c_prog, 0) / 1e6, (unsigned long long)atomic_exchange(&prof_c_nprog, 0),
-                 atomic_exchange(&prof_c_pipe, 0) / 1e6, (unsigned long long)atomic_exchange(&prof_c_npipe, 0),
-                 atomic_exchange(&prof_c_comp, 0) / 1e6);
-        prof_views_created = 0;
-        prof_tex_checks = prof_tex_samples = prof_tex_full = prof_tex_full_bytes = prof_tex_dyn = 0;
-        prof_exec = prof_draw = prof_sets = prof_vtx = prof_submit = prof_pre = prof_key = prof_dyn = prof_tex = prof_up = prof_gpu = 0;
-    }
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_flushes = stat_wait_ns = 0;
     return stats_text;
 }
@@ -1067,14 +969,7 @@ static void st_defaults(void) {
 }
 
 void vk_exec_init(void) {
-    prof = getenv("SAVAGEWIND_VK_PROF") != NULL;
-    profd = prof && atoi(getenv("SAVAGEWIND_VK_PROF")) != 2;
     no_dyn_cache = getenv("SAVAGEWIND_VK_NO_DYN_CACHE") != NULL;
-    if (prof) {
-        prof_up_ns = 0;
-        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = SUBS * 2};
-        if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &prof_qp) != VK_SUCCESS) prof_qp = VK_NULL_HANDLE;
-    }
     st_defaults();
     pso_init();
     // The command buffers of every slot, before the recorder thread exists: from then on the pool and the buffers are
@@ -1635,7 +1530,15 @@ void vk_end_pass(void) { vk_end_pass_at(0); }
 #define vk_end_pass() vk_end_pass_at(__LINE__)
 static void vk_end_pass_at(int line) {
     if (!in_pass) return;
-    if (prof && line < 4096) prof_end_line[line]++;
+    if (prof_enabled() && line < 4096) {  // (the profiler) passes ended, by the line that ended them
+        static ProfSite end_site[4096];
+        if (!end_site[line].id) {
+            char nm[40];
+            snprintf(nm, sizeof nm, "pass ended at exec.c:%d", line);
+            end_site[line].id = prof_site_dyn(nm);
+        }
+        prof_acc_add(&end_site[line], 0);
+    }
     if (!pass_void) rec_CmdEndRendering(vk_cmd());
     in_pass = false;
     pass_void = false;
@@ -2482,7 +2385,7 @@ static const ProgBuild *prog_build(const ShaderInfo *vi, const ShaderInfo *fi, b
 
 static void compile_program(void *arg) {
     Prog *p = arg;
-    uint64_t pt0 = SDL_GetTicksNS();
+    SW_ZONE("compile program");
     bool made;
     const ProgBuild *b = prog_build(p->vi, p->fi, &made);
     if (!b) { atomic_store(&p->state, 2); return; }
@@ -2497,7 +2400,6 @@ static void compile_program(void *arg) {
     p->stages.f = b->f;
     if (made) {
         atomic_fetch_add(&stat_compiles, 1);
-        atomic_fetch_add(&prof_c_prog, SDL_GetTicksNS() - pt0); atomic_fetch_add(&prof_c_nprog, 1);
     } else {
         atomic_fetch_add(&stat_warm, 1);
     }
@@ -2545,7 +2447,7 @@ static bool fs_sel_match(const FsSel *f, uint64_t code, uint64_t hash) {
 
 static void translate_program(void *arg) {
     Prog *p = arg;
-    uint64_t pt0 = SDL_GetTicksNS();
+    SW_ZONE("translate shaders");
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
     pthread_mutex_lock(&translate_lock);
@@ -2583,7 +2485,6 @@ static void translate_program(void *arg) {
             LOG("[shader] inputs read outside the SPH's: vs %#x of %#x, fs %#x of %#x (code %llx %llx)\n", p->vi->attr_mask, vin,
                 p->fi ? p->fi->attr_mask : 0, fin, (unsigned long long)p->code[0], (unsigned long long)p->code[1]);
     }
-    atomic_fetch_add(&prof_c_tr, SDL_GetTicksNS() - pt0); atomic_fetch_add(&prof_c_ntr, 1);
     if (!p->vi->msl) {
         LOG("[shader] VS translate failed: %s (code %llx)\n", p->vi->error, (unsigned long long)p->code[0]);
         dump_failed_shader(p->code[0], p->cmax[0], "vs");
@@ -3344,7 +3245,7 @@ static void pso_record(int kind, uint64_t id0, uint64_t id1, const void *state, 
 
 static void build_pipeline(void *arg) {
     Pipe *pp = arg;
-    uint64_t pt0 = SDL_GetTicksNS();
+    SW_ZONE("compile pipeline");
     PipeKey *k = &pp->k;
     WarmPipe *w;
     if (warm_get(k->prog->vi, k->prog->fi, &k->s, &w)) {
@@ -3353,7 +3254,6 @@ static void build_pipeline(void *arg) {
         warm_done(w, p, r);
         if (r == VK_SUCCESS) pso_record(1, vk_translate_id(k->prog->vi), vk_translate_id(k->prog->fi), &k->s, sizeof k->s);
         atomic_fetch_add(&stat_compiles, 1);
-        atomic_fetch_add(&prof_c_pipe, SDL_GetTicksNS() - pt0); atomic_fetch_add(&prof_c_npipe, 1);
     } else {
         atomic_fetch_add(&stat_warm, 1);
     }
@@ -5152,13 +5052,12 @@ static void cs_make(CsBuild *c) {
 
 static void build_compute(void *arg) {
     CsProg *cp = arg;
-    uint64_t pt0 = SDL_GetTicksNS();
+    SW_ZONE("compile compute");
     CsBuild *c;
     if (cs_get(cp->si, cp->local, &c)) {
         cs_make(c);
         if (atomic_load(&c->state) == 2) pso_record(2, vk_translate_id(cp->si), 0, cp->local, sizeof cp->local);
         atomic_fetch_add(&stat_compiles, 1);
-        atomic_fetch_add(&prof_c_comp, SDL_GetTicksNS() - pt0);
     } else {
         atomic_fetch_add(&stat_warm, 1);
     }
@@ -5783,12 +5682,9 @@ static void draw(CmdRec *r, bool indexed) {
     // occlusion queries. Its only output in NVN is transform feedback, which isn't implemented (cmdbuf.c), so the draw
     // has nothing left to do (a vertex shader writing storage buffers or images would be the one difference).
     if (st.rasterizer_discard) { stat_discarded++; return; }
-    PROFD_T0();
     SW_ACC("exec/draw");
     draw_(r, indexed);
-    PROFD_ADD(prof_draw);
 }
-static uint64_t prof_tp_;
 // Asynchronous shaders skip a draw whose program or pipeline is still being built: fine for targets drawn every frame
 // (the next frame has it), not for one drawn once and then only sampled. BOTW's pause menu blurs a capture of the
 // scene once when it opens (the background stayed black) and the save dialog's picture is made once. So a draw into
@@ -5817,7 +5713,6 @@ static void wait_built(_Atomic int *state) {  // (0 building: until built or fai
 }
 
 static void draw_(CmdRec *r, bool indexed) {
-    if (profd) prof_tp_ = SDL_GetTicksNS();
     uint64_t pz0 = PZ_NOW();
     fg_before_draw();
     if (!st.program) { stat_skipped++; return; }
@@ -6085,8 +5980,6 @@ static void draw_(CmdRec *r, bool indexed) {
     bool native = topology(mode, &topo, &cls);
     if (!native && mode != 6 && mode != 7 && mode != 9) { stat_skipped++; return; }
 
-    uint64_t prof_tk_ = profd ? SDL_GetTicksNS() : 0;
-    if (profd) prof_pre += prof_tk_ - prof_tp_;
     uint64_t pz1 = PZ_NOW();
     PZ_SPAN("exec/draw/pre", pz0, pz1);
     // ---- pipeline
@@ -6181,8 +6074,6 @@ have_pipe:
     if (no_dyn_cache) vk_dyn_forget();
     dyn_check();
     if (!DYN_SAME(pipe, pp->pipe)) rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe);
-    uint64_t prof_td_ = profd ? SDL_GetTicksNS() : 0;
-    if (profd) prof_key += prof_td_ - prof_tk_;
     uint64_t pz2 = PZ_NOW();
     PZ_SPAN("exec/draw/key", pz1, pz2);
 
@@ -6274,19 +6165,15 @@ have_pipe:
     float tint[8] = {0};  // per-draw tint (translate.c `ltint`): no game-specific highlight sets one yet
     // fragment textures are bound before deciding the viewport (tex_sc / tex_wh), rscale depends on the decision:
     // build the vertex set now and the fragment set after the decision (stage_set fills tex_sc for stage 1).
-    if (profd) prof_dyn += SDL_GetTicksNS() - prof_td_;
     uint64_t pz3 = PZ_NOW();
     PZ_SPAN("exec/draw/dyn", pz2, pz3);
-    PROFD_T0();
     uint32_t dyn[64];
     int ndyn = 0;
     hud_clip = false;  // (hud_patch, while the vertex stage's constant buffers are bound)
     VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndyn);
-    PROFD_ADD(prof_sets);
     uint64_t pz4 = PZ_NOW();
     PZ_SPAN("exec/draw/sets", pz3, pz4);
     VkDescriptorImageInfo fii[64];
-    uint64_t prof_tx_ = profd ? SDL_GetTicksNS() : 0;
     sdw_fix.s = 0;
     shadow_copy_note(pr->fi);
     for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
@@ -6320,7 +6207,6 @@ have_pipe:
             vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndyn);
         }
     }
-    if (profd) prof_tex += SDL_GetTicksNS() - prof_tx_;
     uint64_t pz5 = PZ_NOW();
     PZ_SPAN("exec/draw/tex", pz4, pz5);
     if (fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
@@ -6367,11 +6253,9 @@ have_pipe:
     }
     apply_scissor();
     float rs0[4] = {vp_sx, vp_sy, vp_ox, vp_oy};
-    uint64_t prof_t1_ = profd ? SDL_GetTicksNS() : 0;
     uint64_t pz6 = PZ_NOW();
     VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn, &ndyn);
     sdw_fix.s = 0, up_fix.sx = 0;
-    if (profd) prof_sets += SDL_GetTicksNS() - prof_t1_;
     PZ_SPAN("exec/draw/sets", pz6, PZ_NOW());
     VkDescriptorSet sets[2] = {vset, fset};
     if (ndyn > 32) ndyn = 32;
@@ -6384,7 +6268,6 @@ have_pipe:
     }
     if (mvec_draw) rec_CmdPushConstants(cb, pr->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, MVEC_PUSH, mvec_pc);
 
-    uint64_t prof_t2_ = profd ? SDL_GetTicksNS() : 0;
     uint64_t pz7 = PZ_NOW();
     // ---- indices (copied; the largest index bounds the vertex data copied below)
     uint32_t first = 0, count = (uint32_t)r->x[2], inst, base_inst, max_index = 0;
@@ -6485,7 +6368,6 @@ have_pipe:
         }
     }
 
-    if (profd) prof_vtx += SDL_GetTicksNS() - prof_t2_;
     PZ_SPAN("exec/draw/vtx", pz7, PZ_NOW());
     // ---- draw (inside an occlusion query while SAMPLES_PASSED counts)
     int oq = -1;
@@ -8619,16 +8501,11 @@ void backend_execute(uint64_t handle) {
     SW_ZONE("backend_execute");
     { SW_ACC("exec_lock"); gpu_lock(); }
     if (g_debug_frame && getenv("SAVAGEWIND_LOG_OPS")) LOG("[submit] %llx\n", (unsigned long long)handle);
-    PROF_T0();
-    in_execute = true;
     {
         SW_ACC("exec");
         guest_copy_flush();  // (a new list: the game may have written the memory of the last one's copies since)
         exec_list(handle, 0);
     }
-    in_execute = false;
-    PROF_ADD(prof_exec);
-    if (prof) cum_exec += SDL_GetTicksNS() - prof_t0_;
     static int sync_submit = -1;
     if (sync_submit < 0) sync_submit = getenv("SAVAGEWIND_SYNC_SUBMIT") ? 1 : 0;
     if (sync_submit) renderer_flush();
