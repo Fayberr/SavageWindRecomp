@@ -390,3 +390,54 @@ void prof_status(char *out, size_t n) {
     else
         snprintf(out, n, "idle%s%s", last_file[0] ? ", last file " : "", last_file);
 }
+
+// `prof [start | stop | toggle | status | report]`, for any front end that has words (the control layer's command, a
+// console): it needs nothing from them, they only hand over the arguments and show the text.
+bool prof_command(int argc, char **argv, char *out, size_t n) {
+    const char *a = argc > 1 ? argv[1] : "status";
+    if (argc > 2) {
+        snprintf(out, n, "Usage: prof [start | stop | toggle | status | report]");
+        return false;
+    }
+    if (!strcmp(a, "start")) {
+        if (prof_start()) {
+            snprintf(out, n, "capture started (prof stop, or F6, ends it)");
+            return true;
+        }
+        char st[256];
+        prof_status(st, sizeof st);
+        snprintf(out, n, "cannot start: %s", st);
+        return false;
+    }
+    if (!strcmp(a, "stop")) {
+        if (!prof_active()) {
+            snprintf(out, n, "no capture is running");
+            return false;
+        }
+        prof_stop();
+        snprintf(out, n, "capture stopped, writing the file (prof status shows when it is done)");
+        return true;
+    }
+    if (!strcmp(a, "toggle")) {
+        bool was = prof_active();
+        bool now = prof_toggle();
+        if (now) snprintf(out, n, "capture started");
+        else if (was) snprintf(out, n, "capture stopped, writing the file");
+        else snprintf(out, n, "cannot start now (prof status says why)");
+        return now || was;
+    }
+    if (!strcmp(a, "status")) {
+        prof_status(out, n);
+        return true;
+    }
+    if (!strcmp(a, "report")) {
+        if (!last_file[0]) {
+            snprintf(out, n, "no capture has been written yet");
+            return false;
+        }
+        snprintf(out, n, "python3 tools/swprof.py %s --exe <the swr binary>", last_file);
+        return true;
+    }
+    snprintf(out, n, "Unknown argument %s. Usage: prof [start | stop | toggle | status | report]", a);
+    return false;
+}

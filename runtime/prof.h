@@ -35,6 +35,9 @@ bool prof_active(void);
 void prof_status(char *out, size_t n);
 void prof_frame(uint64_t frame);   // the presenting thread, at the start of each frame
 void prof_thread_name(const char *name);
+// `prof [start | stop | toggle | status | report]`: argv as a command line gives it (argv[0] is "prof"). The answer
+// goes to out; false = it failed (nothing to stop, still writing, ...). No front end is needed to build or use this.
+bool prof_command(int argc, char **argv, char *out, size_t n);
 // The last file written ("" before the first), for a command to report.
 const char *prof_last_file(void);
 

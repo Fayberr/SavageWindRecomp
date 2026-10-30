@@ -212,6 +212,22 @@ int main(void) {
     CHECK(c2.ok && c2.frames == 10 && c2.zones == 2ull * 10 * (WORKERS + 1), "capture 2: frames %llu zones %llu",
           (unsigned long long)c2.frames, (unsigned long long)c2.zones);
 
+    // the command: the words a front end hands over
+    {
+        char o[300];
+        char *st[] = {"prof", "status"}, *start[] = {"prof", "start"}, *stop[] = {"prof", "stop"}, *rep[] = {"prof", "report"},
+             *bad[] = {"prof", "nonsense"}, *many[] = {"prof", "start", "now"};
+        CHECK(prof_command(1, st, o, sizeof o) && !strncmp(o, "idle", 4), "bare prof is status: %s", o);
+        CHECK(prof_command(2, rep, o, sizeof o) && strstr(o, "swprof.py") && strstr(o, ".swprof"), "report: %s", o);
+        CHECK(!prof_command(2, stop, o, sizeof o) && strstr(o, "no capture"), "stop when idle: %s", o);
+        CHECK(prof_command(2, start, o, sizeof o) && prof_active(), "start: %s", o);
+        CHECK(!prof_command(2, start, o, sizeof o) && strstr(o, "cannot start"), "second start: %s", o);
+        CHECK(prof_command(2, stop, o, sizeof o) && !prof_active(), "stop: %s", o);
+        wait_idle();
+        CHECK(!prof_command(2, bad, o, sizeof o) && strstr(o, "Usage"), "unknown: %s", o);
+        CHECK(!prof_command(3, many, o, sizeof o) && strstr(o, "Usage"), "too many: %s", o);
+    }
+
     // cost, for the record
     enum { N = 2000000 };
     uint64_t t0 = plat_now_ns();
