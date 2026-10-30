@@ -45,7 +45,8 @@ GENFLAGS_ZIG := -Xclang $(filter -O%,$(GENFLAGS)) -fno-vectorize -fno-slp-vector
 # the app itself holds none of it. $(GEN)/layout.c, then a folder per module (main, subsdk*, sdk)
 GEN_SRC  := $(wildcard $(GEN)/*.c) $(wildcard $(GEN)/*/*.c)
 GEN_OBJ  := $(patsubst %.c,$(B)/obj/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $(B)/obj/tools/gamelib_entry.o
-RT_SRC   := $(wildcard runtime/*.c) $(wildcard runtime/hle/*.c) $(wildcard runtime/services/*.c) \
+RT_SRC   := $(filter-out runtime/control.c runtime/control_game.c,$(wildcard runtime/*.c)) \
+            runtime/control.c runtime/control_game.c $(wildcard runtime/hle/*.c) $(wildcard runtime/services/*.c) \
             $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(PLATFORM).c
 RT_HDRS  := $(wildcard runtime/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
             $(wildcard runtime/nvn/maxwell/*.h) $(wildcard runtime/nvn/vulkan/*.h) $(wildcard runtime/ui/*.h)
@@ -108,7 +109,7 @@ GENFLAGS += -D_FILE_OFFSET_BITS=64 $(GENARCH)
 # --stack: every thread's default stack, reserved (committed as it grows): 256 MB, the guest threads' recursion runs on
 # it (runtime/kernel.c thread_start)
 LDFLAGS  := -fuse-ld=lld -Wl,--stack,268435456 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
-            -lvulkan-1 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lshaderc_shared -lpdh -l:libz.a \
+            -lvulkan-1 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lshaderc_shared -lpdh -lws2_32 -l:libz.a \
             $(if $(RELEASE),-Wl$(comma)--subsystem$(comma)windows)  # release: no console window (log -> savagewind.log)
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
@@ -210,6 +211,9 @@ $(B)/rt/gamebuild.o: $(GAMELIB_SRCS) Makefile
 $(B)/rt/gamebuild.o: RTFLAGS += -DGAMELIB_CFLAGS='"$(strip $(filter-out -Iruntime,$(GENFLAGS)))"' \
                                 $(if $(GENFLAGS_COMPAT),-DGAMELIB_CFLAGS_COMPAT='"$(strip $(filter-out -Iruntime,$(GENFLAGS_COMPAT)))"') \
                                 -DGAMELIB_ZIGFLAGS='"$(GENFLAGS_ZIG)"' -DGAMELIB_SHARED='"$(GAMELIB_SHARED)"'
+
+# Windows guarded memory scans use SEH.
+$(B)/rt/memscan_os.o: RTFLAGS += -fms-extensions
 
 $(B)/rt/%.o: runtime/%.c $(RT_HDRS)
 	@mkdir -p $(dir $@)
@@ -420,3 +424,14 @@ test-swkbd: $(B)/test_swkbd
 	$(B)/test_swkbd
 
 .PHONY: test-swkbd
+
+# the command layer of the control endpoint (who may run what, the queue, the text)
+$(B)/test_control: tools/test_control.c runtime/control.c runtime/control.h
+	@mkdir -p $(B)
+	$(CC) -O1 -g -Wall $(OSFLAGS) -Iruntime -o $@ tools/test_control.c runtime/control.c -lpthread -lm
+
+test-control: $(B)/test_control
+	env -u SAVAGEWIND_CONTROL -u SAVAGEWIND_DEV $(B)/test_control
+	env -u SAVAGEWIND_CONTROL SAVAGEWIND_DEV=1 $(B)/test_control dev
+
+.PHONY: test-control
