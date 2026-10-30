@@ -401,3 +401,12 @@ test-vibration: $(B)/test_vibration
 	$(B)/test_vibration
 
 .PHONY: test-vibration
+
+$(B)/test_swkbd: tools/test_swkbd.c runtime/hle/swkbd.c $(RT_HDRS)
+	@mkdir -p $(B)
+	$(CC) -O1 -std=gnu11 -Wall -Wextra -Werror $(OSFLAGS) -Iruntime -o $@ tools/test_swkbd.c
+
+test-swkbd: $(B)/test_swkbd
+	$(B)/test_swkbd
+
+.PHONY: test-swkbd
