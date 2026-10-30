@@ -495,3 +495,6 @@ T("AMD FSR 3: it renders smaller and builds the full-resolution image from the f
 T("TAA: blends each frame with the ones before it, following the game's motion, so edges stay smooth and stop shimmering; slightly softer, use it with Sharpening.", "TAA: смешивает каждый кадр с предыдущими с учётом движения в игре, чтобы края оставались гладкими и не мерцали; чуть мягче, используйте вместе с резкостью.")
 T("FSR 1", "")
 T("Frame generation on", "Генерация кадров включена")
+T("Calculating...", "Вычисление...")
+T("Unavailable", "Недоступно")
+T("This deletes Savage Wind's copy of the game files.", "Это удалит копию файлов игры Savage Wind.")

@@ -401,3 +401,19 @@ test-vibration: $(B)/test_vibration
 	$(B)/test_vibration
 
 .PHONY: test-vibration
+
+$(B)/test_game_file_size: tools/test_game_file_size.c runtime/game_file_size.c runtime/game_file_size.h runtime/game_files.h
+	@mkdir -p $(B)
+	$(CC) -O1 -Wall $(OSFLAGS) -Iruntime -o $@ tools/test_game_file_size.c runtime/game_file_size.c
+
+test-game-file-size: $(B)/test_game_file_size
+	$(B)/test_game_file_size
+
+$(B)/test_file_size_cache: tools/test_file_size_cache.cpp runtime/ui/file_size_cache.mm runtime/ui/file_size_cache.h runtime/game_file_size.h
+	@mkdir -p $(B)
+	$(CXX) -O1 -Wall -std=c++17 $(OSFLAGS) -Iruntime -o $@ tools/test_file_size_cache.cpp -lpthread
+
+test-file-size-cache: $(B)/test_file_size_cache
+	$(B)/test_file_size_cache
+
+.PHONY: test-game-file-size test-file-size-cache
