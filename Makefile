@@ -435,3 +435,13 @@ test-control: $(B)/test_control
 	env -u SAVAGEWIND_CONTROL SAVAGEWIND_DEV=1 $(B)/test_control dev
 
 .PHONY: test-control
+
+$(B)/test_hour: tools/test_hour.c runtime/services/test_warp.c runtime/game_sites.h
+	@mkdir -p $(B)
+	$(CC) -O1 -g -Wall -Wno-unused-function $(OSFLAGS) -Iruntime -o $@ tools/test_hour.c -lm
+
+test-hour: $(B)/test_hour
+	env -u SAVAGEWIND_TEST_TIME $(B)/test_hour
+	env SAVAGEWIND_TEST_TIME=18 $(B)/test_hour env
+
+.PHONY: test-hour

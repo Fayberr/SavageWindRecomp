@@ -45,14 +45,20 @@ void control_init(void);
 // Once per presented frame: run the queued commands. Cheap when nothing is queued.
 void control_frame(uint64_t frame);
 
-// The game's commands (state, pos, camera, ...), registered by control_init() through this.
+// The game's commands (state, pos, camera, time, shot, ...), registered by control_init() through this.
 void control_game_init(void);
 // Called by control_frame() at the start of every frame, also when no command is queued, but only when the
 // endpoint is on (the game side keeps its fps average with it).
 void control_game_frame(uint64_t frame);
 
+// Live input hook: frame publication on the presenter; apply may run on guest threads.
+// A NULL lx requests buttons only. Otherwise all four axis pointers must be valid.
+void control_input_frame(uint64_t frame);
 bool control_enabled(void);      // developer mode (SAVAGEWIND_CONTROL=<port> or SAVAGEWIND_DEV=1): the commands that are not player safe
 bool control_endpoint_on(void);  // is the socket server listening (SAVAGEWIND_CONTROL)?
+void control_fly_wheel(float notches);  // mouse wheel while flying: faster / slower
+bool control_fly_toggle(void);   // fly mode on/off (the hotkey, bound as bind_key_fly); false when it could not turn on
+void control_input_apply(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry);
 
 // ---- a front end that is not the socket (the in-game console): lines go in from its thread, run in control_frame()
 typedef struct {

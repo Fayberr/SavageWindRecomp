@@ -208,6 +208,7 @@ static void dump_largest_textures(const char *why) {
 static uint64_t frames, total_frames;
 uint64_t renderer_present_count(void) { return total_frames; }
 bool control_camera_view(float view[12]) { (void)view; return false; }  // (the control endpoint's `camera`: not on Metal yet)
+bool control_shot_now(const char *path) { (void)path; return false; }  // (the control endpoint's `shot`: not on Metal yet)
 
 // Output resolution: render targets the game sizes for the 1920x1080 screen are allocated at
 // (sx, sy) times their guest size. Shaders and the renderer keep working in guest ("logical") units.

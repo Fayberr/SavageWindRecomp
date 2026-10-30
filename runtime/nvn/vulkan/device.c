@@ -1693,6 +1693,14 @@ static bool fg_wanted(void) {
     return !framepace_title_ui() && !framepace_menu_ui() && !framepace_paused() && !menu_is_open();
 }
 
+// The image being presented, for the control endpoint's `shot` (runtime/control_game.c; commands run in this frame).
+static TexBackend *ctl_present_tex;
+bool control_shot_now(const char *path) {
+    if (!ctl_present_tex) return false;
+    renderer_save_texture_tex(ctl_present_tex, path);
+    return true;
+}
+
 // The world camera's view matrix (3x4, row-major, as the shaders read it) of the last finished frame, for the control
 // endpoint's `camera` (runtime/control_game.c). false: none (motion recording is off, or no scene was drawn).
 bool control_camera_view(float view[12]) {
@@ -1706,6 +1714,7 @@ bool control_camera_view(float view[12]) {
 static void present_locked(NvnTexture *t) {
     g_last_presented = t;
     TexBackend *b = vk_tex(t, true);
+    ctl_present_tex = b;
     b->presented = true;
     uint64_t t0 = SDL_GetTicksNS();
     vk_end_pass();
