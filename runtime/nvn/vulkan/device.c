@@ -169,9 +169,15 @@ static void pick_device(void) {
     LOG("[vk] using %s\n", g_vk.props.deviceName);
     // Colour images with a list of their view formats (textures.c create_image), on integrated GPUs by default: there
     // the memory traffic it saves pays (Radeon 660M; LAS Recomp 03ee802f measured an Intel UHD 770 faster and an
-    // RTX 3080 Ti slightly slower). SAVAGEWIND_VK_LEAN_USAGE=0 / =1 overrides.
+    // RTX 3080 Ti slightly slower). Not on Linux AMD (RADV: the Steam Deck): there the game showed small purple specks
+    // flickering on the ground with them and none without (Great Plateau, user play test 2026-10-29).
+    // SAVAGEWIND_VK_LEAN_USAGE=0 / =1 overrides.
     const char *lean = getenv("SAVAGEWIND_VK_LEAN_USAGE");
-    g_vk.lean_usage = lean && *lean ? atoi(lean) != 0 : g_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    bool lean_default = g_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+#ifdef __linux__
+    if (g_vk.props.vendorID == 0x1002) lean_default = false;
+#endif
+    g_vk.lean_usage = lean && *lean ? atoi(lean) != 0 : lean_default;
     LOG("[vk] view format lists %s\n", g_vk.lean_usage ? "on" : "off");
     { extern void perfmon_set_gpu_hint(const char *n); perfmon_set_gpu_hint(g_vk.props.deviceName); }
 }
