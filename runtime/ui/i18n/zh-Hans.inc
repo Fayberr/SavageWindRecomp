@@ -112,7 +112,7 @@ T("Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.", "占满整个屏幕�
 T("FPS", "")
 T("Full", "完整")
 T("Performance overlay", "性能信息")
-T("FPS: the frame rate and frame time. Full: also CPU, memory and GPU load and temperatures, and a frame time graph. F10 switches between them while you play.", "FPS：帧率和帧时间。完整：另外显示CPU、内存和GPU的负载与温度，以及帧时间图表。游戏中按F10切换。")
+T("FPS: the frame rate and frame time. Full: also CPU, memory and GPU load and temperatures, a frame time graph and Link's coordinates. F10 switches between them while you play.", "FPS：帧率和帧时间。完整：另外显示CPU、内存和GPU的负载与温度、帧时间图表和林克的坐标。游戏中按F10切换。")
 T("Rendering", "渲染")
 T("MetalFX", "")
 T("AMD FSR 1", "")

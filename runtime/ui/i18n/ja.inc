@@ -112,7 +112,7 @@ T("Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.", "画面全体に表�
 T("FPS", "")
 T("Full", "詳細")
 T("Performance overlay", "パフォーマンス表示")
-T("FPS: the frame rate and frame time. Full: also CPU, memory and GPU load and temperatures, and a frame time graph. F10 switches between them while you play.", "FPS：フレームレートとフレーム時間。詳細：さらにCPU、メモリ、GPUの負荷と温度、フレーム時間のグラフ。プレイ中はF10で切り替えられます。")
+T("FPS: the frame rate and frame time. Full: also CPU, memory and GPU load and temperatures, a frame time graph and Link's coordinates. F10 switches between them while you play.", "FPS：フレームレートとフレーム時間。詳細：さらにCPU、メモリ、GPUの負荷と温度、フレーム時間のグラフ、リンクの座標。プレイ中はF10で切り替えられます。")
 T("Rendering", "レンダリング")
 T("MetalFX", "")
 T("AMD FSR 1", "")

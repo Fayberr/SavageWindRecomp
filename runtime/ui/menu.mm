@@ -699,8 +699,8 @@ static void tab_display(void) {
     }
     static const char *const perf_names[] = {"Off", "FPS", "Full"};
     opt_choice("Performance overlay", &g_settings.perf_overlay, perf_names, 3, PERF_OFF,
-               "FPS: the frame rate and frame time. Full: also CPU, memory and GPU load and temperatures, and a "
-               "frame time graph. F10 switches between them while you play.");
+               "FPS: the frame rate and frame time. Full: also CPU, memory and GPU load and temperatures, a "
+               "frame time graph and Link's coordinates. F10 switches between them while you play.");
 
     opt_section("Rendering");
     {   // Upscaler: Off, this OS's spatial upscaler (its modes on the row below), and the temporal ones still to come.
@@ -1014,6 +1014,10 @@ static void perf_overlay_draw(ImGuiIO &io, float scale) {
 #endif
     if (g_fg_active) line += std::string(line.empty() ? "" : " | ") + tr("Frame generation on");
     if (!line.empty()) ImGui::TextDisabled("%s", line.c_str());
+    // Link's coordinates; no line at all while there is no Link or the game is in a scene (title, loading, movie, event).
+    // Axis letters are not translated.
+    float pos[3];
+    if (perfmon_position(pos)) ImGui::Text("X %.1f  Y %.1f  Z %.1f", pos[0], pos[1], pos[2]);
     ImGui::End();
 }
 

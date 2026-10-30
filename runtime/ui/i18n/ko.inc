@@ -112,7 +112,7 @@ T("Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.", "화면 전체를 채
 T("FPS", "")
 T("Full", "전체")
 T("Performance overlay", "성능 표시")
-T("FPS: the frame rate and frame time. Full: also CPU, memory and GPU load and temperatures, and a frame time graph. F10 switches between them while you play.", "FPS: 프레임 레이트와 프레임 시간. 전체: CPU, 메모리, GPU의 부하와 온도, 프레임 시간 그래프까지 표시. 플레이 중에는 F10으로 전환합니다.")
+T("FPS: the frame rate and frame time. Full: also CPU, memory and GPU load and temperatures, a frame time graph and Link's coordinates. F10 switches between them while you play.", "FPS: 프레임 레이트와 프레임 시간. 전체: CPU, 메모리, GPU의 부하와 온도, 프레임 시간 그래프와 링크의 좌표까지 표시. 플레이 중에는 F10으로 전환합니다.")
 T("Rendering", "렌더링")
 T("MetalFX", "")
 T("AMD FSR 1", "")

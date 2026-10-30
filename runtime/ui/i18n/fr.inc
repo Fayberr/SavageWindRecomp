@@ -112,7 +112,7 @@ T("Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.", "Occupe tout l'écran
 T("FPS", "")
 T("Full", "Complet")
 T("Performance overlay", "Indicateur de performances")
-T("FPS: the frame rate and frame time. Full: also CPU, memory and GPU load and temperatures, and a frame time graph. F10 switches between them while you play.", "FPS : la fréquence d'images et le temps par image. Complet : aussi la charge et la température du CPU, de la mémoire et du GPU, et un graphique des temps par image. F10 passe de l'un à l'autre pendant le jeu.")
+T("FPS: the frame rate and frame time. Full: also CPU, memory and GPU load and temperatures, a frame time graph and Link's coordinates. F10 switches between them while you play.", "FPS : la fréquence d'images et le temps par image. Complet : aussi la charge et la température du CPU, de la mémoire et du GPU, un graphique des temps par image et les coordonnées de Link. F10 passe de l'un à l'autre pendant le jeu.")
 T("Rendering", "Rendu")
 T("MetalFX", "")
 T("AMD FSR 1", "")
