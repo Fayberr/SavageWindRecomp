@@ -206,6 +206,40 @@ was made, so no multiplier is claimed.
 [Apple bulk-attribute manual](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/getattrlistbulk.2),
 [Apple file-attribute manual](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/getattrlist.2).
 
+### Further Linux parallel-scanning experiment
+
+The same warmed synthetic tree was scanned with a small directory-work queue
+using one, two or four pthread workers. The Oracle host has four Neoverse-N1
+cores. Each worker uses the directory-relative single-lookup implementation.
+Thread creation and joining are included in elapsed time. Six measured passes
+alternate method order; every result is exactly 1,970,118 bytes.
+
+| Method | Median elapsed time | Median aggregate process CPU time |
+| --- | ---: | ---: |
+| Upstream | 127.342 ms | 127.334 ms |
+| Optimized single-thread recursion | 70.837 ms | 70.835 ms |
+| Queue, one worker | 73.123 ms | 72.836 ms |
+| Queue, two workers | 38.230 ms | 75.927 ms |
+| Queue, four workers | 22.542 ms | 81.553 ms |
+
+Four workers reduce wall time roughly 5.6x relative to upstream and 3.1x
+relative to the optimized single-thread scanner in this experiment. They use
+multiple cores at once and about 15% more aggregate CPU time than the optimized
+single-thread traversal. The additional saving is about 48 ms on this warmed
+synthetic workload; no real game tree, cold metadata or mechanical/network
+storage was measured on Linux.
+
+This is an ignored benchmark prototype (`build/probe/posix/parallel.c` and
+`parallel.log`), with a fixed-capacity descriptor queue and no production
+cancellation/error-recovery design. It is not ready to integrate as-is.
+
+Recommended implementation order: first integrate the measured Windows native
+scanner and Linux single-thread optimization, plus one background scan shared
+by both launcher pages with cache invalidation. Keep macOS' existing traversal
+until its native bulk implementation can be tested. Consider additional Linux
+parallelism separately if representative end-to-end measurements justify the
+CPU use and worker/descriptor lifecycle complexity.
+
 ## Recommended fix and verification
 
 Run size enumeration on a worker and expose a shared cached result to both
