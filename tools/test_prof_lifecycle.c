@@ -117,7 +117,22 @@ int main(int argc, char **argv) {
         puts("survived signal shutdown");
         return 0;
     }
-    if (!strcmp(argv[1], "stress")) {
+    if (!strcmp(argv[1], "full-acc")) {
+        assert(prof_start()); prof_frame(10);
+        ProfSite a = {"stored total", 0}, b = {"pending total", 0}, c = {"pending tally", 0};
+        ProfSite next = {"next frame total", 0};
+        uint32_t gen = prof_generation(), filler = prof_site_dyn("filler");
+        prof_acc_add_gen(gen, &a, 111);
+        prof_acc_add_gen(gen, &b, 222);
+        prof_acc_add_gen(gen, &c, 0);
+        // Leave one record for the first accumulator after the next frame boundary.
+        for (unsigned i = 0; i < (8u << 20) / sizeof(ProfRec) - 3; i++)
+            prof_put(PROF_COUNTER, filler, prof_ticks(), 7, 0);
+        prof_frame(11);
+        prof_acc_add_gen(gen, &next, 333);
+        assert(!prof_enabled());
+        prof_stop(); idle();
+    } else if (!strcmp(argv[1], "stress")) {
         pthread_t th[4];
         for (unsigned i = 0; i < 4; i++) assert(!pthread_create(&th[i], NULL, producer, NULL));
         for (unsigned i = 0; i < 20; i++) {

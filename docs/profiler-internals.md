@@ -25,6 +25,8 @@ The ordering between producers and the writer, in `prof.c:enter` and `writer_mai
 
 The flag covers the short recording operation, not the scope being measured, so a long scope cannot hold the writer.
 Final accumulator totals are streamed as extra chunks, so they survive a full event pool and the exit of a worker.
+If a frame flush fills the pool partway through, only stored sites are cleared. The remaining totals keep their
+original frame for the writer; the new frame's addition that encountered the full pool is rejected as admission closes.
 Thread ids are compacted for the file, and slots left over from earlier captures are omitted.
 
 Normal shutdown and an in-place game reboot wait for the writer, so the file is finished before guest thread handles or

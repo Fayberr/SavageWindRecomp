@@ -212,19 +212,20 @@ static ProfCursor *enter(uint32_t gen, bool gpu) {
 }
 static void leave(ProfCursor *c) { __atomic_store_n(&c->busy, 0, __ATOMIC_RELEASE); }
 
-static void append(ProfCursor *c, uint32_t kind, uint32_t site, uint64_t t0, uint64_t t1, uint64_t val) {
+static bool append(ProfCursor *c, uint32_t kind, uint32_t site, uint64_t t0, uint64_t t1, uint64_t val) {
     if (c->cur == c->end) {
         unsigned i = atomic_fetch_add(&next_chunk, 1);
         if (i >= pool_chunks) {
             atomic_store(&stop_requested, true);
             __atomic_store_n(&g_prof_on, 0, __ATOMIC_SEQ_CST);
-            return;
+            return false;
         }
         chunk_thread[i] = (uint16_t)c->thread;
         c->cur = pool + (size_t)i * CHUNK_RECS;
         c->end = c->cur + CHUNK_RECS;
     }
     *c->cur++ = (ProfRec){t0, t1, val, site, kind};
+    return true;
 }
 
 void prof_put_gen(uint32_t gen, uint32_t kind, uint32_t site, uint64_t t0, uint64_t t1, uint64_t val) {
@@ -235,22 +236,28 @@ void prof_put_gen(uint32_t gen, uint32_t kind, uint32_t site, uint64_t t0, uint6
     if (__builtin_expect(atomic_load_explicit(&stop_requested, memory_order_relaxed), 0)) prof_stop();
 }
 
-static void flush_acc(ProfCursor *c) {
+static bool flush_acc(ProfCursor *c) {
     uint64_t now = prof_ticks();
     for (uint32_t id = 1; id < PROF_MAX_SITES; id++)
         if (c->acc->calls[id]) {
-            append(c, PROF_ACC | (c->acc->calls[id] << 8), id, now, c->acc->ticks[id], c->acc_frame);
+            if (!append(c, PROF_ACC | (c->acc->calls[id] << 8), id, now, c->acc->ticks[id], c->acc_frame))
+                return false;  // the writer streams the remaining totals with their original frame
             c->acc->ticks[id] = 0;
             c->acc->calls[id] = 0;
         }
     c->acc_seq = atomic_load(&g_prof_seq);
     c->acc_frame = atomic_load(&g_prof_frame);
+    return true;
 }
 
 void prof_acc_add_gen(uint32_t gen, ProfSite *s, uint64_t ticks) {
     ProfCursor *c = enter(gen, false);
     if (!c) return;
-    if (c->acc_seq != atomic_load(&g_prof_seq)) flush_acc(c);
+    if (c->acc_seq != atomic_load(&g_prof_seq) && !flush_acc(c)) {
+        leave(c);
+        prof_stop();
+        return;  // admission closed before this frame's addition; do not merge it into the retained frame
+    }
     uint32_t id = prof_site(s);
     c->acc->ticks[id] += ticks;
     c->acc->calls[id]++;

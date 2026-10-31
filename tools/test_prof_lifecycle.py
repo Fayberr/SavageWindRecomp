@@ -63,5 +63,12 @@ class LifecycleTest(unittest.TestCase):
         calls = sum(n for acc in cap.acc for _, sid, n, _ in acc if cap.sites[sid] == 'final total')
         self.assertEqual(calls, 1)
 
+    def test_partial_accumulator_flush_preserves_unstored_totals_and_frame(self):
+        cap = self.run_case('full-acc')
+        totals = [(frame, cap.sites[sid], calls, round(ms * cap.ticks_per_ms))
+                  for acc in cap.acc for frame, sid, calls, ms in acc]
+        self.assertEqual(sorted(totals), [(10, 'pending tally', 1, 0), (10, 'pending total', 1, 222),
+                                         (10, 'stored total', 1, 111)])
+
     def test_writer_failure_allows_a_later_capture(self):
         self.assertTrue(self.run_case('write-failure').frame_marks)
