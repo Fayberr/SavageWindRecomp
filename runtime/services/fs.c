@@ -1022,6 +1022,24 @@ static uint32_t errno_result(void) {
     return MAKE_RESULT(2, 4000);
 }
 
+// The game closed the file's session: its host descriptor (a Windows handle each) and the copy of the save go.
+static void file_close(Service *s) {
+    HostFile *f = s->state;
+    if (!f) return;
+    s->state = NULL;
+    if (f->fd >= 0) close(f->fd);
+    free(f->patched);
+    free(f);
+}
+
+static void dir_close(Service *s) {
+    HostDir *d = s->state;
+    if (!d) return;
+    s->state = NULL;
+    if (d->d) closedir(d->d);
+    free(d);
+}
+
 static void file(Service *s, IpcReq *req, IpcResp *resp) {
     HostFile *f = s->state;
     switch (req->cmd) {
@@ -1177,7 +1195,9 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
                 f->patched = NULL;
             }
         }
-        ipc_return_object(resp, service_new("IFile", file, f));
+        Service *fsvc = service_new("IFile", file, f);
+        fsvc->on_close = file_close;
+        ipc_return_object(resp, fsvc);
         break;
     }
     case 9: {  // OpenDirectory(mode)
@@ -1187,7 +1207,9 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
         hd->d = d;
         hd->mode = (int)IN(uint32_t, 0);
         snprintf(hd->path, sizeof hd->path, "%s", p);
-        ipc_return_object(resp, service_new("IDirectory", directory, hd));
+        Service *dsvc = service_new("IDirectory", directory, hd);
+        dsvc->on_close = dir_close;
+        ipc_return_object(resp, dsvc);
         break;
     }
     case 10: break;  // Commit
