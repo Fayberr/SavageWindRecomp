@@ -2098,6 +2098,7 @@ static void window_event_log(const SDL_Event *e) {
 
 int ui_run(void) {
     ui_window_init();
+    input_focus_update(window);
     atomic_store(&ui_ready, true);
     for (;;) {
         if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
@@ -2112,6 +2113,7 @@ int ui_run(void) {
                 exit(0);
             }
             window_event_log(&e);
+            if (input_user_blocked(&e)) continue;
             if (menu_handle_event(&e)) continue;
             input_handle_event(&e);
         }

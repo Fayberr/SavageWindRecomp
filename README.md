@@ -213,7 +213,12 @@ Estimates of where each part stands. "Tested in game" is how much of the game ha
 ## Controls
 
 Any controller SDL knows works, by button position; one with a gyroscope (DualSense, DualShock 4, Switch controllers,
-Steam Deck) also aims and tilts by motion. Keyboard and mouse defaults:
+Steam Deck) also aims and tilts by motion.
+
+Controller buttons, sticks and motion only control the game while its window has focus. Switching away releases
+held inputs; returning reads the controller's current state.
+
+Keyboard and mouse defaults:
 
 | Action | Key | Action | Key |
 |---|---|---|---|

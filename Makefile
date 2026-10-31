@@ -412,6 +412,18 @@ test-vibration: $(B)/test_vibration
 
 .PHONY: test-vibration
 
+# The input test includes input.c; discard its unused HLE functions and their runtime dependencies.
+$(B)/test_input_focus: tools/test_input_focus.c runtime/hle/input.c $(RT_HDRS)
+	@mkdir -p $(B)
+	$(CC) -O1 -ffunction-sections -fdata-sections $(OSFLAGS) $(DEPINC) -Iruntime -o $@ tools/test_input_focus.c \
+	    $(if $(filter macos,$(PLATFORM)),-Wl$(comma)-dead_strip,-Wl$(comma)--gc-sections) \
+	    $(if $(filter macos,$(PLATFORM)),-L$(SDL)/lib,$(if $(DEPS),-L$(DEPS)/lib)) -lSDL3 -lm
+
+test-input-focus: $(B)/test_input_focus
+	$(B)/test_input_focus
+
+.PHONY: test-input-focus
+
 $(B)/test_swkbd: tools/test_swkbd.c runtime/hle/swkbd.c $(RT_HDRS)
 	@mkdir -p $(B)
 	$(CC) -O1 -std=gnu11 -Wall -Wextra -Werror $(OSFLAGS) -Iruntime -o $@ tools/test_swkbd.c

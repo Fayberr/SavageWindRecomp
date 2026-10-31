@@ -52,7 +52,7 @@ extern "C" void menu_request_window_size_apply(void) { g_size_apply_at.store(SDL
 extern "C" bool game_options_input_hold(void);  // game_options.mm: a binding capture from the game's Options screen
 
 struct QEvent {
-    enum { KEY, ANALOG, MOUSE_POS, MOUSE_BUTTON, WHEEL, TEXT } kind;
+    enum { KEY, ANALOG, MOUSE_POS, MOUSE_BUTTON, WHEEL, TEXT, FOCUS } kind;
     ImGuiKey key;
     bool down;
     float value, x, y;
@@ -178,6 +178,14 @@ extern "C" bool menu_cursor_free(void) { return g_cursor_free.load(); }
 
 bool menu_handle_event(const SDL_Event *e) {
     static bool back_down, start_down;
+    if (e->type == SDL_EVENT_WINDOW_FOCUS_LOST || e->type == SDL_EVENT_WINDOW_FOCUS_GAINED) {
+        back_down = start_down = false;
+        QEvent q = {};
+        q.kind = QEvent::FOCUS;
+        q.down = e->type == SDL_EVENT_WINDOW_FOCUS_GAINED;
+        push(q);
+        return false;  // the input runtime also releases its cached controls
+    }
     // a binding capture (Controls tab, or the game's Options screen) takes the press
     if (bind_capture_event(e)) return true;
     if (e->type == SDL_EVENT_KEY_DOWN) g_last_pad = false;
@@ -459,6 +467,7 @@ static void drain_events(ImGuiIO &io) {
         case QEvent::MOUSE_BUTTON: io.AddMouseButtonEvent(q.button, q.down); break;
         case QEvent::WHEEL: io.AddMouseWheelEvent(q.x, q.y); break;
         case QEvent::TEXT: io.AddInputCharactersUTF8(q.text); break;
+        case QEvent::FOCUS: io.AddFocusEvent(q.down); break;
         }
     }
 }
