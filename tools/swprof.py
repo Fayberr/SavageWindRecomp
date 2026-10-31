@@ -151,7 +151,7 @@ class Frames:
 
 def build_tree(zones, names, span=(-math.inf, math.inf)):
     """zones: (start, end, site) of one thread -> {path tuple: [calls, inclusive ms, self ms, max ms]}; also each
-    zone's (start, self, path) for attributing to frames."""
+    self-time intervals (start, end, path) for attributing to frames. Build nesting before clipping to span."""
     zones = sorted(zones, key=lambda z: (z[0], -z[1]))
     stack = []  # [end, path, direct child intervals, start]
     stats = {}
@@ -465,7 +465,11 @@ def gpu_summary(cap, fr, span, nframes):
             idle += end - start
         else:
             busy += end - start
-    return {'busy_ms_per_frame': round(busy / nframes, 3), 'idle_ms_per_frame': round(idle / nframes, 3),
+    calibration = [v for t, v in cap.counters.get('GPU clock calibrated', []) if span[0] <= t < span[1]]
+    deviations = [v for t, v in cap.counters.get('GPU clock deviation ns', []) if span[0] <= t < span[1]]
+    return {'alignment': ('calibrated' if all(calibration) else 'estimated') if calibration else 'unknown (older capture)',
+            'max_deviation_ns': max(deviations) if deviations else None,
+            'busy_ms_per_frame': round(busy / nframes, 3), 'idle_ms_per_frame': round(idle / nframes, 3),
             'busy_percent': round(100 * busy / (busy + idle), 1) if busy + idle else 0,
             'rows': [{'name': n, 'rows_per_frame': round(v[0] / nframes, 2), 'ms_per_frame': round(v[1] / nframes, 4),
                       'draws_per_frame': round(v[2] / nframes, 1), 'max_ms': round(v[3], 3)}
@@ -492,6 +496,8 @@ def text_report(res, top_n, slow_ms):
             w(f"  {t['self_ms_per_frame']:8.3f}  {t['calls_per_frame']:9.1f}x  [{t['thread']}] {t['name']}")
     g = res.get('gpu')
     if g:
+        w(f"\nGPU clock alignment: {g['alignment']}" +
+          (f"; maximum calibration deviation {g['max_deviation_ns']} ns" if g['max_deviation_ns'] is not None else ''))
         w(f"\nGPU: busy {g['busy_ms_per_frame']} ms per frame ({g['busy_percent']}% of the time), idle {g['idle_ms_per_frame']} ms. "
           f"Passes, dispatches and copies by GPU time (ms per frame):")
         for r in g['rows'][:top_n]:

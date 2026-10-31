@@ -10,6 +10,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "../../kernel.h"
 #include "../../prof.h"
@@ -363,17 +366,45 @@ static void gp_end(VkCommandBuffer cb, uint64_t seq) {
     gp_fifo[gp_tail++ % SUBS] = (uint8_t)cur_sub;
 }
 
-// The GPU clock against the CPU's cycle counter: one reading of both (the call is bracketed by two counter reads).
-static bool gp_clocks(uint64_t *gpu, uint64_t *cpu) {
+// Query the device and an advertised host time domain together. Bracketing a device-only driver call with rdtsc
+// cannot bound its alignment error: the driver may sample the GPU at any point inside that call.
+static bool gp_clocks(uint64_t *gpu, uint64_t *cpu, uint64_t *deviation) {
     static PFN_vkGetCalibratedTimestampsEXT get;
+    static int host_ok = -1;
+#ifdef _WIN32
+    const VkTimeDomainEXT host = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT;
+#else
+    const VkTimeDomainEXT host = VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT;
+#endif
     if (!g_vk.calibrated) return false;
     if (!get) get = (PFN_vkGetCalibratedTimestampsEXT)vkGetDeviceProcAddr(g_vk.dev, "vkGetCalibratedTimestampsEXT");
     if (!get) return false;
-    VkCalibratedTimestampInfoEXT info = {.sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, .timeDomain = VK_TIME_DOMAIN_DEVICE_EXT};
-    uint64_t c0 = prof_ticks(), dev = 0, dev_max;
-    if (get(g_vk.dev, 1, &info, &dev, &dev_max) != VK_SUCCESS) return false;
-    *cpu = c0 + (prof_ticks() - c0) / 2;
-    *gpu = dev;
+    if (host_ok < 0) {
+        host_ok = 0;
+        PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT domains =
+            (PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT)vkGetInstanceProcAddr(g_vk.inst, "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT");
+        VkTimeDomainEXT supported[8];
+        uint32_t n = 8;
+        if (domains && domains(g_vk.phys, &n, supported) == VK_SUCCESS)
+            for (uint32_t i = 0; i < n; i++) if (supported[i] == host) host_ok = 1;
+    }
+    if (!host_ok) return false;
+    VkCalibratedTimestampInfoEXT info[2] = {
+        {.sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, .timeDomain = VK_TIME_DOMAIN_DEVICE_EXT},
+        {.sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, .timeDomain = host}};
+    uint64_t stamp[2];
+    if (get(g_vk.dev, 2, info, stamp, deviation) != VK_SUCCESS) return false;
+    uint64_t host_ns = stamp[1];
+#ifdef _WIN32
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    host_ns = (uint64_t)((unsigned __int128)host_ns * 1000000000ull / (uint64_t)frequency.QuadPart);
+#endif
+    uint64_t c0 = prof_ticks(), now = plat_now_ns(), c1 = prof_ticks();
+    double delta = ((double)host_ns - (double)now) * prof_ticks_per_ns();
+    *cpu = (uint64_t)((double)(c0 + (c1 - c0) / 2) + delta);
+    *deviation += (uint64_t)((double)(c1 - c0) / prof_ticks_per_ns());
+    *gpu = stamp[0];
     return true;
 }
 
@@ -397,10 +428,16 @@ static void gp_read(GpSub *g, unsigned si) {
     static uint64_t t[GPQ + 1];
     if (vkGetQueryPoolResults(g_vk.dev, gp_qp, (uint32_t)(si * GPQ), g->n + 1, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
     double tpn = prof_ticks_per_ns() * g_vk.props.limits.timestampPeriod;  // CPU ticks per GPU tick
-    uint64_t gpu_now, cpu_now;
+    uint64_t gpu_now, cpu_now, deviation = 0;
     uint64_t base;  // CPU tick of t[0]
-    if (gp_clocks(&gpu_now, &cpu_now)) base = cpu_now - (uint64_t)((double)((gpu_now - t[0]) & gp_mask()) * tpn);
+    bool calibrated = gp_clocks(&gpu_now, &cpu_now, &deviation);
+    if (calibrated) base = cpu_now - (uint64_t)((double)((gpu_now - t[0]) & gp_mask()) * tpn);
     else base = g->submit_ticks;  // (no calibration: the submission started when it was handed over, the GPU not backed up)
+    static uint32_t calibration_site, deviation_site;
+    if (!calibration_site) calibration_site = prof_site_dyn("GPU clock calibrated");
+    if (!deviation_site) deviation_site = prof_site_dyn("GPU clock deviation ns");
+    prof_put_gen(g->gen, PROF_GPU_COUNTER, calibration_site, base, calibrated, 0);
+    if (calibrated) prof_put_gen(g->gen, PROF_GPU_COUNTER, deviation_site, base, deviation, 0);
     if (gp_prev_gen != g->gen) { gp_prev_gen = g->gen; gp_prev_end = 0; }
     static uint32_t idle_site;
     if (!idle_site) idle_site = prof_site_dyn("(gpu idle)");

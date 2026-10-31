@@ -227,7 +227,7 @@ static void append(ProfCursor *c, uint32_t kind, uint32_t site, uint64_t t0, uin
 }
 
 void prof_put_gen(uint32_t gen, uint32_t kind, uint32_t site, uint64_t t0, uint64_t t1, uint64_t val) {
-    ProfCursor *c = enter(gen, kind == PROF_GPU);
+    ProfCursor *c = enter(gen, kind == PROF_GPU || kind == PROF_GPU_COUNTER);
     if (!c) return;
     append(c, kind, site, t0, t1, val);
     leave(c);

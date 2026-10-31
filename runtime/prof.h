@@ -49,6 +49,7 @@ bool prof_gpu_enabled(uint32_t generation);
 typedef struct { const char *name; uint32_t id; } ProfSite;  // id 0: not registered yet
 typedef struct { uint64_t t0, t1, val; uint32_t site, kind; } ProfRec;  // 32 bytes. kind: low 8 bits PROF_*, ACC: calls << 8
 enum { PROF_ZONE = 1, PROF_COUNTER = 2, PROF_FRAME = 3, PROF_ACC = 4, PROF_GPU = 5, PROF_SAMPLE = 6, PROF_STACK = 7 };
+enum { PROF_GPU_COUNTER = PROF_COUNTER | 0x100 };  // a counter admitted during GPU drain too
 // PROF_GPU: a stretch of GPU work (t0..t1 in cycle counter ticks, val = draws | frame << 32), written by whichever
 // thread reads the GPU's timestamps back; the tool shows these as a thread of their own, "gpu".
 

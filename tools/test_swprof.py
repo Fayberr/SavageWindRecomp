@@ -113,6 +113,19 @@ class SwprofTest(unittest.TestCase):
         self.assertAlmostEqual(g['rows'][0]['draws_per_frame'], 20, delta=0.01)
         self.assertTrue(any(t['name'] == 'gpu' for t in res['threads']))
 
+    def test_gpu_clock_metadata_reports_estimated_alignment(self):
+        cap = self.crossing_capture()
+        cap.counters['GPU clock calibrated'] = [(5, 0)]
+        self.assertEqual(swprof.analyse(cap)['gpu']['alignment'], 'estimated')
+
+    def test_gpu_clock_metadata_reports_calibration_uncertainty(self):
+        cap = self.crossing_capture()
+        cap.counters['GPU clock calibrated'] = [(5, 1)]
+        cap.counters['GPU clock deviation ns'] = [(5, 1234)]
+        gpu = swprof.analyse(cap)['gpu']
+        self.assertEqual(gpu['alignment'], 'calibrated')
+        self.assertEqual(gpu['max_deviation_ns'], 1234)
+
     def test_counters(self):
         res = swprof.analyse(swprof.Capture(self.path))
         self.assertEqual(res['counters']['queue']['max'], 7)
