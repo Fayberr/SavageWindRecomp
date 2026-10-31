@@ -33,6 +33,12 @@ reason. If the file cannot be opened, written or closed, no new path is publishe
 
 ## Linux sampling
 
+Named threads register a lifetime slot even while capture is off. The sampler snapshots these slots before asking
+the kernel for its running threads, then validates the slot generation and holds the lifetime mutex across
+`pthread_sigqueue`. The thread's TLS destructor takes the same mutex before releasing its slot, so exit, detach and
+join cannot reclaim pthread storage during signal delivery. Reused slots and unregistered threads are skipped.
+The mutex is released before waiting for a signal response; the handler never takes it.
+
 The handler for a sample must be async-signal-safe. glibc's `backtrace()` is not (it can take heap and loader locks), so
 the Linux sampler does not unwind. It reserves `SIGRTMIN + 6` once for the lifetime of the process, and refuses to run
 if that signal is already in use instead of replacing someone else's handler. `SIGPROF` is not touched.

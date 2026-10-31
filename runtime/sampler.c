@@ -144,6 +144,38 @@ static struct {
 static uint32_t request_id;
 _Static_assert(__atomic_always_lock_free(sizeof(uint32_t), 0), "signal handler needs lock-free request atomics");
 
+// Guest threads name themselves before running guest code. Keep their pthread storage alive while signaling:
+// a TLS destructor must pass this lock before the thread can finish, detach or be joined.
+static pthread_mutex_t lifetime_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t lifetime_once = PTHREAD_ONCE_INIT;
+static pthread_key_t lifetime_key;
+static struct LiveThread { pthread_t host; uint64_t serial; } live[MAX_THREADS];
+static uint64_t lifetime_serial;
+
+static void unregister_thread(void *p) {
+    pthread_mutex_lock(&lifetime_lock);
+    ((struct LiveThread *)p)->serial = 0;
+    pthread_mutex_unlock(&lifetime_lock);
+}
+
+static void init_lifetime_key(void) {
+    if (pthread_key_create(&lifetime_key, unregister_thread)) abort();
+}
+
+void prof_sampler_register_thread(void) {
+    pthread_once(&lifetime_once, init_lifetime_key);
+    if (pthread_getspecific(lifetime_key)) return;
+    pthread_mutex_lock(&lifetime_lock);
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (live[i].serial) continue;
+        live[i].host = pthread_self();
+        live[i].serial = ++lifetime_serial;
+        if (pthread_setspecific(lifetime_key, &live[i])) live[i].serial = 0;
+        break;  // unregistered threads are skipped rather than signaled without a lifetime guard
+    }
+    pthread_mutex_unlock(&lifetime_lock);
+}
+
 static void on_signal(int sig, siginfo_t *si, void *uc_) {
     (void)sig;
     if (si->si_code != SI_QUEUE || si->si_pid != getpid()) return;
@@ -192,6 +224,10 @@ static void *sampler_main(void *arg) {
     uint64_t entry[MAX_THREADS];
     for (uint64_t next = plat_now_ns(); __atomic_load_n(&g_running, __ATOMIC_ACQUIRE) && prof_enabled();
          next += (uint64_t)g_interval_us * 1000) {
+        struct LiveThread snapshot[MAX_THREADS];
+        pthread_mutex_lock(&lifetime_lock);
+        memcpy(snapshot, live, sizeof snapshot);
+        pthread_mutex_unlock(&lifetime_lock);
         int n = kernel_running_threads(host, handle, entry, MAX_THREADS);
         for (int i = 0; i < n && prof_enabled(); i++) {
             if (pthread_equal(host[i], pthread_self())) continue;
@@ -200,7 +236,16 @@ static void *sampler_main(void *arg) {
             uint32_t req = ++request_id;
             __atomic_store_n(&g_slot.state, req, __ATOMIC_RELEASE);
             union sigval value = {.sival_int = (int)req};
-            if (!pthread_sigqueue(host[i], SAMPLE_SIGNAL, value)) {
+            int sent = ESRCH;
+            pthread_mutex_lock(&lifetime_lock);
+            for (int j = 0; j < MAX_THREADS; j++) {
+                if (snapshot[j].serial && snapshot[j].serial == live[j].serial && host[i] == live[j].host) {
+                    sent = pthread_sigqueue(live[j].host, SAMPLE_SIGNAL, value);
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&lifetime_lock);
+            if (!sent) {
                 for (int spin = 0; spin < 250 && __atomic_load_n(&g_slot.state, __ATOMIC_ACQUIRE); spin++) {
                     struct timespec ts = {0, 20000};
                     nanosleep(&ts, NULL);
@@ -254,6 +299,10 @@ int prof_sampler_modules(ProfModule *out, int max) {
 static void *sampler_main(void *arg) { (void)arg; return NULL; }
 int prof_sampler_modules(ProfModule *out, int max) { (void)out; (void)max; return 0; }
 
+#endif
+
+#ifndef __linux__
+void prof_sampler_register_thread(void) {}
 #endif
 
 void prof_sampler_begin(void) {

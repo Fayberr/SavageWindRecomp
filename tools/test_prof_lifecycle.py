@@ -22,6 +22,9 @@ class LifecycleTest(unittest.TestCase):
     def test_pending_signal_after_stop(self):
         self.run_case('pending')
 
+    def test_sampler_skips_a_thread_reaped_after_snapshot(self):
+        self.run_case('reaped-snapshot')
+
     def test_delayed_realtime_request_after_stop(self):
         self.run_case('pending-rt')
 

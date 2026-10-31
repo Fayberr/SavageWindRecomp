@@ -15,6 +15,7 @@
 
 static pthread_t sampled;
 static int sample_main;
+static atomic_int reap_snapshot, reaped, victim_ready, victim_exit;
 uint64_t plat_now_ns(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -24,7 +25,19 @@ void plat_sleep_until_ns(uint64_t t) { while (plat_now_ns() < t) usleep(100); }
 int kernel_running_threads(pthread_t *h, uint32_t *k, uint64_t *e, int max) {
     if (!sample_main || !max) return 0;
     h[0] = sampled; k[0] = 1; e[0] = 0;
+    if (atomic_exchange(&reap_snapshot, 0)) {
+        atomic_store(&victim_exit, 1);
+        assert(!pthread_join(sampled, NULL));
+        atomic_store(&reaped, 1);
+    }
     return 1;
+}
+static void *sample_victim(void *arg) {
+    (void)arg;
+    prof_thread_name("short-lived guest");
+    atomic_store(&victim_ready, 1);
+    while (!atomic_load(&victim_exit)) usleep(100);
+    return NULL;
 }
 static void idle(void) {
     char s[256];
@@ -76,11 +89,28 @@ int main(int argc, char **argv) {
     assert(argc == 2);
     setenv("SAVAGEWIND_PROF_MB", "8", 1);
     setenv("SAVAGEWIND_PROF_SAMPLE", "0", 1);
+    if (!strcmp(argv[1], "reaped-snapshot")) {
+        pthread_attr_t attr;
+        assert(!pthread_attr_init(&attr));
+        assert(!pthread_attr_setstacksize(&attr, 256ull << 20));
+        assert(!pthread_create(&sampled, &attr, sample_victim, NULL));
+        pthread_attr_destroy(&attr);
+        while (!atomic_load(&victim_ready)) usleep(100);
+        sample_main = 1;
+        atomic_store(&reap_snapshot, 1);
+        setenv("SAVAGEWIND_PROF_SAMPLE", "1000", 1);
+        assert(prof_start());
+        while (!atomic_load(&reaped)) usleep(100);
+        prof_stop(); idle();
+        puts("survived reaped snapshot");
+        return 0;
+    }
     if (!strcmp(argv[1], "pending") || !strcmp(argv[1], "pending-rt")) {
         sigset_t set;
         sigemptyset(&set); sigaddset(&set, !strcmp(argv[1], "pending") ? SIGPROF : SIGRTMIN + 6);
         pthread_sigmask(SIG_BLOCK, &set, NULL);
         sampled = pthread_self(); sample_main = 1;
+        prof_thread_name("main");
         setenv("SAVAGEWIND_PROF_SAMPLE", "1000", 1);
         assert(prof_start()); usleep(80000); prof_stop(); idle();
         pthread_sigmask(SIG_UNBLOCK, &set, NULL);

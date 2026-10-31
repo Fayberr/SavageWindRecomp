@@ -62,6 +62,7 @@ typedef struct { uint64_t base, size, bias; uint32_t kind; char name[196]; } Pro
 void prof_sampler_begin(void);
 void prof_sampler_end(void);  // waits for the sampler thread to finish
 int prof_sampler_modules(ProfModule *out, int max);
+void prof_sampler_register_thread(void);  // called by prof_thread_name, including while recording is off
 
 typedef struct ProfAcc ProfAcc;
 typedef struct {

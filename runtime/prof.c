@@ -109,6 +109,7 @@ static uint64_t os_thread_id(void) {
 }
 
 void prof_thread_name(const char *name) {
+    prof_sampler_register_thread();
     snprintf(t_name, sizeof t_name, "%s", name ? name : "");
     pthread_mutex_lock(&registry_lock);
     if (t_prof) snprintf(threads[t_prof->thread].name, sizeof threads[0].name, "%s", t_name);
