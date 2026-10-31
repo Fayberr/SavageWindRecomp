@@ -37,6 +37,31 @@ static void emit(uint64_t t, uint64_t tid, uint32_t handle, const uint64_t *pc, 
 
 static uint64_t os_tid(HANDLE h) { return GetThreadId(h); }
 
+// Walks the stack of a suspended thread. The thread can be anywhere (a prologue, a system call, a driver's own code),
+// so the unwinder may read what is not there: a fault ends this one sample, never the game (the thread is resumed by
+// the caller either way).
+static int unwind(CONTEXT *ctx, uint64_t *pc) {
+    volatile int d = 0;
+    __try {
+        for (; d < DEPTH && ctx->Rip; d++) {
+            pc[d] = ctx->Rip;
+            DWORD64 base = 0;
+            PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx->Rip, &base, NULL);
+            if (!f) {  // a leaf without unwind data: the return address is on top of the stack
+                if (!ctx->Rsp || IsBadReadPtr((void *)ctx->Rsp, 8)) { d++; break; }
+                ctx->Rip = *(DWORD64 *)ctx->Rsp;
+                ctx->Rsp += 8;
+                continue;
+            }
+            void *hd = NULL;
+            DWORD64 fr = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx->Rip, f, ctx, &hd, &fr, NULL);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return d;
+}
+
 static void *sampler_main(void *arg) {
     (void)arg;
     prof_thread_name("sampler");
@@ -56,22 +81,7 @@ static void *sampler_main(void *arg) {
             CONTEXT ctx;
             memset(&ctx, 0, sizeof ctx);
             ctx.ContextFlags = CONTEXT_FULL;
-            if (GetThreadContext(h, &ctx)) {
-                for (; d < DEPTH && ctx.Rip; d++) {
-                    pc[d] = ctx.Rip;
-                    DWORD64 base = 0;
-                    PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
-                    if (!f) {  // a leaf without unwind data: the return address is on top of the stack
-                        if (!ctx.Rsp || IsBadReadPtr((void *)ctx.Rsp, 8)) { d++; break; }
-                        ctx.Rip = *(DWORD64 *)ctx.Rsp;
-                        ctx.Rsp += 8;
-                        continue;
-                    }
-                    void *hd = NULL;
-                    DWORD64 fr = 0;
-                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, f, &ctx, &hd, &fr, NULL);
-                }
-            }
+            if (GetThreadContext(h, &ctx)) d = unwind(&ctx, pc);
             ResumeThread(h);
             if (d) emit(t, tid, handle[i], pc, d);
         }
