@@ -5,6 +5,7 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -246,6 +247,38 @@ class SwprofTest(unittest.TestCase):
             fh.write(b'\0' * 200)
         with self.assertRaises(SystemExit):
             swprof.Capture(bad)
+
+    def test_rejects_truncated_chunk_payload_at_record_and_byte_boundaries(self):
+        with open(self.path, 'rb') as fh:
+            data = fh.read()
+        for missing in (swprof.REC.size, 1):
+            with self.subTest(missing=missing):
+                with open(self.path, 'wb') as fh:
+                    fh.write(data[:-missing])
+                with self.assertRaisesRegex(SystemExit, r'truncated chunk .*expected .*bytes.*found .*bytes'):
+                    swprof.Capture(self.path)
+
+    def test_rejects_truncated_chunk_header(self):
+        data = build({}, ['main'], [(0, 0, 0, 0, 0, swprof.FRAME)])
+        with open(self.path, 'wb') as fh:
+            fh.write(data[:-swprof.REC.size - 1])
+        with self.assertRaisesRegex(SystemExit, 'truncated chunk .*header'):
+            swprof.Capture(self.path)
+
+    def test_truncated_capture_cli_fails_without_reports(self):
+        with open(self.path, 'rb') as fh:
+            data = fh.read()
+        with open(self.path, 'wb') as fh:
+            fh.write(data[:-swprof.REC.size])
+        js, csv_path = os.path.join(self.dir.name, 'bad.json'), os.path.join(self.dir.name, 'bad.csv')
+        run = subprocess.run([sys.executable, swprof.__file__, self.path, '--json', js, '--csv', csv_path],
+                             capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('truncated chunk', run.stderr)
+        self.assertNotIn('Traceback', run.stderr)
+        self.assertEqual(run.stdout, '')
+        self.assertFalse(os.path.exists(js))
+        self.assertFalse(os.path.exists(csv_path))
 
     def crossing_capture(self):
         recs = [(0, i * TPM, 0, i // 10, 0, swprof.FRAME) for i in range(0, 41, 10)]

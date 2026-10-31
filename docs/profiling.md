@@ -116,3 +116,5 @@ its older comma-separated frame list is not supported. FNPROF and the F10 player
 
 `SWPROF01` version 1; `runtime/prof.c` has the layout in its header comment. The tool refuses files with another
 magic or version.
+Short chunk headers and payloads are rejected with a message naming the chunk and the expected and available byte
+counts, including truncation on a complete record boundary. The command exits unsuccessfully and writes no reports.

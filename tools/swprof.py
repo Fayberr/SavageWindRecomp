@@ -86,10 +86,19 @@ class Capture:
         self.sample_depth = 0
         self.records = 0
         ms = lambda t: (t - t0) / self.ticks_per_ms
-        for _ in range(nchunks):
+        for chunk in range(nchunks):
+            available = len(data) - pos
+            if available < CHUNK.size:
+                raise SystemExit(f'{path}: truncated chunk {chunk + 1}/{nchunks} header: '
+                                 f'expected {CHUNK.size} bytes, found {available} bytes')
             thread, n = CHUNK.unpack_from(data, pos)
             pos += CHUNK.size
-            for a, b, val, site, kind in REC.iter_unpack(data[pos:pos + n * REC.size]):
+            size = n * REC.size
+            available = len(data) - pos
+            if available < size:
+                raise SystemExit(f'{path}: truncated chunk {chunk + 1}/{nchunks}: '
+                                 f'expected {n} records ({size} bytes), found {available} bytes')
+            for a, b, val, site, kind in REC.iter_unpack(data[pos:pos + size]):
                 k = kind & 0xff
                 if k == SAMPLE:
                     self.samples.append([ms(a), b, val, []])
@@ -112,7 +121,7 @@ class Capture:
                     self.frame_marks.append((ms(a), val))
                 elif k == GPU:
                     self.gpu.append((ms(a), ms(b), site, val & 0xffffffff))
-            pos += n * REC.size
+            pos += size
             self.records += n
         self.frame_marks.sort()
         self.gpu.sort()
