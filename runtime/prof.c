@@ -1,10 +1,9 @@
 // On-demand profiler: the recorder and the capture file (runtime/prof.h has the markers and the overview).
 //
-// Memory: one pool of fixed chunks, taken whole by whichever thread needs one (an atomic counter, nothing else is
-// shared), so a thread writes into its own chunk and nobody ever waits. The pool is calloc'ed once, on the first
-// capture, and stays zero between captures (the used chunks are cleared after the file is written): a record
-// counts as written once its `kind` is not zero, and the reader stops at the first zero one. When the pool is
-// full the capture ends itself (SAVAGEWIND_PROF_MB, default 256).
+// Memory: one pool of fixed chunks, claimed atomically and written through private thread cursors. The writer closes
+// admission and waits for their short writes before reading or clearing the pool. Registration uses bounded slots;
+// steady-state markers do not take a mutex. The pool is allocated on first capture and reused. Unused records stay
+// zero; after producer completion the writer scans up to the first zero kind. A full pool stops capture and logs it.
 //
 // File (little endian), read by tools/swprof.py:
 //   header   "SWPROF01", u32 version, u32 record size, u64 ticks0, ns0, ticks1, ns1 (the cycle counter and
@@ -268,6 +267,7 @@ void prof_frame(uint64_t frame) {
     static int env_read, env_done;
     static long env_first = -1, env_count;
     static uint64_t env_stop_at;
+    static uint32_t env_gen;
     if (!env_read) {
         env_read = 1;
         const char *e = getenv("SAVAGEWIND_PROF");
@@ -285,8 +285,12 @@ void prof_frame(uint64_t frame) {
     }
     if (env_first >= 0 && !env_done && frame >= (uint64_t)env_first && atomic_load(&state) == IDLE) {
         env_done = 1;
-        if (prof_start()) env_stop_at = env_count > 0 ? frame + (uint64_t)env_count : 0;
+        if (prof_start()) {
+            env_stop_at = env_count > 0 ? frame + (uint64_t)env_count : 0;
+            env_gen = prof_generation();
+        }
     }
+    if (env_stop_at && env_gen != prof_generation()) env_stop_at = 0;
     if (!prof_enabled()) {
         if (atomic_load(&stop_requested) && atomic_load(&state) == CAPTURING) prof_stop();  // the buffer filled up
         return;

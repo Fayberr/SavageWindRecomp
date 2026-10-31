@@ -41,6 +41,7 @@ static void *old_scope(void *arg) {
     {
         SW_ZONE("old zone");
         SW_ACC("old accumulator");
+        SW_COUNT("queue", 7);  // claim the old capture's cursor before the writer closes it
         atomic_store(&entered, 1);
         while (!atomic_load(&release_scope)) usleep(100);
     }
@@ -59,6 +60,7 @@ static uint64_t gpu_start;
 static void finish_gpu(void) {
     assert(!prof_enabled());
     prof_put_gpu(gpu_gen, gpu_site, gpu_start, gpu_start + 1, 1);
+    prof_put_gen(gpu_gen, PROF_GPU_COUNTER, gpu_site, gpu_start, 1, 0);
 }
 static atomic_bool stress_done;
 static void *producer(void *arg) {
@@ -102,8 +104,15 @@ int main(int argc, char **argv) {
         gpu_gen = prof_generation(); gpu_site = prof_site_dyn("delayed GPU"); gpu_start = prof_ticks();
         prof_gpu_finish_hook(finish_gpu);
         prof_stop(); idle();
-    } else if (!strcmp(argv[1], "one")) {
-        setenv("SAVAGEWIND_PROF", "100:1", 1);
+    } else if (!strcmp(argv[1], "cancel-env")) {
+        setenv("SAVAGEWIND_PROF", "100:1000", 1);
+        prof_frame(100); prof_stop(); idle();
+        assert(prof_start()); prof_frame(2000);
+        assert(prof_active());
+        prof_stop(); idle();
+    } else if (!strcmp(argv[1], "one") || !strcmp(argv[1], "alias")) {
+        if (!strcmp(argv[1], "alias")) setenv("SAVAGEWIND_GPUPROF_AT", "100", 1);
+        else setenv("SAVAGEWIND_PROF", "100:1", 1);
         prof_frame(100); usleep(10000); prof_frame(101); idle();
     } else if (!strcmp(argv[1], "cross")) {
         assert(prof_start()); prof_frame(1);
