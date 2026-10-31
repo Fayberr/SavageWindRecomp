@@ -4,7 +4,7 @@
 AMD ships FSR 4 only as signed Windows x64 DLLs (no Linux or macOS build). runtime/nvn/vulkan/fsr_api.cpp loads
 amd_fidelityfx_loader_vk.dll from the game's folder if it is there; without it the game is as before and FSR 4 is
 listed as AMD Radeon only. The DLLs are not in this repository (36 MB): this fetches them, checks their SHA-256 and
-writes AMD's licence text next to them (its terms: binary redistribution is fine with that notice reproduced; no
+writes AMD's licence text (also checked) next to them (its terms: binary redistribution is fine with that notice reproduced; no
 reverse engineering).
 
 usage: tools/fetch_fsr_dlls.py                 into build/fsr-dlls/ (make dist copies them from there when present)
@@ -13,6 +13,7 @@ usage: tools/fetch_fsr_dlls.py                 into build/fsr-dlls/ (make dist c
 import argparse
 import hashlib
 import os
+import shutil
 import sys
 import urllib.request
 
@@ -23,7 +24,8 @@ FILES = {
         '38a56a01fb3565c0757d9f5c1e4e69de4b65e5f2e5769b323b200dc1f142bab9'),
     'signedbin/amd_fidelityfx_upscaler_vk.dll': ('amd_fidelityfx_upscaler_vk.dll',
         '4a7e895af6e0b615d40a84d59eb8c2b1054ad91cdd0c739567940270d51bdab7'),
-    'docs/license.md': ('AMD-FidelityFX-DLL-LICENSE.txt', None),
+    'docs/license.md': ('AMD-FidelityFX-DLL-LICENSE.txt',
+        '32357259b965d6a8001e9e508ba60eda6034027c5923a7d226ffbaff813c2bfb'),
 }
 
 
@@ -43,16 +45,20 @@ def main():
     os.makedirs(dest, exist_ok=True)
     for src, (name, want) in FILES.items():
         out = os.path.join(dest, name)
-        if want and os.path.exists(out) and sha256(out) == want:
+        if os.path.exists(out) and sha256(out) == want:
             print(f'{name}: already there')
             continue
         print(f'{name}: downloading {src} ({TAG})')
         tmp = out + '.part'
-        urllib.request.urlretrieve(f'{BASE}/{src}', tmp)
-        if want and sha256(tmp) != want:
-            os.remove(tmp)
-            sys.exit(f'{name}: SHA-256 differs from the one recorded for {TAG}; not kept')
-        os.replace(tmp, out)
+        try:
+            with urllib.request.urlopen(f'{BASE}/{src}', timeout=60) as r, open(tmp, 'wb') as f:
+                shutil.copyfileobj(r, f)
+            if sha256(tmp) != want:
+                sys.exit(f'{name}: SHA-256 differs from the one recorded for {TAG}; not kept')
+            os.replace(tmp, out)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
     print(f'done: {dest}')
 
 

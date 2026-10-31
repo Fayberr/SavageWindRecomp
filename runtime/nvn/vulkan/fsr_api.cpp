@@ -55,9 +55,10 @@ extern "C" bool fsr_api_present(void) {
     return have;
 }
 
-// The versions the DLL offers for this device: the newest of each major version (ids from the DLL's own query, as
-// AMD asks: never hard-coded)
+// The versions the DLL offers for this device: the highest of each major version (ids from the DLL's own query, as
+// AMD asks: never hard-coded; the list has no promised order)
 static uint64_t ver_id[5];
+static uint32_t ver_key[5];  // (minor and patch number of the version kept, to keep the highest)
 static char ver_name[5][32];
 static std::atomic<bool> ver_have[5];
 static bool amd_gpu;
@@ -111,13 +112,17 @@ extern "C" void fsr_api_probe(VkDevice dev, VkPhysicalDevice phys) {
         // ("4.1.2", or a name with the number after a word: the first number is the major version)
         const char *d = s;
         while (*d && (*d < '0' || *d > '9')) d++;
-        int major = atoi(d);
-        if (major < 1 || major > 4 || ver_have[major]) continue;  // (the first of a major version is its newest)
+        unsigned maj = 0, min = 0, pat = 0;
+        sscanf(d, "%u.%u.%u", &maj, &min, &pat);
+        int major = (int)maj;
+        uint32_t key = (min & 0xffff) << 16 | (pat & 0xffff);
+        if (major < 1 || major > 4 || (ver_have[major] && key <= ver_key[major])) continue;
         ver_id[major] = ids[i];
+        ver_key[major] = key;
         snprintf(ver_name[major], sizeof ver_name[major], "%s", s);  // (a copy: AMD says the names may be overwritten)
         ver_have[major] = true;
     }
-    // FSR 4 runs on AMD Radeon graphics only (RX 6000 and newer)
+    // FSR 4 runs on AMD Radeon graphics only
     if (ver_have[4] && !amd_gpu) ver_have[4] = false;
     LOG("[fsr] AMD FSR API: upscaler versions %s%s\n", list,
         ver_have[4] ? "" : amd_gpu ? " (no FSR 4 for this GPU)" : " (FSR 4: AMD Radeon only)");
@@ -190,7 +195,9 @@ static bool make_context(const Fsr3Dispatch *d, int major) {
     ov.versionId = ver_id[major];
     cd.header.pNext = &bd.header;
     bd.header.pNext = &vd.header;
-    vd.header.pNext = &ov.header;
+    // (FSR 3: the 3.1.6 asked for by id. FSR 4: no version asked for, so the DLL picks its newest, which may be a
+    // driver's own newer build; AMD's docs: an override turns that choice off)
+    if (major != 4) vd.header.pNext = &ov.header;
     ffxReturnCode_t e = create_context(&ctx, &cd.header, nullptr);
     if (e != FFX_API_RETURN_OK) {
         LOG("[fsr] FSR %s context %ux%u -> %ux%u: error %u\n", ver_name[major], d->color.width, d->color.height,
@@ -205,7 +212,7 @@ static bool make_context(const Fsr3Dispatch *d, int major) {
     ctx_dev = d->dev;
     ctx_rw = d->color.width, ctx_rh = d->color.height, ctx_ow = d->output.width, ctx_oh = d->output.height;
     LOG("[fsr] AMD FSR API context %ux%u -> %ux%u (asked for %s, got %s)\n", ctx_rw, ctx_rh, ctx_ow, ctx_oh,
-        ver_name[major], got);
+        major == 4 ? "the newest" : ver_name[major], got);
     return true;
 }
 
@@ -220,9 +227,11 @@ static FfxApiResource resource(const Fsr3Image *m, bool uav) {
     return ffxApiGetResourceVK((void *)m->image, rd, FFX_API_RESOURCE_STATE_COMMON);
 }
 
+static bool failed[5];  // (a version that failed once is not tried again this run)
+extern "C" bool fsr_api_usable(int major) { return fsr_api_has(major) && !failed[major]; }
+
 extern "C" bool fsr_api_dispatch(const Fsr3Dispatch *d, int major) {
-    static bool failed[5];
-    if (!fsr_api_has(major) || failed[major]) return false;
+    if (!fsr_api_usable(major)) return false;
     if ((!ctx || ctx_major != major || d->color.width != ctx_rw || d->color.height != ctx_rh ||
          d->output.width != ctx_ow || d->output.height != ctx_oh) && !make_context(d, major)) {
         failed[major] = true;
@@ -257,6 +266,7 @@ extern "C" bool fsr_api_dispatch(const Fsr3Dispatch *d, int major) {
     if (e != FFX_API_RETURN_OK) {
         static int logged;
         if (logged++ < 8) LOG("[fsr] FSR %s dispatch: error %u\n", ver_name[major], (unsigned)e);
+        failed[major] = true;
         return false;
     }
     return true;

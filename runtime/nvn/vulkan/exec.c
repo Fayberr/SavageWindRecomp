@@ -8328,13 +8328,17 @@ static TexBackend *fsr3_scene(VkCommandBuffer cb, TexBackend *b, uint32_t ow, ui
     last_ns = ns;
     // Upscaler FSR 4, or SAVAGEWIND_FSR3_API=1: AMD's DLLs (fsr_api.h); else the built-in FSR 3.1 (fsr3.h)
     int api = rt_fsr4() ? 4 : fsr3_api_wanted() ? 3 : 0;
+    if (api && !fsr_api_usable(api)) api = 0;  // (it failed before: the built-in one from here on)
     static int last_api = -1;  // (another upscaler: its own history, from none)
     if (api != last_api) d.reset = true;
     last_api = api;
     if (g_gpuprof_frame) gp_mark(cb, api == 4 ? "FSR 4 upscaler" : "FSR 3 upscaler");
     rec_drain();  // (FidelityFX records into cb itself, and may wait for the device: what was queued before goes first)
-    // (AMD's failing, logged there: the built-in FSR 3.1 in its place, from this frame on)
-    if (!(api && fsr_api_dispatch(&d, api)) && !(fsr3_available() && fsr3_dispatch(&d))) return NULL;
+    // (AMD's failing, logged there: the built-in FSR 3.1 in its place, from this frame on, without the history of the
+    // other upscaler)
+    bool amd_ok = api && fsr_api_dispatch(&d, api);
+    if (api && !amd_ok) d.reset = true, api = 0, last_api = 0;
+    if (!amd_ok && !(fsr3_available() && fsr3_dispatch(&d))) return NULL;
     if (g_gpuprof_frame) gp_mark(cb, api == 4 ? "after FSR 4" : "after FSR 3");
     last = frame;
     vk_dyn_forget();  // (FSR's own pipelines and sets were bound)

@@ -501,7 +501,7 @@ static void create_device(void) {
     }
     g_vk.present_wait = pwait;
     // AMD FSR 4 (vulkan/fsr_api.h): AMD's upscaler DLL runs its network with cooperative matrices (FP8 on the RX 9000,
-    // INT8 on the RX 7000 and 6000), integer dot products, compute derivatives and a chosen subgroup size. They go on
+    // INT8 on older Radeons), integer dot products, compute derivatives and a chosen subgroup size. They go on
     // only for an AMD Radeon with the DLLs next to the game; each only where the driver has it (fsr_api_probe says
     // after the device is made whether AMD's DLL then offers FSR 4).
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop_on = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,

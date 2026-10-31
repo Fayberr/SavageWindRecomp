@@ -767,7 +767,7 @@ static void tab_display(void) {
                                                             : std::string(tr("FSR 3")) + " " + tr("(coming soon)");
         std::string fsr4 = upscaler_available(UPSCALE_FSR4)
                                ? std::string(tr("AMD FSR 4"))
-                               : std::string(tr("FSR 4")) + " " + tr(fsr4_offered() ? "(coming soon)" : "(AMD Radeon only)");
+                               : std::string(tr("FSR 4")) + " " + tr(fsr4_offered() ? "(coming soon)" : "(AMD Radeon on Windows only)");
         std::string dlss = std::string(tr("DLSS")) + " " + tr(renderer_gpu_rtx() ? "(coming soon)" : "(NVIDIA RTX only)");
 #ifdef __APPLE__
         const char *ups[] = {"Off", "MetalFX"};
@@ -791,7 +791,7 @@ static void tab_display(void) {
                    : tr("AMD FSR 3 and NVIDIA DLSS (NVIDIA RTX graphics cards) are coming in a later version."));
         if (upscaler_available(UPSCALE_FSR4))  // (its own paragraph: the ones above keep their translations)
             uds += std::string("\n\n") + tr("AMD FSR 4: like FSR 3, but AMD's machine learning rebuilds the image. For AMD Radeon "
-                                              "graphics cards (RX 6000 and newer) on Windows. Sharpening sets its own sharpening.");
+                                              "graphics cards on Windows. Sharpening sets its own sharpening.");
         const char *ud = uds.c_str();
 #endif
         enum { NU = sizeof ups_value / sizeof ups_value[0] };
