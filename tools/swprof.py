@@ -430,7 +430,8 @@ def analyse(cap, first=None, last=None, exe=None):
     # slow frames: the worst few, with the places that took the most self time inside each
     worst = sorted(fr.items, key=lambda it: -it[3])[:10]
     for i, n, start, dur in worst:
-        cause = sorted(per_frame_self.get(i, {}).items(), key=lambda kv: -kv[1])[:6]
+        work = ((k, v) for k, v in per_frame_self.get(i, {}).items() if k[1].rsplit('/', 1)[-1] not in WAIT_ZONES)
+        cause = sorted(work, key=lambda kv: -kv[1])[:6]
         result['slow_frames'].append({'frame': n, 'ms': round(dur, 2), 'at_s': round(start / 1000, 3),
                                       'top': [{'thread': k[0], 'name': k[1], 'ms': round(v, 2)} for k, v in cause]})
     result['gpu'] = gpu_summary(cap, fr, span, nframes)

@@ -260,6 +260,17 @@ int main(void) {
     printf("full buffer: %llu events in the file\n", (unsigned long long)full.records);
     CHECK(full.ok && full.records > 0, "file after a full buffer");
 
+    // F6 uses prof_toggle: acknowledge a full buffer before allowing another capture.
+    uint32_t full_gen = prof_generation();
+    CHECK(!prof_toggle() && !prof_active(), "F6 after a full buffer must only acknowledge the stop");
+    CHECK(prof_generation() == full_gen, "acknowledgment must not start a capture");
+    CHECK(prof_toggle() && prof_active(), "the next F6 must start a capture");
+    CHECK(!prof_toggle() && !prof_active(), "F6 must still stop a running capture");
+    wait_idle();
+    CHECK(prof_toggle() && prof_active(), "a manual stop must not require acknowledgment");
+    prof_stop();
+    wait_idle();
+
     printf(failures ? "test_prof: %d FAILED\n" : "test_prof: ok\n", failures);
     return failures != 0;
 }

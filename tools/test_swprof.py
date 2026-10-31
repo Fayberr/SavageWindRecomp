@@ -86,6 +86,29 @@ class SwprofTest(unittest.TestCase):
         self.assertEqual(slow['top'][0]['name'], 'render/draw')
         self.assertAlmostEqual(slow['top'][0]['ms'], 50, delta=0.1)
 
+    def test_slow_frame_excludes_waits_and_keeps_sample_split(self):
+        sites = {1: 'worker', 2: 'guest sleep', 3: 'kernel wait', 4: 'real work'}
+        recs = [(0, 0, 0, 0, 0, swprof.FRAME),
+                (0, 100 * TPM, 0, 1, 0, swprof.FRAME),
+                (0, 0, 100 * TPM, 0, 1, swprof.ZONE),
+                (0, 0, 90 * TPM, 0, 2, swprof.ZONE),
+                (0, 90 * TPM, 100 * TPM, 0, 4, swprof.ZONE),
+                (1, 0, 100 * TPM, 0, 3, swprof.ZONE),
+                (2, TPM, 100, 0, 0, swprof.SAMPLE | (1 << 8)),
+                (2, 0, 0, 0, 0, swprof.STACK)]
+        with open(self.path, 'wb') as fh:
+            fh.write(build(sites, ['main', 'waiting worker', 'sampler'], recs))
+        res = swprof.analyse(swprof.Capture(self.path))
+        slow = res['slow_frames'][0]
+        self.assertEqual(slow['top'][0]['name'], 'worker/real work')
+        self.assertAlmostEqual(slow['top'][0]['ms'], 10)
+        self.assertFalse({r['name'].rsplit('/', 1)[-1] for r in slow['top']} & swprof.WAIT_ZONES)
+        report = swprof.text_report(res, 10, 33.4).split('Slowest frames', 1)[1]
+        self.assertIn('worker/real work', report)
+        self.assertNotIn('guest sleep', report)
+        self.assertNotIn('kernel wait', report)
+        self.assertIn('samples: waiting 1', report)
+
     def test_zone_self_time_and_acc(self):
         res = swprof.analyse(swprof.Capture(self.path))
         main = next(t for t in res['threads'] if t['name'] == 'main')

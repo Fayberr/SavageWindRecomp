@@ -29,7 +29,7 @@ extern "C" {
 // ---- control (any thread; the command layer, the hotkey and the environment variable call these)
 bool prof_start(void);             // false: already running, still writing the last file, or no memory
 void prof_stop(void);              // ends the capture; the file is written in the background
-bool prof_toggle(void);            // start or stop; true = now capturing
+bool prof_toggle(void);            // start, stop, or acknowledge a full buffer; true = now capturing
 bool prof_active(void);
 // One line of state for a command: capturing / writing / idle, how full the buffer is, the last file.
 void prof_status(char *out, size_t n);

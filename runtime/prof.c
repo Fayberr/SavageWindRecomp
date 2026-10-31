@@ -48,6 +48,7 @@ static __thread char t_name[32];
 enum { IDLE, CAPTURING, WRITING };
 static atomic_int state;
 static atomic_bool stop_requested;  // the pool filled up: the presenting thread ends the capture at the next frame
+static atomic_bool full_stop_pending;  // the next toggle acknowledges the automatic stop
 static int gpu_on;
 static void (*gpu_finish)(void);
 static pthread_mutex_t control_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -347,6 +348,7 @@ bool prof_start(void) {
     atomic_store(&next_chunk, 0);
     atomic_store(&nthreads, 0);
     atomic_store(&stop_requested, false);
+    atomic_store(&full_stop_pending, false);
     unix0 = (uint64_t)time(NULL);
     ns0 = plat_now_ns();
     ticks0 = prof_ticks();
@@ -501,7 +503,10 @@ void prof_stop(void) {
     __atomic_store_n(&g_prof_on, 0, __ATOMIC_SEQ_CST);
     ticks1 = prof_ticks();
     ns1 = plat_now_ns();
-    if (atomic_load(&stop_requested)) LOG("[prof] buffer full, stopping capture\n");
+    if (atomic_load(&stop_requested)) {
+        atomic_store(&full_stop_pending, true);
+        LOG("[prof] buffer full, stopping capture\n");
+    }
     pthread_t th;
     bool started = pthread_create(&th, NULL, writer_main, NULL) == 0;
     if (started) pthread_detach(th);
@@ -515,6 +520,10 @@ void prof_shutdown(void) {
 }
 
 bool prof_toggle(void) {
+    if (atomic_exchange(&full_stop_pending, false)) {
+        LOG("[prof] capture already ended (buffer full); press F6 again to start a capture\n");
+        return false;
+    }
     if (prof_active()) {
         prof_stop();
         return false;

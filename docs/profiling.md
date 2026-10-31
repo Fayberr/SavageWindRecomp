@@ -8,12 +8,14 @@ no viewer is needed.
 
 | How | What it does |
 | --- | --- |
-| `F6` in the game | Starts a capture; `F6` again stops it. Ignored while a menu captures input or F6 is assigned to a game control. |
+| `F6` in the game | Starts a capture; `F6` again stops it. After a full buffer stops it automatically, the next press only acknowledges the stop; the press after that starts a new capture. Ignored while a menu captures input or F6 is assigned to a game control. |
 | `SAVAGEWIND_PROF=<first>[:<frames>]` | Starts at frame `<first>`; stops after `<frames>` frames (without a count: stays on until stopped). `SAVAGEWIND_GPUPROF_AT=<n>` still works and means `<n>:1`. |
 | `prof start`, `prof stop`, `prof status` | The same, from the command layer (once it is merged). |
 
 A capture also ends by itself when its buffer is full (`SAVAGEWIND_PROF_MB`, default 256, 8 to 4096). The file is
-written in the background to `profile/swprof-<date>-<time>.swprof`. Stopping first closes CPU recording, then drains
+written in the background to `profile/swprof-<date>-<time>.swprof`. This logs `[prof] buffer full, stopping capture`;
+there is no on-screen notification. The next F6 press only acknowledges that stop, and the press after that starts
+a new capture once writing is finished. Stopping first closes CPU recording, then drains
 pending GPU timestamps on the writer thread. A capture started while the last file is still
 being written is refused; wait for `prof status` to say `idle`.
 
