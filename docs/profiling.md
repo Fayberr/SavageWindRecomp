@@ -57,6 +57,9 @@ stack samples; Linux can classify waits only where a completed wait zone covers 
 Zone self time is split at child and frame boundaries. A frame selection clips CPU/GPU intervals to that window;
 an empty selection reports no work. Operation/call counts include operations touching the window, while their times
 are clipped. Accumulators are assigned to the frame observed by that thread; they do not retain individual intervals.
+Their self time is deducted proportionally from non-wait zone self time on the same thread and frame, up to the
+available zone time. This prevents duplicate self-time totals, but the missing ACC intervals mean the enclosing zone
+cannot be identified exactly; unrelated zones in that frame can also be reduced. Zone inclusive time is unchanged.
 
 The recompiled game code is deliberately one total. The tool never looks up or prints a game function, and the
 sampler section ends with a reminder: do not put game addresses, game names or generated code into pull requests or

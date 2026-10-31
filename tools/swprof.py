@@ -390,20 +390,46 @@ def analyse(cap, first=None, last=None, exe=None):
         (0.0, 0.0) if first is not None or last is not None else (0.0, cap.duration_ms)
 
     wanted = {it[1] for it in fr.items}
+    frame_indices = {n: i for i, n, _, _ in fr.items}
     per_frame_self = collections.defaultdict(lambda: collections.defaultdict(float))  # frame mark index -> key -> ms
     top = collections.defaultdict(lambda: [0, 0.0])  # (thread, name) -> calls, self ms
     for ti, (tname, tid) in enumerate(cap.threads):
         stats, events = build_tree(cap.zones[ti], cap.sites, span)
+        zone_frames = collections.defaultdict(lambda: collections.defaultdict(float))
         for start, end, path in events:
+            if not fr.items:
+                zone_frames[None][path] += end - start
             i = max(fr.index_at(start), 0)
             while i + 1 < len(fr.starts) and fr.starts[i] < end:
                 overlap = min(end, fr.starts[i + 1]) - max(start, fr.starts[i])
                 if overlap > 0:
-                    per_frame_self[i][(tname, '/'.join(path))] += overlap
+                    zone_frames[i][path] += overlap
                 i += 1
         accs = [a for a in cap.acc[ti] if a[0] in wanted] if fr.items or first is not None or last is not None else cap.acc[ti]
         at = acc_tree(accs, cap.sites)
-        aself = self_times(at)
+        acc_frames = collections.defaultdict(list)
+        for record in accs:
+            acc_frames[frame_indices.get(record[0])].append(record)
+        aself = collections.defaultdict(float)
+        for i, records in acc_frames.items():
+            frame_self = self_times(acc_tree(records, cap.sites))
+            for p, ms in frame_self.items():
+                aself[p] += ms
+            # ACC has no intervals or parent links. Estimate its enclosing work from this thread/frame's
+            # non-wait zone self time, proportionally and without allowing negative zone self time.
+            zones = zone_frames[i]
+            available = sum(ms for p, ms in zones.items() if p[-1] not in WAIT_ZONES)
+            fraction = min(sum(frame_self.values()) / available, 1.0) if available else 0.0
+            for p, ms in zones.items():
+                if p[-1] in WAIT_ZONES:
+                    continue
+                removed = ms * fraction
+                zones[p] = max(ms - removed, 0.0)
+                stats[p][2] = max(stats[p][2] - removed, 0.0)
+        for i, zones in zone_frames.items():
+            if i is not None:
+                for p, ms in zones.items():
+                    per_frame_self[i][(tname, '/'.join(p))] += ms
         for p, selfms in aself.items():
             top[(tname, p)][0] += at[p][0]
             top[(tname, p)][1] += selfms

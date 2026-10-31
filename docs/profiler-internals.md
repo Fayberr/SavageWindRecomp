@@ -87,6 +87,12 @@ reports no work. Counts include every operation that touches the window; times a
 
 Accumulators are totals per thread and per observed frame. Their individual intervals are not stored, so they are not
 split across frames. Scopes still open at stop are discarded rather than invented.
+Accumulator self time subtracts direct children in the slash-separated hierarchy within each thread and frame.
+To avoid counting accumulated work again as zone self time, its total is deducted proportionally from non-wait zone
+self time on that same thread and frame, capped at the available zone time. Inclusive zone times are unchanged.
+This is an estimate: ACC records carry neither intervals nor parent links, so unrelated zones sharing the frame can
+lose self time too, and accumulator work beyond the recorded zone coverage remains separate. Wait zone self time is
+preserved. Without complete frame boundaries the same estimate applies to the whole capture.
 
 ## Tests
 

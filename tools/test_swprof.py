@@ -126,6 +126,43 @@ class SwprofTest(unittest.TestCase):
         top = {(t['thread'], t['name']): t['self_ms_per_frame'] for t in res['top_self']}
         self.assertAlmostEqual(top[('render', 'exec/pre')], 1.5, delta=0.01)
 
+    def accumulator_capture(self):
+        sites = {1: 'backend_execute', 2: 'exec', 3: 'exec/pre', 4: 'draw', 5: 'other thread'}
+        recs = [(0, i * 10 * TPM, 0, 40 + i, 0, swprof.FRAME) for i in range(3)]
+        recs += [(0, 0, 10 * TPM, 0, 1, swprof.ZONE),
+                 (0, 10 * TPM, 20 * TPM, 0, 1, swprof.ZONE),
+                 (1, 0, 20 * TPM, 0, 5, swprof.ZONE),
+                 # Flush timestamps deliberately lie in a later frame: ACC.val owns attribution.
+                 (0, 20 * TPM, 4 * TPM, 40, 2, swprof.ACC | (2 << 8)),
+                 (0, 20 * TPM, 1 * TPM, 40, 3, swprof.ACC | (2 << 8)),
+                 (0, 20 * TPM, 6 * TPM, 40, 4, swprof.ACC | (3 << 8)),
+                 (0, 20 * TPM, 2 * TPM, 41, 2, swprof.ACC | (1 << 8)),
+                 (0, 20 * TPM, 3 * TPM, 41, 4, swprof.ACC | (1 << 8))]
+        with open(self.path, 'wb') as fh:
+            fh.write(build(sites, ['render', 'worker'], recs))
+        return swprof.Capture(self.path)
+
+    def test_accumulator_work_is_removed_from_zone_self_time_per_thread_and_frame(self):
+        cap = self.accumulator_capture()
+        res = swprof.analyse(cap)
+        render = res['threads'][0]
+        self.assertAlmostEqual(render['zones'][0]['incl_ms'], 10)
+        self.assertAlmostEqual(render['zones'][0]['self_ms'], 2.5)
+        top = {(r['thread'], r['name']): r['self_ms_per_frame'] for r in res['top_self']}
+        self.assertAlmostEqual(sum(v for (t, _), v in top.items() if t == 'render'), 10)
+        self.assertAlmostEqual(top[('worker', 'other thread')], 10)
+        self.assertAlmostEqual(res['_per_frame_self'][0][('render', 'backend_execute')], 0)
+        self.assertAlmostEqual(res['_per_frame_self'][1][('render', 'backend_execute')], 5)
+        selected = swprof.analyse(cap, 41, 41)
+        self.assertAlmostEqual(selected['threads'][0]['zones'][0]['self_ms'], 5)
+
+    def test_accumulator_deduction_is_capped_at_zone_self_time(self):
+        cap = self.accumulator_capture()
+        cap.acc[0].append((40, 4, 1, 20))
+        res = swprof.analyse(cap, 40, 40)
+        self.assertEqual(res['threads'][0]['zones'][0]['self_ms'], 0)
+        self.assertTrue(all(r['self_ms_per_frame'] >= 0 for r in res['top_self']))
+
     def test_gpu(self):
         res = swprof.analyse(swprof.Capture(self.path))
         g = res['gpu']
