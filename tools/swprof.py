@@ -415,6 +415,8 @@ def analyse(cap, first=None, last=None, exe=None):
             frame_self = self_times(acc_tree(records, cap.sites))
             for p, ms in frame_self.items():
                 aself[p] += ms
+                if i is not None:
+                    per_frame_self[i][(tname, p)] += ms
             # ACC has no intervals or parent links. Estimate its enclosing work from this thread/frame's
             # non-wait zone self time, proportionally and without allowing negative zone self time.
             zones = zone_frames[i]

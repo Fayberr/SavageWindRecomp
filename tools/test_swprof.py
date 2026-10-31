@@ -1,5 +1,6 @@
 """Tests of tools/swprof.py on a capture built by hand. `make test-prof` or `python3 -m unittest tools.test_swprof`."""
 import contextlib
+import csv
 import io
 import json
 import os
@@ -162,6 +163,38 @@ class SwprofTest(unittest.TestCase):
         res = swprof.analyse(cap, 40, 40)
         self.assertEqual(res['threads'][0]['zones'][0]['self_ms'], 0)
         self.assertTrue(all(r['self_ms_per_frame'] >= 0 for r in res['top_self']))
+
+    def test_accumulator_totals_reach_frame_attribution_and_csv(self):
+        cap = self.accumulator_capture()
+        res = swprof.analyse(cap)
+        per = res['_per_frame_self']
+        for i, expected in enumerate(((3, 1, 6), (2, 0, 3))):
+            for name, ms in zip(('exec', 'exec/pre', 'draw'), expected):
+                self.assertAlmostEqual(per[i].get(('render', name), 0), ms)
+            self.assertAlmostEqual(sum(ms for (t, _), ms in per[i].items() if t == 'render'), 10)
+        slow = next(r for r in res['slow_frames'] if r['frame'] == 40)
+        self.assertEqual(slow['top'][1], {'thread': 'render', 'name': 'draw', 'ms': 6})
+        path = os.path.join(self.dir.name, 'acc.csv')
+        swprof.write_csv(res, path)
+        with open(path) as fh:
+            rows = list(csv.DictReader(fh))
+        self.assertEqual([r['render:draw'] for r in rows], ['6.000', '3.000'])
+        self.assertEqual([r['render:exec/pre'] for r in rows], ['1.000', '0.000'])
+        selected = swprof.analyse(cap, 41, 41)
+        swprof.write_csv(selected, path)
+        with open(path) as fh:
+            rows = list(csv.DictReader(fh))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]['frame'], rows[0]['render:draw']), ('41', '3.000'))
+
+    def test_accumulator_without_zones_reaches_csv(self):
+        res = swprof.analyse(swprof.Capture(self.path))
+        path = os.path.join(self.dir.name, 'acc-only.csv')
+        swprof.write_csv(res, path)
+        with open(path) as fh:
+            rows = list(csv.DictReader(fh))
+        self.assertEqual([r['render:exec/pre'] for r in rows], ['1.500'] * 10)
+        self.assertEqual([r['render:exec'] for r in rows], ['0.500'] * 10)
 
     def test_gpu(self):
         res = swprof.analyse(swprof.Capture(self.path))

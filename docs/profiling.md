@@ -60,6 +60,8 @@ are clipped. Accumulators are assigned to the frame observed by that thread; the
 Their self time is deducted proportionally from non-wait zone self time on the same thread and frame, up to the
 available zone time. This prevents duplicate self-time totals, but the missing ACC intervals mean the enclosing zone
 cannot be identified exactly; unrelated zones in that frame can also be reduced. Zone inclusive time is unchanged.
+Accumulator self totals also appear in slow-frame causes and CSV cells, assigned by the frame number in each ACC
+record rather than its later flush timestamp. Slash-separated accumulator children are subtracted within that frame.
 
 The recompiled game code is deliberately one total. The tool never looks up or prints a game function, and the
 sampler section ends with a reminder: do not put game addresses, game names or generated code into pull requests or
