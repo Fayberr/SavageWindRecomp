@@ -139,6 +139,8 @@ void gpu_lock(void) { pthread_once(&gpu_mutex_once, gpu_mutex_init); pthread_mut
 void gpu_unlock(void) { pthread_mutex_unlock(&gpu_mutex); }
 
 static void readbacks_apply(void);
+static void hc_cpu_wrote(uint64_t addr, uint64_t size);
+static bool hc_all_stale;  // a shader stored to guest memory where gw_note could not tell: the next list copies all geometry
 uint64_t vk_completed_seq(void) {
     uint64_t v = 0;
     vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v);
@@ -1158,6 +1160,7 @@ static void oq_apply(void) {  // (readback_lock held) reports whose submission c
         if (logon < 0) logon = getenv("SAVAGEWIND_LOG_OCCLUSION") ? atoi(getenv("SAVAGEWIND_LOG_OCCLUSION")) : 0;
         if (nlog < logon) { nlog++; LOG("[oq] %d queries: %.0f samples -> %llx\n", p->nq, sum, (unsigned long long)p->addr); }
         kernel_watch_write("ReportCounter", p->addr, 16);
+        hc_cpu_wrote(p->addr, 16);
         uint64_t *out = (uint64_t *)(uintptr_t)p->addr;
         out[0] = (uint64_t)(sum + 0.5);
         out[1] = p->ts;
@@ -1176,6 +1179,7 @@ static void readbacks_apply(void) {
             if (r->seq > done) { readbacks[k++] = *r; continue; }
             kernel_watch_write("linear render target", r->addr, r->stride * r->rows);
             vmaInvalidateAllocation(g_vk.vma, r->mem, 0, VK_WHOLE_SIZE);  // (see below)
+            hc_cpu_wrote(r->addr, r->stride * r->rows);
             static int dump = -1;  // (debugging) SAVAGEWIND_DUMP_LINEAR=1: the first copies of each target as raw files
             if (dump < 0) dump = getenv("SAVAGEWIND_DUMP_LINEAR") != NULL;
             if (dump) {
@@ -4461,7 +4465,7 @@ static void gw_note(int stage) {  // a shader of this stage that stores to globa
         ok = gw_add(r.addr, r.addr + r.size);
         n++;
     }
-    if (!ok || !n) { chunk_hold = true; stat_gw_holds++; }
+    if (!ok || !n) { chunk_hold = true; hc_all_stale = true; stat_gw_holds++; }
 }
 
 // A constant buffer bound in place (in the set, in the heap, aligned for a uniform buffer descriptor), or false.
@@ -4507,6 +4511,235 @@ static void gw_check(const uint32_t cbufs[6], bool vertices, uint64_t iaddr, uin
     guest_copy_flush();  // (the list's shared copies may hold what was there before)
 }
 
+// ---- vertices and indices from a copy of the heap in video memory (discrete GPUs, Windows)
+// The imported heap is system memory on a discrete GPU, so every draw fetched its vertices and indices across PCIe.
+// Now they come from a device-local copy of the heap holding the geometry pages: the 4K pages vertex and index
+// fetches read (hc_geo). Before each list, the ones the CPU wrote since (Windows' write watch, plat_written_pages)
+// and the ones fetched for the first time are copied over from the import, on the GPU, ahead of the list's draws.
+// A fetch from pages the copy doesn't hold as they are now reads the import in place, as before, and its pages join
+// the next list's copy. What shaders store to (the gw set) is always read in place; CPU writes during a list
+// (UpdateUniformBuffer, CopyBufferToBuffer, readbacks) take their pages out of the copy until the next one.
+// Write-watch queries cost per call and per page, so they cover only spans around the geometry pages.
+// Off on integrated GPUs (the import is already their memory), outside Windows, without room for the copy in video
+// memory (4 GB besides it), and with SAVAGEWIND_VK_HEAP_COPY=0 (=1: on whatever the room).
+// SAVAGEWIND_VK_HEAP_COPY_LOG=<lists>: what was copied, every that many lists.
+// (Approach from Demetter's fork, savagewind-native-28oct; reimplemented.)
+#define HC_PAGE 4096ull
+#define HC_SPANS 8
+static int hc_state = -1;  // -1: not decided yet, 0: off, 1: on
+static VkBuffer hc_buf;
+static VmaAllocation hc_mem;
+static uint64_t hc_size;          // bytes of the heap it mirrors (gmem_size when made)
+static uint64_t *hc_geo, *hc_ok;  // a bit per page: geometry / held by the copy as it is now
+static size_t hc_words;
+static uint64_t *hc_pages;  // (written pages, plat_written_pages)
+static size_t hc_pages_max;
+static struct { uint64_t lo, hi; } hc_span[HC_SPANS];  // heap offsets the write-watch queries cover
+static int hc_nspans;
+static bool hc_geo_new;  // pages became geometry since the spans were made
+static uint64_t hc_stat_lists, hc_stat_bytes, hc_stat_runs, hc_stat_inplace, hc_stat_mirror, hc_stat_query_ns, hc_stat_written;
+
+static bool hc_on(void) {
+    if (hc_state >= 0) return hc_state;
+    const char *e = getenv("SAVAGEWIND_VK_HEAP_COPY");
+    int force = e ? atoi(e) : -1;
+    uint64_t probe;
+    bool ww = plat_written_pages(HEAP_BASE, HC_PAGE, &probe, 2) >= 0;
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+    uint64_t vram = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+        if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > vram) vram = mp.memoryHeaps[i].size;
+    bool discrete = g_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+    uint64_t heap = kernel_heap_size();
+    hc_state = force == 0 || gmem_mapped || !ww ? 0 : force > 0 ? 1 : discrete && vram >= heap + (4ull << 30);
+    LOG("[vk] heap copy in video memory: %s (%s GPU, %llu MB of video memory, heap %llu MB, write watch %s)\n",
+        hc_state ? "on" : "off", discrete ? "discrete" : "not a discrete", (unsigned long long)(vram >> 20),
+        (unsigned long long)(heap >> 20), ww ? "yes" : "no");
+    return hc_state;
+}
+
+static void hc_free(void) {
+    if (hc_buf) {
+        vk_wait_seq(submit_seq);
+        vk_dyn_forget();  // (a new buffer may get the old handle: nothing recorded may be taken as still bound)
+        setc_gen++;
+        vmaDestroyBuffer(g_vk.vma, hc_buf, hc_mem);
+    }
+    hc_buf = VK_NULL_HANDLE;
+    hc_size = 0;
+    free(hc_geo), free(hc_ok), free(hc_pages);
+    hc_geo = hc_ok = hc_pages = NULL;
+    hc_nspans = 0;
+}
+
+static bool hc_ready(void) {  // the copy, made for the heap as imported now
+    if (!gmem_buf || !hc_on()) return false;
+    if (hc_size == gmem_size) return hc_buf != VK_NULL_HANDLE;
+    hc_free();
+    hc_size = gmem_size;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = gmem_size,
+                             .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+                                  .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
+    if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &hc_buf, &hc_mem, NULL) != VK_SUCCESS) {
+        LOG("[vk] heap copy: no room for %llu MB in video memory, off\n", (unsigned long long)(gmem_size >> 20));
+        hc_buf = VK_NULL_HANDLE;
+        hc_state = 0;
+        return false;
+    }
+    hc_words = (size_t)((gmem_size / HC_PAGE + 63) / 64);
+    hc_geo = calloc(hc_words, 8), hc_ok = calloc(hc_words, 8);
+    hc_pages_max = 65536;
+    hc_pages = malloc(hc_pages_max * sizeof *hc_pages);
+    LOG("[vk] heap copy: %llu MB in video memory\n", (unsigned long long)(gmem_size >> 20));
+    return true;
+}
+
+// [lo, hi) of the heap (offsets) no longer as the copy holds it
+static void hc_stale(uint64_t lo, uint64_t hi) {
+    if (!hc_ok) return;
+    if (hi > hc_size) hi = hc_size;
+    for (uint64_t p = lo / HC_PAGE; p < (hi + HC_PAGE - 1) / HC_PAGE; p++) hc_ok[p >> 6] &= ~(1ull << (p & 63));
+}
+
+// The CPU wrote guest memory during a list (the write watch tells the next list)
+static void hc_cpu_wrote(uint64_t addr, uint64_t size) {
+    if (hc_ok && addr >= HEAP_BASE && addr < HEAP_BASE + hc_size) hc_stale(addr - HEAP_BASE, addr - HEAP_BASE + size);
+}
+
+// The spans the queries cover: runs of geometry words (64 pages, 256 KB) joined across gaps, with the smallest gap
+// that leaves at most HC_SPANS of them
+static void hc_spans_make(void) {
+    for (size_t gap = 1;; gap *= 2) {
+        int n = 0;
+        size_t w = 0;
+        bool over = false;
+        while (w < hc_words) {
+            while (w < hc_words && !hc_geo[w]) w++;
+            if (w == hc_words) break;
+            size_t lo = w, last = w;
+            for (; w < hc_words && w - last <= gap; w++)
+                if (hc_geo[w]) last = w;
+            if (n == HC_SPANS) { over = true; break; }
+            hc_span[n].lo = (uint64_t)lo * 64 * HC_PAGE;
+            hc_span[n].hi = (uint64_t)(last + 1) * 64 * HC_PAGE;
+            if (hc_span[n].hi > hc_size) hc_span[n].hi = hc_size;
+            n++;
+            w = last + 1;
+        }
+        if (!over) { hc_nspans = n; break; }
+    }
+    hc_geo_new = false;
+}
+
+static void hc_copy_flush(VkCommandBuffer *cb, VkBufferCopy *rg, int *nrg) {
+    if (!*nrg) return;
+    if (!*cb) {
+        *cb = vk_upload_cmd();
+        VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,  // (earlier lists' fetches of these pages)
+                               .srcStageMask = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT,
+                               .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT};
+        rec_CmdPipelineBarrier2(*cb, &(VkDependencyInfo){.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                                         .pMemoryBarriers = &mb});
+    }
+    rec_CmdCopyBuffer(*cb, gmem_buf, hc_buf, (uint32_t)*nrg, rg);
+    for (int i = 0; i < *nrg; i++) hc_stat_bytes += rg[i].size;
+    hc_stat_runs += (uint64_t)*nrg;
+    *nrg = 0;
+}
+
+// A list begins: the written geometry pages leave the copy, and every geometry page it doesn't hold is copied over
+// (runs of pages, in the list's upload commands: before its draws)
+static void hc_list_begin(void) {
+    if (!hc_ready()) return;
+    uint64_t t0 = SDL_GetTicksNS();
+    uint64_t b0 = hc_stat_bytes, r0 = hc_stat_runs, w0 = hc_stat_written;  // (the slow-list line below)
+    bool remade = hc_geo_new, all = hc_all_stale;
+    int full = 0;
+    if (hc_geo_new) hc_spans_make();
+    if (hc_all_stale) memset(hc_ok, 0, hc_words * 8), hc_all_stale = false;
+    for (int i = 0; i < hc_nspans; i++) {
+        long n = plat_written_pages(HEAP_BASE + hc_span[i].lo, hc_span[i].hi - hc_span[i].lo, hc_pages, hc_pages_max);
+        if (n < 0) { hc_stale(hc_span[i].lo, hc_span[i].hi); full++; continue; }
+        hc_stat_written += (uint64_t)n;
+        for (long k = 0; k < n; k++) {
+            uint64_t p = (hc_pages[k] - HEAP_BASE) / HC_PAGE;
+            hc_ok[p >> 6] &= ~(1ull << (p & 63));
+        }
+    }
+    uint64_t tq = SDL_GetTicksNS() - t0;
+    hc_stat_query_ns += tq;
+    VkBufferCopy rg[256];
+    int nrg = 0;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    for (size_t w = 0; w < hc_words; w++) {
+        uint64_t need = hc_geo[w] & ~hc_ok[w];
+        hc_ok[w] |= hc_geo[w];
+        for (; need; need &= need - 1) {
+            uint64_t off = ((uint64_t)w * 64 + (uint64_t)__builtin_ctzll(need)) * HC_PAGE;
+            if (nrg && rg[nrg - 1].srcOffset + rg[nrg - 1].size == off) { rg[nrg - 1].size += HC_PAGE; continue; }
+            if (nrg == 256) hc_copy_flush(&cb, rg, &nrg);
+            rg[nrg++] = (VkBufferCopy){off, off, HC_PAGE};
+        }
+    }
+    hc_copy_flush(&cb, rg, &nrg);
+    if (cb) {
+        VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                               .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               .dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT,
+                               .dstAccessMask = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT};
+        rec_CmdPipelineBarrier2(cb, &(VkDependencyInfo){.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                                        .pMemoryBarriers = &mb});
+    }
+    uint64_t tt = SDL_GetTicksNS() - t0;
+    if (tt > 5000000) {  // a list the copy held up: what it did
+        uint64_t spanned = 0;
+        for (int i = 0; i < hc_nspans; i++) spanned += hc_span[i].hi - hc_span[i].lo;
+        LOG("[vk] heap copy, slow list: %.1f ms (query %.1f ms over %d spans, %.0f MB; %llu pages written, %d spans over the "
+            "page list), %.1f MB copied in %llu runs%s%s\n", tt / 1e6, tq / 1e6, hc_nspans, spanned / 1048576.0,
+            (unsigned long long)(hc_stat_written - w0), full, (hc_stat_bytes - b0) / 1048576.0,
+            (unsigned long long)(hc_stat_runs - r0), remade ? ", spans remade" : "", all ? ", all stale" : "");
+    }
+    static int every = -1;
+    if (every < 0) every = getenv("SAVAGEWIND_VK_HEAP_COPY_LOG") ? atoi(getenv("SAVAGEWIND_VK_HEAP_COPY_LOG")) : 0;
+    if (every > 0 && ++hc_stat_lists >= (uint64_t)every) {
+        size_t geo = 0;
+        for (size_t w = 0; w < hc_words; w++) geo += (size_t)__builtin_popcountll(hc_geo[w]);
+        double f = (double)hc_stat_lists;
+        LOG("[vk] heap copy, a list: %.1f KB copied in %.1f runs, %.0f pages written, query %.3f ms over %d spans; "
+            "fetches %.0f from the copy, %.0f in place; geometry %.1f MB\n", hc_stat_bytes / f / 1024, hc_stat_runs / f,
+            hc_stat_written / f, hc_stat_query_ns / f / 1e6, hc_nspans, hc_stat_mirror / f, hc_stat_inplace / f,
+            geo * HC_PAGE / 1048576.0);
+        hc_stat_lists = hc_stat_bytes = hc_stat_runs = hc_stat_inplace = hc_stat_mirror = hc_stat_query_ns = hc_stat_written = 0;
+    }
+}
+
+// A vertex or index fetch: from the copy if it holds [addr, addr + size) as it is now, else in place from the import
+// (guest_direct), its pages then geometry for the next list's copy. While a storing shader whose stores aren't
+// known holds the list (chunk_hold), in place.
+static bool guest_fetch(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+    if (!guest_direct(addr, size, buf, off)) return false;
+    if (!hc_buf) return true;
+    if (chunk_hold || !size || addr + size > HEAP_BASE + hc_size || gw_overlaps(addr, addr + size)) {
+        hc_stat_inplace++;
+        return true;
+    }
+    uint64_t p0 = (addr - HEAP_BASE) / HC_PAGE, p1 = (addr - HEAP_BASE + size - 1) / HC_PAGE;
+    bool all = true;
+    for (uint64_t w = p0 >> 6; w <= p1 >> 6; w++) {
+        uint64_t m = ~0ull;
+        if (w == p0 >> 6) m &= ~0ull << (p0 & 63);
+        if (w == p1 >> 6) m &= ~0ull >> (63 - (p1 & 63));
+        if ((hc_ok[w] & m) != m) all = false;
+        if ((hc_geo[w] & m) != m) hc_geo[w] |= m, hc_geo_new = true;
+    }
+    if (!all) { hc_stat_inplace++; return true; }
+    hc_stat_mirror++;
+    *buf = hc_buf;
+    return true;
+}
+
 static int g_cs_n;  // (compute program table below)
 
 // In-place reboot (device.c backend_reset; GPU idle): drop what is keyed by guest addresses - programs by code
@@ -4527,6 +4760,7 @@ void vk_exec_reset(void) {
     key_gen++;
     g_cs_n = 0;
     gcopy_gen++;
+    hc_free();  // (before the import goes: the copy mirrors it)
     if (gmem_buf) {
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
         vkFreeMemory(g_vk.dev, gmem_mem, NULL);
@@ -6296,7 +6530,7 @@ have_pipe:
             uint32_t isz = itype == 1 ? 2 : 4;
             itype_vk = itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
             icount = count;
-            if (iaddr % isz == 0 && guest_direct(iaddr, (uint64_t)count * isz, &ib.buf, &ib.off)) {
+            if (iaddr % isz == 0 && guest_fetch(iaddr, (uint64_t)count * isz, &ib.buf, &ib.off)) {
                 scan_src = src; scan_isz = isz; scan_restart = restart;  // max_index only if a stream gets copied
             } else {
                 ib = vk_transient_copy(src, (uint64_t)count * isz + 4, 4);
@@ -6337,7 +6571,7 @@ have_pipe:
             Range v = st.vbuf[s];
             VkBuffer dbuf;
             VkDeviceSize doff;
-            if (v.addr && v.size && guest_direct(v.addr, v.size, &dbuf, &doff)) {
+            if (v.addr && v.size && guest_fetch(v.addr, v.size, &dbuf, &doff)) {
                 if (dc.vbuf[s] != dbuf || dc.voff[s] != doff) {
                     rec_CmdBindVertexBuffers(cb, (uint32_t)s, 1, &dbuf, &doff);
                     dc.vbuf[s] = dbuf; dc.voff[s] = doff;
@@ -6756,6 +6990,7 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     rec_CmdCopyImageToBuffer(cb, srcimg, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
     renderer_flush();  // the CPU may read the result right after the fence
     kernel_watch_write("CopyTextureToBuffer", dst, total);
+    hc_cpu_wrote(dst, total);
     vk_trace_dump(t);
     {
         unsigned k = t2b_next++ & 15;
@@ -8423,6 +8658,7 @@ static void exec_list(uint64_t handle, int depth) {
             // The same bytes again (~1 update in 5 in the open world): the copies over the range stay good.
             if (!memcmp((void *)(uintptr_t)(r->x[0] + r->x[2]), x, r->x[3])) { stat_uub_same++; break; }
             memcpy((void *)(uintptr_t)(r->x[0] + r->x[2]), x, r->x[3]);
+            hc_cpu_wrote(r->x[0] + r->x[2], r->x[3]);
             uub_note(r->x[0] + r->x[2], r->x[0] + r->x[2] + r->x[3]);  // (the shared copies over it are stale now)
             break;
         case CMD_BARRIER:
@@ -8489,6 +8725,7 @@ static void exec_list(uint64_t handle, int depth) {
             renderer_flush();
             kernel_watch_write("CopyBufferToBuffer", r->x[1], r->x[2]);
             memmove((void *)(uintptr_t)r->x[1], (void *)(uintptr_t)r->x[0], r->x[2]);
+            hc_cpu_wrote(r->x[1], r->x[2]);
             guest_copy_flush();
             break;
         default: break;
@@ -8504,6 +8741,7 @@ void backend_execute(uint64_t handle) {
     PROF_T0();
     in_execute = true;
     guest_copy_flush();  // (a new list: the game may have written the memory of the last one's copies since)
+    hc_list_begin();
     exec_list(handle, 0);
     in_execute = false;
     PROF_ADD(prof_exec);
