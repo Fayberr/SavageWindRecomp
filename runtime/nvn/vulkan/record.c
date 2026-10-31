@@ -49,6 +49,7 @@ static uint64_t ring_cap;  // (a power of two)
 static _Atomic uint64_t head;  // (T) published end
 static _Atomic uint64_t tail;  // (R) recorded end
 static uint64_t wpos, published;  // (T) written end, the end last published
+static uint64_t publish_every = PUBLISH_EVERY;
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cv_work = PTHREAD_COND_INITIALIZER, cv_done = PTHREAD_COND_INITIALIZER;
 static _Atomic int asleep;
@@ -123,7 +124,7 @@ static void *push(PktFn fn, size_t args, size_t extra) {
     return h + 1;
 }
 static void commit(void) {
-    if (wpos - published >= PUBLISH_EVERY) publish();
+    if (wpos - published >= publish_every) publish();
 }
 // (the arrays of a packet: after its arguments, 16-aligned)
 #define AL16(n) (((n) + 15) & ~(size_t)15)
@@ -160,6 +161,15 @@ static void *run(void *arg) {
 
 void rec_init(void) {
     if (on >= 0) return;
+    // Experimental: larger batches can save Windows wake calls, but their FPS
+    // benefit depends on the scene. Keep the default's shorter publication delay.
+    const char *kb = getenv("SAVAGEWIND_VK_RECORDER_BATCH_KB");
+    if (kb && *kb) {
+        char *end;
+        unsigned long n = strtoul(kb, &end, 10);
+        if (!*end && n >= 4 && n <= 256) publish_every = (uint64_t)n << 10;
+        else LOG("[vk] recorder batch: use 4 to 256 KiB, keeping 4 KiB\n");
+    }
     prof = getenv("SAVAGEWIND_VK_PROF") != NULL;
     prof_enq = prof && atoi(getenv("SAVAGEWIND_VK_PROF")) != 2;
     const char *e = getenv("SAVAGEWIND_VK_RECORDER");
@@ -191,6 +201,8 @@ void rec_init(void) {
         pthread_attr_destroy(&attr);
     }
     LOG("[vk] recorder thread %s%s\n", on ? "on" : "off", mali && !e ? " (Mali driver)" : "");
+    if (on && publish_every != PUBLISH_EVERY)
+        LOG("[vk] recorder publication batch %llu KiB\n", (unsigned long long)(publish_every >> 10));
 }
 
 // ================================================================== waits
