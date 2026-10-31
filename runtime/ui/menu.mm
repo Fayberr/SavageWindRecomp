@@ -15,6 +15,7 @@
 #include "i18n.h"
 #include "imgui.h"
 #include "option_rows.h"
+#include "saves_tab.h"
 #include "imgui_internal.h"  // (NavCursorVisible)
 #include "osk.h"
 #ifdef __APPLE__
@@ -1164,11 +1165,14 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     Tab tabs[11];
     int ntabs = 0;
     if (prelaunch) tabs[ntabs++] = {"Prelaunch", -1, true};
-    // (ids 2-7 were Link's Awakening tabs; the ids stay: test hooks)
-    static const char *names[] = {"Video", "Audio", "Language", "", "", "", "", "", "Controls", "Quit"};
-    static const int order[] = {8, 0, 1, 2, 9};  // Controls, Video, Audio, Language, Quit
-    for (int i : order)  // (Quit: in game only - the start screen has its own QUIT)
-        if (i != 9 || !prelaunch) tabs[ntabs++] = {names[i], i, true};
+    // (ids 4-7 were Link's Awakening tabs; the ids stay: test hooks)
+    static const char *names[] = {"Video", "Audio", "Language", "Saves", "", "", "", "", "Controls", "Quit"};
+    static const int order[] = {8, 0, 1, 2, 3, 9};  // Controls, Video, Audio, Language, Saves, Quit
+    for (int i : order) {  // (Quit: in game only - the start screen has its own QUIT; Saves: on the start screen only,
+        if (i == 9 && prelaunch) continue;  //  the game must not be running while its saves change)
+        if (i == 3 && !prelaunch) continue;
+        tabs[ntabs++] = {names[i], i, true};
+    }
     int cur = 0;  // g_tab / g_tab_request hold ids
     for (int i = 0; i < ntabs; i++) if (tabs[i].id == g_tab) cur = i;
     if (!tabs[cur].on) cur = 0;
@@ -1246,6 +1250,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 case 0: tab_display(); break;
                 case 1: tab_audio(); break;
                 case 2: tab_language(in_game); break;
+                case 3: saves_tab_draw(); break;
                 case 8: tab_about(); break;
                 case 9: tab_quit(scale, in_game); break;
                 }
