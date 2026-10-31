@@ -647,6 +647,14 @@ static void tab_display(void) {
                        "conversations keep theirs.", false))
             g_settings.fov = fov[cur];
     }
+    {   // Draw distance (runtime/draw_distance.c)
+        static const char *const names[DRAWDIST_COUNT] = {"Original", "Medium", "High"};  // (DRAWDIST_*)
+        int cur = g_settings.draw_distance;
+        if (opt_choice("Draw distance", &cur, names, DRAWDIST_COUNT, DRAWDIST_ORIGINAL,
+                       "How far out grass, trees, rocks, buildings and enemies appear. Higher costs more CPU and GPU time.",
+                       true))
+            g_settings.draw_distance = cur;
+    }
     {   // Frame rate (runtime/hle/framepace.c)
         static const int fps[] = FPS_CHOICES;
         enum { NF = sizeof fps / sizeof fps[0] };

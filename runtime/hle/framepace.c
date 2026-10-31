@@ -349,9 +349,12 @@ void rt_vfr_update(uint64_t vfr) {
 // SAVAGEWIND_SCRIPT_CLOCK=1: SAVAGEWIND_INPUT and SAVAGEWIND_SHOT_AT count 30ths of a second (the console's frames)
 // instead of presented frames, so one script drives the game the same way at any frame rate: each presented frame
 // adds its length x 30, at most 1.5 (a load's long frames count like the console's).
+static double g_script_t;  // (SAVAGEWIND_SCRIPT_CLOCK: the script frames so far)
+uint64_t framepace_script_now(void) { return (uint64_t)g_script_t; }
+
 uint64_t framepace_script_frame(uint64_t presented) {
     static int on = -1;
-    static double t;
+    double t = g_script_t;
     static uint64_t last;
     if (on < 0) on = env_int("SAVAGEWIND_SCRIPT_CLOCK", 0) != 0;
     if (!on) return presented;
@@ -359,6 +362,7 @@ uint64_t framepace_script_frame(uint64_t presented) {
     double units = last ? (now - last) / 1e9 * 30 : 1;
     last = now;
     t += units > 1.5 ? 1.5 : units;
+    g_script_t = t;
     {   // (debug) SAVAGEWIND_DUMP_DATA_AT=<frame>,...: main's .data and .bss -> build/data_<frame>.bin
         static const char *next;
         static int init;
