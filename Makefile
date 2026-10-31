@@ -404,7 +404,7 @@ test-bind-capture: $(B)/test_bind_capture
 
 .PHONY: test-bind-capture
 
-$(B)/test_pc_controls: tests/test_pc_controls.c runtime/hle/input.c runtime/hle/bindings.c runtime/pc_bow.h runtime/settings.h
+$(B)/test_pc_controls: tests/test_pc_controls.c runtime/hle/input.c runtime/hle/bindings.c runtime/settings.h
 	@mkdir -p $(dir $@)
 	$(CC) -O2 -ffunction-sections -fdata-sections -DSDL_STATIC_LIB $(OSFLAGS) $(DEPINC) -Iruntime -isystem third_party -o $@ $< -fuse-ld=lld -Wl,--gc-sections $(if $(filter windows,$(PLATFORM)),-Wl$(comma)--exclude-all-symbols) -lSDL3 -lm
 
@@ -420,10 +420,10 @@ test-pc-controls: $(B)/test_pc_controls $(B)/test_pc_settings $(B)/test_options_
 	$(B)/test_pc_controls
 	$(B)/test_options_pointer
 	@set -e; f=$$(mktemp); trap 'rm -f "$$f"' EXIT; \
-	  env -u SAVAGEWIND_PC_CURSOR -u SAVAGEWIND_PC_BOW $(B)/test_pc_settings "$$f" 1 1; \
-	  env -u SAVAGEWIND_PC_CURSOR -u SAVAGEWIND_PC_BOW $(B)/test_pc_settings "$$f" 0 0; \
-	  SAVAGEWIND_PC_CURSOR=0 SAVAGEWIND_PC_BOW=1 $(B)/test_pc_settings "$$f" 0 1; \
-	  env -u SAVAGEWIND_PC_CURSOR -u SAVAGEWIND_PC_BOW $(B)/test_pc_settings "$$f" 1 0
+	  env -u SAVAGEWIND_PC_CURSOR $(B)/test_pc_settings "$$f" 1; \
+	  env -u SAVAGEWIND_PC_CURSOR $(B)/test_pc_settings "$$f" 0; \
+	  SAVAGEWIND_PC_CURSOR=0 $(B)/test_pc_settings "$$f" 0; \
+	  env -u SAVAGEWIND_PC_CURSOR $(B)/test_pc_settings "$$f" 1
 
 .PHONY: test-pc-controls
 

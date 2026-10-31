@@ -976,8 +976,6 @@ static void tab_about(void) {
     header("Mouse");
     opt_toggle("PC mouse pointer", &g_settings.pc_cursor, true,
                "Point and click in menus and map. Esc pauses/goes back; F2 frees the cursor.");
-    opt_toggle("Mouse bow aiming", &g_settings.pc_bow, true,
-               "Hold right mouse to aim; left click fires. Off: use your normal button bindings.");
     toggle("Mouse camera", &g_settings.mouse_camera);
     hint("The mouse turns the camera. Pointer off: Esc frees it; pointer on: F2 frees it.");
     float sens = roundf(g_settings.mouse_sens * 100);

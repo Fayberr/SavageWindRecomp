@@ -1,4 +1,4 @@
-// Exercise the window-thread cursor policy and game-thread bow transition without opening a window.
+// Exercise the window-thread cursor policy without opening a window.
 // Unrelated guest imports are left out; SDL window operations are replaced below.
 #include <assert.h>
 #include <stdio.h>
@@ -11,25 +11,26 @@
 #include "../runtime/hle/input.c"
 #include "../runtime/hle/bindings.c"
 
-Settings g_settings = {.mouse_camera = true, .pc_cursor = true, .pc_bow = true};
+Settings g_settings = {.mouse_camera = true, .pc_cursor = true};
 static bool pointer_ui, map_pointer, captured, freed, visible = true, relative;
 static int relative_changes, visibility_changes;
-static uint64_t now = 1000000000;
 
 bool pc_cursor_active(void) { return pointer_ui; }
 bool pc_cursor_hide_system(void) { return map_pointer; }
 void pc_cursor_window(SDL_Window *w) { (void)w; }
 bool menu_input_captured(void) { return captured; }
 bool menu_cursor_free(void) { return freed; }
+uint64_t plat_now_ns(void) { return 1000000000; }
 void vibration_update(SDL_Gamepad *p, bool focused) { (void)p; (void)focused; }
 void motion_tilt_held(bool held) { (void)held; }
-uint64_t plat_now_ns(void) { return now; }
 bool SDL_SetWindowRelativeMouseMode(SDL_Window *w, bool on) {
     (void)w; relative = on; relative_changes++; return true;
 }
 bool SDL_CursorVisible(void) { return visible; }
 bool SDL_ShowCursor(void) { visible = true; visibility_changes++; return true; }
 bool SDL_HideCursor(void) { visible = false; visibility_changes++; return true; }
+static bool window_focused = true;
+SDL_WindowFlags SDL_GetWindowFlags(SDL_Window *w) { (void)w; return window_focused ? SDL_WINDOW_INPUT_FOCUS : 0; }
 SDL_MouseButtonFlags SDL_GetMouseState(float *x, float *y) { (void)x; (void)y; return 0; }
 
 // Unrelated game/window entry points must never run in this synthetic test.
@@ -37,7 +38,7 @@ void pc_cursor_frame(void) { abort(); }
 bool framepace_menu_ui(void) { abort(); }
 bool framepace_title_ui(void) { abort(); }
 Cpu *kernel_current_cpu(void) { abort(); }
-bool pc_cursor_event(const SDL_Event *e) { (void)e; abort(); }
+bool pc_cursor_event(const SDL_Event *e) { (void)e; return false; }
 void motion_pad_opened(SDL_Gamepad *p) { (void)p; abort(); }
 void motion_pad_closed(void) { abort(); }
 void motion_sensor_event(const SDL_Event *e) { (void)e; abort(); }
@@ -65,25 +66,27 @@ int main(void) {
     freed = true; update(); assert(visible && !relative);
     freed = false; update(); assert(!visible);
     captured = true; update(); assert(visible);
-    captured = false; win_focused = false; update(); assert(visible);
-    win_focused = true; update(); assert(!visible);
+    captured = false; window_focused = false; update(); assert(visible);
+    window_focused = true; update(); assert(!visible);
     pointer_ui = map_pointer = false; update(); assert(relative && !visible);
     g_settings.mouse_camera = false; update(); assert(!relative && visible);
     changes = visibility_changes; update(); assert(visibility_changes == changes);
     puts("PASS: camera/menu/map transitions, absolute map input, F2, focus, overlay and idle cursor visibility");
 
-    g_settings.pc_bow = true; pc_bow_wanted = true;
-    assert(pc_bow_sample() == (1ull << BTN_ZR));
-    g_settings.pc_bow = false;
-    assert(pc_bow_sample() == ((1ull << BTN_ZR) | (1ull << BTN_B)));
-    now += 130000000;
-    assert(pc_bow_sample() == (1ull << BTN_B));
-    now += 70000000;
-    assert(pc_bow_sample() == 0);
-    g_settings.pc_bow = true;
-    assert(pc_bow_sample() == 0);  // re-enabling must not resume a stale aim
-    pc_bow_wanted = true; assert(pc_bow_sample() == (1ull << BTN_ZR));
-    freed = true;
-    assert(pc_bow_sample() == ((1ull << BTN_ZR) | (1ull << BTN_B)));
-    puts("PASS: disabling bow/F2 cancels before trigger release; re-enable does not resume stale aim");
+    // Right click in play stays the player's binding: shield / lock on (ZL), never a bow draw. F stays the bow (ZR).
+    assert(g_bind_key[BIND_ZL] == BIND_MOUSE + SDL_BUTTON_RIGHT && g_bind_key[BIND_ZR] == SDL_SCANCODE_F);
+    g_settings.mouse_camera = true; pointer_ui = map_pointer = false; update(); assert(relative);
+    SDL_Event ev = {0};
+    ev.type = SDL_EVENT_MOUSE_BUTTON_DOWN; ev.button.button = SDL_BUTTON_RIGHT; input_handle_event(&ev);
+    assert(key_buttons == (1ull << BTN_ZL));
+    ev.button.button = SDL_BUTTON_LEFT; input_handle_event(&ev);  // fire while "aiming" is not special any more
+    assert(key_buttons == ((1ull << BTN_ZL) | (1ull << BTN_Y)));
+    ev.type = SDL_EVENT_MOUSE_BUTTON_UP; input_handle_event(&ev);
+    ev.button.button = SDL_BUTTON_RIGHT; input_handle_event(&ev);
+    assert(key_buttons == 0);
+    ev.type = SDL_EVENT_KEY_DOWN; ev.key.scancode = SDL_SCANCODE_F; input_handle_event(&ev);
+    assert(key_buttons == (1ull << BTN_ZR));
+    ev.type = SDL_EVENT_KEY_UP; input_handle_event(&ev);
+    assert(key_buttons == 0);
+    puts("PASS: right click is still shield / lock on (ZL), F still aims the bow (ZR)");
 }

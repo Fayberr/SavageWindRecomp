@@ -1,15 +1,16 @@
 # PC mouse controls
 
-Mouse pointer controls for menus, inventory, quick equipment and map, and right-mouse bow aiming are enabled by default. Open the executable directly; no custom launcher or environment variables are needed. The native mouse camera already exists upstream and is not reintroduced here. Virtual gyro changes remain separate.
+Mouse pointer controls for menus, inventory, quick equipment and map are enabled by default. Open the executable directly; no custom launcher or environment variables are needed. The native mouse camera already exists upstream and is not reintroduced here. Virtual gyro changes remain separate.
 
 ## Options
 
 In the game's **System > Options > Controls** (also in the configuration UI):
 
 - **PC mouse pointer**: hover/click menus, inventory and map. With it on, **Esc** opens pause or goes back and **F2** frees the cursor. Click once inside the window to take it back; that click is consumed. With it off, Esc retains upstream cursor-release behavior.
-- **Mouse bow aiming**: hold right mouse to draw/aim, then left-click to fire. Off restores normal mouse bindings. Disabling it or freeing the cursor safely cancels an arrow already being drawn.
 
-Changes apply immediately and are saved as `pc_cursor` and `pc_bow` in `savagewind.ini`. Existing files without these keys keep both defaults on. `SAVAGEWIND_PC_CURSOR=0/1` and `SAVAGEWIND_PC_BOW=0/1` are optional startup overrides; the Controls switches can still change their values during that session. Remove the overrides to resume using the saved choices on the next boot.
+The change applies immediately and is saved as `pc_cursor` in `savagewind.ini`. Existing files without this key keep it on. `SAVAGEWIND_PC_CURSOR=0/1` is an optional startup override; the Controls switch can still change the value during that session. Remove the override to resume using the saved choice on the next boot.
+
+Right click keeps its normal binding in play (shield and target lock-on), and the bow stays on its own key (**F** by default). The pointer does not change either.
 
 ## Pointer behavior
 
@@ -31,19 +32,16 @@ The specialized map/inventory adapters target BOTW 1.9.0. Optional generator sit
 
 Updated onto `test` at `4249c88`, retaining upstream changes. The Windows executable builds. Automated coverage includes:
 
-- `make test-pc-controls`: actual host cursor-update transitions (including map entry while relative mode is already off), focus, overlay/F2 policy, safe bow cancellation, number-key defaults, options persistence across boots and startup overrides.
+- `make test-pc-controls`: actual host cursor-update transitions (including map entry while relative mode is already off), focus, overlay/F2 policy, number-key defaults, that right click and F keep their ZL (shield / lock on) and ZR (bow) bindings, options persistence across boots and the startup override.
 - `tests/test_options_pointer.c`: synthetic Options viewport scrolling without d-pad/selection changes, scroll limits, transformed hover rectangles, direct row actions, native focus activation without auto-scrolling, input ownership, disabled pointer behavior and reboot reset. The contributor also checked Options hit detection, wheel scrolling, help text, keyboard/mouse focus transfer and returning from binding subpages in game.
-- `tests/test_bow.c`: draw, shot, redraw and cancellation at 30/60/120 FPS.
 - `tests/test_cursor_math.c`: seven resolutions/aspect ratios, letterboxing, 1,200 pan/zoom samples, time-based WASD/edge navigation.
 - `tools/test_game_sites.py`: 45 checks.
 
-The contributor tested this revision in a separate Windows build based on `test` at `4249c88`, at 1920 x 1080 on an NVIDIA RTX 3080 Ti. The local playable build also contains the separate virtual-gyro contribution; that code is not included in this PR. The executable opens directly, with no launcher script or environment overrides required. The contributor confirmed native Options click actions, viewport wheel scrolling, one shared highlight and help text, keyboard/mouse focus handoff, and returning from long keyboard-binding pages. Earlier gameplay checks covered menus, inventory, quick equipment, bow controls, map navigation and stamps, including 4K. The PC-pointer-only executable also builds and passes the host tests. Steam Deck and broader controller testing remain pending.
+The contributor tested this revision in a separate Windows build based on `test` at `4249c88`, at 1920 x 1080 on an NVIDIA RTX 3080 Ti. The local playable build also contains the separate virtual-gyro contribution; that code is not included in this PR. The executable opens directly, with no launcher script or environment overrides required. The contributor confirmed native Options click actions, viewport wheel scrolling, one shared highlight and help text, keyboard/mouse focus handoff, and returning from long keyboard-binding pages. Earlier gameplay checks covered menus, inventory, quick equipment, map navigation and stamps, including 4K. The PC-pointer-only executable also builds and passes the host tests. Steam Deck and broader controller testing remain pending.
 
 ```sh
 make -j8
 make test-pc-controls
-clang tests/test_bow.c -o build/test_bow
-build/test_bow
 clang tests/test_cursor_math.c -o build/test_cursor_math
 build/test_cursor_math
 python tools/test_game_sites.py
