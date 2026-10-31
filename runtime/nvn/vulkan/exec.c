@@ -161,7 +161,7 @@ void vk_wait_seq(uint64_t seq) {
     uint64_t t0 = SDL_GetTicksNS();
     VkResult r;
     {
-        SW_ACC("gpu_wait");
+        SW_ZONE("gpu_wait");
         r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
     }
     stat_wait_ns += SDL_GetTicksNS() - t0;

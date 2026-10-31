@@ -39,7 +39,7 @@ WAIT_ZONES = {'kernel wait', 'kernel wait (handles)', 'guest sleep', 'gpu_wait',
 # Runtime functions that only wait (for a kernel object, for work, for one of the four cores). A sample whose stack is in
 # the system below one of them is waiting even with no wait zone around it: a wait that began before the capture did has
 # no zone (its stamp was not taken), and some waits have none.
-WAIT_FUNCS = {'kwait', 'block_current', 'guest_sleep', 'queue_wait', 'queue_thread', 'rec_drain', 'core_acquire'}
+WAIT_FUNCS = {'kwait', 'block_current', 'guest_sleep', 'queue_wait', 'queue_thread', 'rec_drain', 'core_acquire', 'vk_wait_seq'}
 COPYRIGHT_NOTE = ('Reminder: the game code is shown as one total on purpose. Do not put game addresses, game names or '
                   'generated code into pull requests or issues.')
 

@@ -84,6 +84,10 @@ slot; dynamic GPU labels format text, intern names under a mutex and may allocat
 behind `-DSW_PROF_DISABLE` if they sit in the hottest loops. This disables the SW_* macros, not direct recorder calls
 or the renderer's manual span markers. Wait zones that should count as waiting in the sampler are
 listed in `WAIT_ZONES` in `tools/swprof.py`.
+The Vulkan semaphore wait is recorded as the `gpu_wait` interval zone so samples inside it count as waiting, including
+Linux's single-PC samples. With runtime symbols and stack samples, `vk_wait_seq` also identifies waits whose zone
+has not completed or began before capture. Older captures containing only a `gpu_wait` accumulator require that
+stack-based fallback; an accumulator cannot locate a wait in time.
 
 ## Platforms
 

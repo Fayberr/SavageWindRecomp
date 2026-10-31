@@ -361,6 +361,30 @@ class SamplerTest(unittest.TestCase):
         self.assertEqual([(r['name'], r['samples']) for r in sp['runtime_waits']], [('kwait', 10)])
         self.assertEqual(sp['runtime_callers_of_driver'], [])
 
+    def test_vulkan_semaphore_wait_found_by_stack_without_a_completed_zone(self):
+        exe = os.path.join(self.dir.name, 'swr')
+        with open(exe, 'wb') as fh:
+            fh.write(b'\x7fELF' + b'\0' * 100)
+        done = mock.Mock(stdout='0000000000000100 T render_frame\n0000000000000200 T vk_wait_seq\n')
+        with mock.patch.object(swprof.shutil, 'which', return_value='/usr/bin/nm'), \
+                mock.patch.object(swprof.subprocess, 'run', return_value=done):
+            res = swprof.analyse(swprof.Capture(self.path), exe=exe)
+        main = next(t for t in res['sampler']['threads'] if t['name'] == 'main')
+        self.assertEqual((main['driver/system'], main['waiting']), (0, 30))
+        self.assertEqual(res['sampler']['runtime_callers_of_driver'], [])
+        self.assertEqual(res['sampler']['runtime_waits'][0]['name'], 'vk_wait_seq')
+        self.assertEqual(res['slow_frames'][0]['samples']['waiting'], 30)
+
+    def test_gpu_wait_zone_classifies_single_pc_samples_without_symbols(self):
+        cap = swprof.Capture(self.path)
+        cap.sites[1] = 'gpu_wait'
+        cap.samples = [(90, 100, 7, [OTHER + 5])]
+        res = swprof.analyse(cap)
+        main = res['sampler']['threads'][0]
+        self.assertEqual((main['driver/system'], main['waiting']), (0, 100))
+        self.assertFalse(res['top_self'])
+        self.assertEqual(res['top_waits'][0]['name'], 'gpu_wait')
+
     def test_symbols(self):
         exe = os.path.join(self.dir.name, 'swr')
         with open(exe, 'wb') as fh:
