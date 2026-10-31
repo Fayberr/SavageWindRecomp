@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef _WIN32
+#define NOUSER
 #include <windows.h>
 #endif
 
