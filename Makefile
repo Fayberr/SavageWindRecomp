@@ -48,7 +48,8 @@ GEN_OBJ  := $(patsubst %.c,$(B)/obj/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $(B)/
 RT_SRC   := $(wildcard runtime/*.c) $(wildcard runtime/hle/*.c) $(wildcard runtime/services/*.c) \
             $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(PLATFORM).c
 RT_HDRS  := $(wildcard runtime/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
-            $(wildcard runtime/nvn/maxwell/*.h) $(wildcard runtime/nvn/vulkan/*.h) $(wildcard runtime/ui/*.h)
+            $(wildcard runtime/nvn/maxwell/*.h) $(wildcard runtime/nvn/vulkan/*.h) $(wildcard runtime/ui/*.h) \
+            $(wildcard runtime/services/*.h)
 UI_SRC   := $(wildcard runtime/ui/*.mm)
 UI_OBJ   := $(patsubst runtime/%.mm,$(B)/rt/%.o,$(UI_SRC))
 IMGUI_OBJ := $(B)/imgui/imgui.o $(B)/imgui/imgui_draw.o $(B)/imgui/imgui_tables.o $(B)/imgui/imgui_widgets.o \
@@ -439,3 +440,14 @@ test-swkbd: $(B)/test_swkbd
 	$(B)/test_swkbd
 
 .PHONY: test-swkbd
+
+# The Wii U / Cemu save importer against tools/botw_save_convert.py: both convert synthetic saves and every output file
+# is compared (no game files needed). With your own: python3 tools/test_save_convert.py --src <profile> --bootup <pack>
+$(B)/test_save_convert: tools/test_save_convert.c runtime/services/save_convert.c runtime/services/save_convert.h runtime/services/archive.c runtime/services/archive.h
+	@mkdir -p $(B)
+	$(CC) -O1 -std=gnu11 -D_FILE_OFFSET_BITS=64 -Iruntime -o $@ tools/test_save_convert.c runtime/services/archive.c
+
+test-save-convert: $(B)/test_save_convert
+	python3 tools/test_save_convert.py --exe $(B)/test_save_convert
+
+.PHONY: test-save-convert
