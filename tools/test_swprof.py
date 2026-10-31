@@ -141,6 +141,48 @@ class SwprofTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             swprof.Capture(bad)
 
+    def crossing_capture(self):
+        recs = [(0, i * TPM, 0, i // 10, 0, swprof.FRAME) for i in range(0, 41, 10)]
+        recs += [(0, 5 * TPM, 35 * TPM, 0, 1, swprof.ZONE),
+                 (0, 12 * TPM, 18 * TPM, 0, 2, swprof.ZONE),
+                 (0, 5 * TPM, 35 * TPM, 30, 3, swprof.GPU)]
+        with open(self.path, 'wb') as f:
+            f.write(build({1: 'outer', 2: 'inner', 3: 'pass'}, ['main'], recs))
+        return swprof.Capture(self.path)
+
+    def test_crossing_zone_is_clipped_to_selected_frames(self):
+        res = swprof.analyse(self.crossing_capture(), 1, 2)
+        zones = {z['path']: z for z in res['threads'][0]['zones']}
+        self.assertAlmostEqual(zones['outer']['incl_ms'], 10)
+        self.assertAlmostEqual(zones['outer']['self_ms'], 7)
+        self.assertAlmostEqual(zones['outer/inner']['self_ms'], 3)
+
+    def test_self_time_is_split_at_frame_and_child_boundaries(self):
+        res = swprof.analyse(self.crossing_capture())
+        rows = res['_per_frame_self']
+        for i, expected in enumerate((5, 4, 10, 5)):
+            self.assertAlmostEqual(rows[i][('main', 'outer')], expected)
+        self.assertAlmostEqual(rows[1][('main', 'outer/inner')], 6)
+
+    def test_crossing_gpu_interval_is_clipped(self):
+        gpu = swprof.analyse(self.crossing_capture(), 1, 2)['gpu']
+        self.assertAlmostEqual(gpu['busy_ms_per_frame'], 10)
+
+    def test_selection_before_a_nested_child(self):
+        res = swprof.analyse(self.crossing_capture(), 0, 0)
+        zones = {z['path']: z for z in res['threads'][0]['zones']}
+        self.assertAlmostEqual(zones['outer']['self_ms'], 5)
+
+    def test_selection_after_a_nested_child(self):
+        res = swprof.analyse(self.crossing_capture(), 3, 3)
+        zones = {z['path']: z for z in res['threads'][0]['zones']}
+        self.assertAlmostEqual(zones['outer']['self_ms'], 5)
+
+    def test_empty_frame_selection_does_not_fall_back_to_whole_capture(self):
+        res = swprof.analyse(self.crossing_capture(), 100, 200)
+        self.assertFalse(res['top_self'])
+        self.assertFalse(res['gpu'].get('rows'))
+
 
 GAME, RUNTIME, OTHER = 0x10000000, 0x20000000, 0x30000000
 MODULES = [(GAME, 0x1000, GAME, swprof.MOD_GAME, 'game.dll'), (RUNTIME, 0x1000, RUNTIME, swprof.MOD_RUNTIME, 'swr.exe'),

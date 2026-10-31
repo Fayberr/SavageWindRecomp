@@ -149,22 +149,37 @@ class Frames:
         return bisect.bisect_right(self.starts, t) - 1
 
 
-def build_tree(zones, names):
+def build_tree(zones, names, span=(-math.inf, math.inf)):
     """zones: (start, end, site) of one thread -> {path tuple: [calls, inclusive ms, self ms, max ms]}; also each
     zone's (start, self, path) for attributing to frames."""
     zones = sorted(zones, key=lambda z: (z[0], -z[1]))
-    stack = []  # [end, path, child ms, start, dur]
+    stack = []  # [end, path, direct child intervals, start]
     stats = {}
     events = []
 
     def close(item):
-        end, path, child, start, dur = item
+        end, path, children, start = item
+        start, end = max(start, span[0]), min(end, span[1])
+        if end <= start:
+            return
+        dur = end - start
+        cursor, own = start, 0.0
+        for a, b in children:
+            a, b = max(a, start), min(b, end)
+            if b <= a:
+                continue
+            if a > cursor:
+                events.append((cursor, a, path))
+                own += a - cursor
+            cursor = max(cursor, b)
+        if cursor < end:
+            events.append((cursor, end, path))
+            own += end - cursor
         s = stats.setdefault(path, [0, 0.0, 0.0, 0.0])
         s[0] += 1
         s[1] += dur
-        s[2] += max(dur - child, 0.0)
+        s[2] += own
         s[3] = max(s[3], dur)
-        events.append((start, max(dur - child, 0.0), path))
 
     for start, end, site in zones:
         while stack and start >= stack[-1][0] - 1e-9:
@@ -172,8 +187,8 @@ def build_tree(zones, names):
         name = names.get(site, '?')
         path = (stack[-1][1] if stack else ()) + (name,)
         if stack:
-            stack[-1][2] += end - start
-        stack.append([end, path, 0.0, start, end - start])
+            stack[-1][2].append((start, end))
+        stack.append([end, path, [], start])
     while stack:
         close(stack.pop())
     return stats, events
@@ -371,18 +386,22 @@ def analyse(cap, first=None, last=None, exe=None):
             'ms_avg': round(total / len(ms), 3), 'ms_p50': round(percentile(ms, 50), 3),
             'ms_p95': round(percentile(ms, 95), 3), 'ms_p99': round(percentile(ms, 99), 3), 'ms_max': round(ms[-1], 3),
             'over_33_ms': sum(1 for v in ms if v > 33.4), 'over_50_ms': sum(1 for v in ms if v > 50)}
-    span = (fr.items[0][2], fr.items[-1][2] + fr.items[-1][3]) if fr.items else (0.0, cap.duration_ms)
+    span = (fr.items[0][2], fr.items[-1][2] + fr.items[-1][3]) if fr.items else \
+        (0.0, 0.0) if first is not None or last is not None else (0.0, cap.duration_ms)
 
     wanted = {it[1] for it in fr.items}
     per_frame_self = collections.defaultdict(lambda: collections.defaultdict(float))  # frame mark index -> key -> ms
     top = collections.defaultdict(lambda: [0, 0.0])  # (thread, name) -> calls, self ms
     for ti, (tname, tid) in enumerate(cap.threads):
-        zones = [z for z in cap.zones[ti] if span[0] <= z[0] < span[1]]
-        stats, events = build_tree(zones, cap.sites)
-        for start, selfms, path in events:
-            i = fr.index_at(start)
-            per_frame_self[i][(tname, '/'.join(path))] += selfms
-        accs = [a for a in cap.acc[ti] if a[0] in wanted] if fr.items else cap.acc[ti]
+        stats, events = build_tree(cap.zones[ti], cap.sites, span)
+        for start, end, path in events:
+            i = max(fr.index_at(start), 0)
+            while i + 1 < len(fr.starts) and fr.starts[i] < end:
+                overlap = min(end, fr.starts[i + 1]) - max(start, fr.starts[i])
+                if overlap > 0:
+                    per_frame_self[i][(tname, '/'.join(path))] += overlap
+                i += 1
+        accs = [a for a in cap.acc[ti] if a[0] in wanted] if fr.items or first is not None or last is not None else cap.acc[ti]
         at = acc_tree(accs, cap.sites)
         aself = self_times(at)
         for p, selfms in aself.items():
@@ -433,18 +452,19 @@ def gpu_summary(cap, fr, span, nframes):
     rows = collections.defaultdict(lambda: [0, 0.0, 0, 0.0])  # name -> rows, ms, draws, longest
     busy = idle = 0.0
     for a, b, site, draws in cap.gpu:
-        if not (span[0] <= a < span[1]):
+        start, end = max(a, span[0]), min(b, span[1])
+        if end <= start:
             continue
         name = cap.sites.get(site, '?')
         r = rows[name]
         r[0] += 1
-        r[1] += b - a
+        r[1] += end - start
         r[2] += draws
-        r[3] = max(r[3], b - a)
+        r[3] = max(r[3], end - start)
         if name == GPU_IDLE:
-            idle += b - a
+            idle += end - start
         else:
-            busy += b - a
+            busy += end - start
     return {'busy_ms_per_frame': round(busy / nframes, 3), 'idle_ms_per_frame': round(idle / nframes, 3),
             'busy_percent': round(100 * busy / (busy + idle), 1) if busy + idle else 0,
             'rows': [{'name': n, 'rows_per_frame': round(v[0] / nframes, 2), 'ms_per_frame': round(v[1] / nframes, 4),

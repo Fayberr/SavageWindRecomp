@@ -43,6 +43,12 @@ static _Atomic int last_device;  // DEVICE_*: what the player used last
 static bool tilt_held;  // the tilt key: the mouse tilts the controller instead of turning the camera
 extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or name entry up (it has the keys / pad)
 
+static bool profiler_key_available(void) {
+    for (int i = 0; i < BIND_KEY_COUNT; i++)
+        if (g_bind_key[i] == SDL_SCANCODE_F6) return false;
+    return !menu_input_captured();
+}
+
 static int held_key(int sc) {
     if (sc > BIND_MOUSE && sc <= BIND_MOUSE_LAST) return mouse_down[sc - BIND_MOUSE];
     return sc > 0 && sc < SDL_SCANCODE_COUNT && (keys_down[sc] || test_keys[sc]);
@@ -350,7 +356,7 @@ void input_handle_event(const SDL_Event *e) {
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP:
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F9 && !e->key.repeat) g_debug_frame_request = 1;
-        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F6 && !e->key.repeat)
+        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F6 && !e->key.repeat && profiler_key_available())
             prof_toggle();  // the profiler: start or stop a capture (runtime/prof.h; the report: tools/swprof.py)
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F12 && !e->key.repeat)
             g_record_frames = !g_record_frames;

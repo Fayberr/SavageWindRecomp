@@ -3,8 +3,8 @@
 // Off (the normal state) a marker costs one load and one branch. A capture is started with prof_start() (the
 // `prof` command, the hotkey, SAVAGEWIND_PROF=<first frame>[:<frames>]) and runs until prof_stop(); then one
 // file, profile/swprof-<time>.swprof, is written on a thread of its own. The recorder is built so that a running
-// capture disturbs the game as little as it can: a cheap cycle counter, one write-only buffer per thread (no locks,
-// no allocation, no formatting), everything else is done afterwards by the tool.
+// capture uses a cheap cycle counter and a private cursor per thread. First use claims a bounded thread slot and
+// registers names; steady-state writes do not allocate or take a mutex. Analysis happens afterwards.
 //
 //   SW_ZONE("name");      the rest of this block, as one event with a start and an end. Zones nest per thread.
 //   SW_ACC("a/b");        like a zone, but the time and the calls are added up per thread and frame and written once a
@@ -40,6 +40,9 @@ void prof_thread_name(const char *name);
 bool prof_command(int argc, char **argv, char *out, size_t n);
 // The last file written ("" before the first), for a command to report.
 const char *prof_last_file(void);
+void prof_shutdown(void);          // stop and wait for the file (normal exit / before a game reboot)
+void prof_gpu_finish_hook(void (*finish)(void));  // backend drains its pending timestamps on the writer thread
+bool prof_gpu_enabled(uint32_t generation);
 
 // ---- markers
 // GPU events are written with prof_put_gpu() from the code that reads the GPU's timestamps (nvn/vulkan/exec.c).
@@ -64,21 +67,18 @@ typedef struct {
     ProfRec *cur, *end;
     ProfAcc *acc;
     uint64_t acc_frame;
-    uint32_t gen, acc_seq, thread;
+    uint32_t gen, acc_seq, thread, busy;
 } ProfCursor;
 
-extern volatile int g_prof_on;
-extern volatile uint32_t g_prof_gen;  // changes with every capture: a thread's cursor from an older one is stale
-extern volatile uint32_t g_prof_seq;  // counts frames: a thread flushes its ACC totals when it sees a new one
-extern __thread ProfCursor t_prof;
+extern int g_prof_on;
+extern uint32_t g_prof_gen;  // accessed atomically, changes with every capture
+extern __thread ProfCursor *t_prof;
 
 uint32_t prof_register(ProfSite *s);
 // A marker named at run time ("pass: 4 color 1920x1080"): the name is copied, the same name gives the same id. Many
 // different names run out of ids; those share one.
 uint32_t prof_site_dyn(const char *name);
 double prof_ticks_per_ns(void);                // the cycle counter's rate, measured since the capture started
-bool prof_slow(ProfCursor *c);                 // a stale or full cursor: get this thread a chunk; false = drop the event
-void prof_acc_flush(ProfCursor *c);            // write the totals of the frame that ended
 
 static inline uint64_t prof_ticks(void) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -93,32 +93,37 @@ static inline uint64_t prof_ticks(void) {
 }
 
 static inline int prof_enabled(void) { return __atomic_load_n(&g_prof_on, __ATOMIC_RELAXED); }
+static inline uint32_t prof_generation(void) { return __atomic_load_n(&g_prof_gen, __ATOMIC_ACQUIRE); }
 
+void prof_put_gen(uint32_t gen, uint32_t kind, uint32_t site, uint64_t t0, uint64_t t1, uint64_t val);
 static inline void prof_put(uint32_t kind, uint32_t site, uint64_t t0, uint64_t t1, uint64_t val) {
-    ProfCursor *c = &t_prof;
-    if (__builtin_expect(c->gen != g_prof_gen || c->cur == c->end, 0))
-        if (!prof_slow(c)) return;
-    ProfRec *r = c->cur++;
-    r->t0 = t0;
-    r->t1 = t1;
-    r->val = val;
-    r->site = site;
-    __atomic_store_n(&r->kind, kind, __ATOMIC_RELEASE);  // last: the reader takes a record once its kind is set
+    prof_put_gen(prof_generation(), kind, site, t0, t1, val);
 }
 
-static inline void prof_put_gpu(uint32_t site, uint64_t t0, uint64_t t1, uint64_t val) { prof_put(PROF_GPU, site, t0, t1, val); }
+static inline void prof_put_gpu(uint32_t gen, uint32_t site, uint64_t t0, uint64_t t1, uint64_t val) {
+    prof_put_gen(gen, PROF_GPU, site, t0, t1, val);
+}
 
-static inline uint32_t prof_site(ProfSite *s) { return s->id ? s->id : prof_register(s); }
+static inline uint32_t prof_site(ProfSite *s) {
+    uint32_t id = __atomic_load_n(&s->id, __ATOMIC_ACQUIRE);
+    return id ? id : prof_register(s);
+}
 
-typedef struct { ProfSite *site; uint64_t t0; } ProfZone;  // t0 0: the capture was off when the block began
+typedef struct { ProfSite *site; uint64_t t0; uint32_t gen; } ProfZone;
+static inline ProfZone prof_zone_begin(ProfSite *s) {
+    uint32_t gen = prof_generation();
+    return (ProfZone){s, prof_ticks(), gen};
+}
 
 static inline void prof_zone_exit(ProfZone *z) {
-    if (z->t0) prof_put(PROF_ZONE, prof_site(z->site), z->t0, prof_ticks(), 0);
+    if (z->t0 && z->gen == prof_generation() && prof_enabled())
+        prof_put_gen(z->gen, PROF_ZONE, prof_site(z->site), z->t0, prof_ticks(), 0);
 }
 
-static inline void prof_acc_add(ProfSite *s, uint64_t ticks);
+void prof_acc_add_gen(uint32_t gen, ProfSite *s, uint64_t ticks);
 static inline void prof_acc_exit(ProfZone *z) {
-    if (z->t0) prof_acc_add(z->site, prof_ticks() - z->t0);
+    if (z->t0 && z->gen == prof_generation() && prof_enabled())
+        prof_acc_add_gen(z->gen, z->site, prof_ticks() - z->t0);
 }
 
 #define PROF_CAT2(a, b) a##b
@@ -132,16 +137,16 @@ static inline void prof_acc_exit(ProfZone *z) {
 #else
 #define SW_ZONE(name) \
     static ProfSite PROF_CAT(prof_site_, __LINE__) = {name, 0}; \
-    __attribute__((cleanup(prof_zone_exit), unused)) ProfZone PROF_CAT(prof_zone_, __LINE__) = { \
-        &PROF_CAT(prof_site_, __LINE__), prof_enabled() ? prof_ticks() : 0}
+    __attribute__((cleanup(prof_zone_exit), unused)) ProfZone PROF_CAT(prof_zone_, __LINE__) = prof_enabled() ? \
+        prof_zone_begin(&PROF_CAT(prof_site_, __LINE__)) : (ProfZone){0}
 #define SW_ACC(name) \
     static ProfSite PROF_CAT(prof_site_, __LINE__) = {name, 0}; \
-    __attribute__((cleanup(prof_acc_exit), unused)) ProfZone PROF_CAT(prof_zone_, __LINE__) = { \
-        &PROF_CAT(prof_site_, __LINE__), prof_enabled() ? prof_ticks() : 0}
+    __attribute__((cleanup(prof_acc_exit), unused)) ProfZone PROF_CAT(prof_zone_, __LINE__) = prof_enabled() ? \
+        prof_zone_begin(&PROF_CAT(prof_site_, __LINE__)) : (ProfZone){0}
 #define SW_TALLY(name) \
     do { \
         static ProfSite prof_ts_ = {name, 0}; \
-        if (prof_enabled()) prof_acc_add(&prof_ts_, 0); \
+        if (prof_enabled()) prof_acc_add_gen(prof_generation(), &prof_ts_, 0); \
     } while (0)
 #define SW_COUNT(name, n) \
     do { \
@@ -156,16 +161,6 @@ struct ProfAcc {
     uint64_t ticks[PROF_MAX_SITES];
     uint32_t calls[PROF_MAX_SITES];
 };
-
-static inline void prof_acc_add(ProfSite *s, uint64_t ticks) {
-    ProfCursor *c = &t_prof;
-    if (__builtin_expect(c->gen != g_prof_gen || !c->acc, 0))
-        if (!prof_slow(c)) return;
-    if (__builtin_expect(c->acc_seq != g_prof_seq, 0)) prof_acc_flush(c);
-    uint32_t id = prof_site(s);
-    c->acc->ticks[id] += ticks;
-    c->acc->calls[id]++;
-}
 
 #ifdef __cplusplus
 }

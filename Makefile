@@ -420,9 +420,14 @@ $(B)/test_prof: tools/test_prof.c runtime/prof.c runtime/sampler.c runtime/prof.
 	$(CC) -O2 -std=gnu11 -Wall -Wextra -Werror $(OSFLAGS) -Iruntime -o $@ tools/test_prof.c runtime/prof.c runtime/sampler.c -lpthread
 
 # (POSIX only: mkdtemp, nanosleep)
-test-prof: $(B)/test_prof
+$(B)/test_prof_lifecycle: tools/test_prof_lifecycle.c runtime/prof.c runtime/sampler.c runtime/prof.h runtime/rt.h
+	@mkdir -p $(B)
+	$(CC) -O2 -std=gnu11 -Wall -Wextra -Werror $(OSFLAGS) -Iruntime -o $@ tools/test_prof_lifecycle.c runtime/prof.c runtime/sampler.c -lpthread
+
+test-prof: $(B)/test_prof $(B)/test_prof_lifecycle
 	$(B)/test_prof
 	python3 -m unittest tools.test_swprof
+	SWPROF_TEST_BIN=$(B)/test_prof_lifecycle python3 -m unittest tools.test_prof_lifecycle
 
 .PHONY: test-prof
 

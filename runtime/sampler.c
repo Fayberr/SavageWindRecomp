@@ -5,8 +5,7 @@
 //
 // Windows: the thread is suspended, its context read and the stack walked with the x64 unwind data (the game library
 //   and the runtime both have it); nothing allocates or locks while a thread is suspended.
-// Linux: a signal (SIGPROF) runs in the thread, which unwinds its own stack with the unwind tables (.eh_frame) and hands
-//   the addresses to this thread. One thread at a time, so there is one slot.
+// Linux: a tagged realtime signal reads the interrupted PC. No unwinding, locks or allocation in its handler.
 // Elsewhere: no samples (the zones and counters of the capture are all there).
 #define _GNU_SOURCE
 #include <stdint.h>
@@ -96,13 +95,16 @@ int prof_sampler_modules(ProfModule *out, int max) {
     // (a game with the video libraries loaded has hundreds of modules: ask for the size first)
     DWORD need = 0;
     K32EnumProcessModules(GetCurrentProcess(), NULL, 0, &need);
-    HMODULE *mods = (HMODULE *)malloc(need + 64 * sizeof(HMODULE));
+    if (need > UINT32_MAX - 64 * sizeof(HMODULE)) return 0;
+    DWORD capacity = need + 64 * sizeof(HMODULE);
+    HMODULE *mods = (HMODULE *)malloc(capacity);
     if (!mods) return 0;
-    if (!K32EnumProcessModules(GetCurrentProcess(), mods, need + 64 * sizeof(HMODULE), &need)) {
+    if (!K32EnumProcessModules(GetCurrentProcess(), mods, capacity, &need)) {
         free(mods);
         return 0;
     }
     int n = 0;
+    if (need > capacity) need = capacity;  // DLLs can be loaded between the size query and this snapshot
     HMODULE exe = GetModuleHandleA(NULL);
     for (DWORD i = 0; i < need / sizeof(HMODULE) && n < max; i++) {
         MODULEINFO mi;
@@ -120,94 +122,101 @@ int prof_sampler_modules(ProfModule *out, int max) {
 
 #elif defined(__linux__)
 #include <link.h>
+#include <errno.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
-#ifdef __GLIBC__
-#include <execinfo.h>
-#endif
 
-// The slot the signal handler fills: the sampler asks one thread at a time and waits for it.
+// Reserve an otherwise unused realtime signal for the process lifetime. Restoring SIG_DFL at capture stop is
+// unsafe: a blocked thread can still have a queued sample. Tagged, expired requests are harmless in this handler.
+// Only the interrupted PC is collected on Linux: backtrace() can lock the loader/allocator from a signal handler.
+#define SAMPLE_SIGNAL (SIGRTMIN + 6)
+static pthread_once_t signal_once = PTHREAD_ONCE_INIT;
+static bool signal_ready;
 static struct {
-    volatile uint32_t asked, answered;  // request numbers
-    pthread_t target;                   // the thread asked
-    volatile uint64_t tid;              // its os thread id, from the handler
-    uint64_t pc[DEPTH + 4];
-    volatile int n;
+    uint32_t state;  // request id, high bit set while the handler owns the slot; zero means free
+    uint32_t answered;
+    uint64_t tid, pc, ticks;
 } g_slot;
+static uint32_t request_id;
+_Static_assert(__atomic_always_lock_free(sizeof(uint32_t), 0), "signal handler needs lock-free request atomics");
 
 static void on_signal(int sig, siginfo_t *si, void *uc_) {
-    (void)sig; (void)si;
-    uint32_t ask = __atomic_load_n(&g_slot.asked, __ATOMIC_ACQUIRE);
-    if (ask == g_slot.answered || !pthread_equal(g_slot.target, pthread_self())) return;  // (late, or not meant for this thread)
-    g_slot.tid = (uint64_t)syscall(SYS_gettid);
+    (void)sig;
+    if (si->si_code != SI_QUEUE || si->si_pid != getpid()) return;
+    uint32_t req = (uint32_t)si->si_value.sival_int;
+    if (!req || req & 0x80000000u) return;
+    uint32_t expected = req;
+    if (!__atomic_compare_exchange_n(&g_slot.state, &expected, req | 0x80000000u, false,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    int saved_errno = errno;
     ucontext_t *uc = uc_;
-    uint64_t pc0 = 0;
+    uint64_t pc = 0;
 #if defined(__x86_64__)
-    pc0 = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+    pc = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
 #elif defined(__aarch64__)
-    pc0 = (uint64_t)uc->uc_mcontext.pc;
+    pc = (uint64_t)uc->uc_mcontext.pc;
 #endif
     (void)uc;
-    int n = 0;
-    uint64_t *out = g_slot.pc;
-    if (pc0) out[n++] = pc0;
-#ifdef __GLIBC__
-    void *bt[DEPTH + 6];
-    int m = backtrace(bt, DEPTH + 6);
-    // the frames above the interrupted one are this handler and the signal return; start after the frame at the
-    // interrupted pc when it is there, else after those two
-    int from = 2;
-    for (int k = 0; k < m && k < 5; k++)
-        if (pc0 && (uint64_t)(uintptr_t)bt[k] == pc0) { from = k + 1; break; }
-    for (int k = from; k < m && n < DEPTH; k++) out[n++] = (uint64_t)(uintptr_t)bt[k];
-#endif
-    g_slot.n = n;
-    __atomic_store_n(&g_slot.answered, ask, __ATOMIC_RELEASE);
+    g_slot.pc = pc;
+    g_slot.tid = (uint64_t)syscall(SYS_gettid);
+    g_slot.ticks = prof_ticks();
+    __atomic_store_n(&g_slot.answered, req, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_slot.state, 0, __ATOMIC_RELEASE);
+    errno = saved_errno;
+}
+
+static void install_signal(void) {
+    struct sigaction old, sa;
+    if (SAMPLE_SIGNAL > SIGRTMAX || sigaction(SAMPLE_SIGNAL, NULL, &old) || old.sa_handler != SIG_DFL) {
+        LOG("[prof] Linux sampler unavailable: realtime signal already in use\n");
+        return;
+    }
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_signal;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    signal_ready = sigaction(SAMPLE_SIGNAL, &sa, NULL) == 0;
 }
 
 static void *sampler_main(void *arg) {
     (void)arg;
     prof_thread_name("sampler");
-#ifdef __GLIBC__
-    void *warm[4];
-    backtrace(warm, 4);  // (the first call loads the unwinder: not in a signal handler)
-#endif
-    struct sigaction sa, old;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_sigaction = on_signal;
-    sa.sa_flags = SA_SIGINFO | SA_RESTART;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGPROF, &sa, &old);
+    pthread_once(&signal_once, install_signal);
+    if (!signal_ready) return NULL;
     pthread_t host[MAX_THREADS];
     uint32_t handle[MAX_THREADS];
     uint64_t entry[MAX_THREADS];
-    uint32_t req = 0;
     for (uint64_t next = plat_now_ns(); __atomic_load_n(&g_running, __ATOMIC_ACQUIRE) && prof_enabled();
          next += (uint64_t)g_interval_us * 1000) {
         int n = kernel_running_threads(host, handle, entry, MAX_THREADS);
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < n && prof_enabled(); i++) {
             if (pthread_equal(host[i], pthread_self())) continue;
-            g_slot.n = 0;
-            g_slot.target = host[i];
-            req++;
-            uint64_t t = prof_ticks();
-            __atomic_store_n(&g_slot.asked, req, __ATOMIC_RELEASE);
-            if (pthread_kill(host[i], SIGPROF) != 0) continue;
-            for (int spin = 0; spin < 250 && __atomic_load_n(&g_slot.answered, __ATOMIC_ACQUIRE) != req; spin++) {
-                struct timespec ts = {0, 20000};
-                nanosleep(&ts, NULL);
+            // Never reuse a request number: an arbitrarily late signal must not match a future request.
+            if (request_id == 0x7fffffffu) return NULL;
+            uint32_t req = ++request_id;
+            __atomic_store_n(&g_slot.state, req, __ATOMIC_RELEASE);
+            union sigval value = {.sival_int = (int)req};
+            if (!pthread_sigqueue(host[i], SAMPLE_SIGNAL, value)) {
+                for (int spin = 0; spin < 250 && __atomic_load_n(&g_slot.state, __ATOMIC_ACQUIRE); spin++) {
+                    struct timespec ts = {0, 20000};
+                    nanosleep(&ts, NULL);
+                }
             }
-            if (g_slot.answered == req && g_slot.n > 0) emit(t, g_slot.tid, handle[i], g_slot.pc, g_slot.n);
+            uint32_t expected = req;
+            __atomic_compare_exchange_n(&g_slot.state, &expected, 0, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+            // A handler that already claimed the request only reads ucontext and writes this slot, never blocks.
+            while (__atomic_load_n(&g_slot.state, __ATOMIC_ACQUIRE)) {}
+            if (__atomic_load_n(&g_slot.answered, __ATOMIC_ACQUIRE) == req && g_slot.pc)
+                emit(g_slot.ticks, g_slot.tid, handle[i], &g_slot.pc, 1);
         }
         uint64_t now = plat_now_ns();
         if (next > now) plat_sleep_until_ns(next);
         else next = now;
     }
-    sigaction(SIGPROF, &old, NULL);
     return NULL;
 }
 
@@ -250,7 +259,7 @@ int prof_sampler_modules(ProfModule *out, int max) { (void)out; (void)max; retur
 void prof_sampler_begin(void) {
     const char *e = getenv("SAVAGEWIND_PROF_SAMPLE");
     long us = e ? atol(e) : 1000;
-    if (us <= 0 || g_running) return;
+    if (us <= 0 || __atomic_load_n(&g_running, __ATOMIC_ACQUIRE)) return;
     if (us < 100) us = 100;
     g_interval_us = (uint32_t)us;
     __atomic_store_n(&g_running, 1, __ATOMIC_RELEASE);
@@ -258,7 +267,7 @@ void prof_sampler_begin(void) {
 }
 
 void prof_sampler_end(void) {
-    if (!g_running) return;
+    if (!__atomic_load_n(&g_running, __ATOMIC_ACQUIRE)) return;
     __atomic_store_n(&g_running, 0, __ATOMIC_RELEASE);
     pthread_join(g_thread, NULL);
 }

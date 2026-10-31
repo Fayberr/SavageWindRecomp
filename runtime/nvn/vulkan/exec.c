@@ -46,8 +46,13 @@ static uint64_t stat_sets, stat_sets_reused;  // descriptor sets asked for / sha
 static uint64_t cum_draws;  // draws so far (vk_pso_wait_needed)
 // The profiler's draw-path timers (runtime/prof.h): stamps taken only while a capture runs, the time between two of them
 // added up per frame under a name ("/" nests it under the one before it in the report)
-#define PZ_NOW() (prof_enabled() ? prof_ticks() : 0)
-#define PZ_SPAN(name, a, b) do { static ProfSite pz_site_ = {name, 0}; if ((a) && (b)) prof_acc_add(&pz_site_, (b) - (a)); } while (0)
+#define PZ_NOW() (prof_enabled() ? prof_zone_begin(NULL) : (ProfZone){0})
+#define PZ_SPAN(name, a, b) do { \
+    static ProfSite pz_site_ = {name, 0}; \
+    ProfZone pz_a_ = (a), pz_b_ = (b); \
+    if (pz_a_.t0 && pz_b_.t0 && pz_a_.gen == pz_b_.gen) \
+        prof_acc_add_gen(pz_a_.gen, &pz_site_, pz_b_.t0 - pz_a_.t0); \
+} while (0)
 
 // Command buffer state draw_ recorded last, so a draw records only what differs (one draw set ~20 pieces of state;
 // the open world has ~5000 draws a frame). dyn_epoch changes with each command buffer begun and wherever other code
@@ -319,7 +324,7 @@ static bool gp_ready(void) {
 
 static void gp_mark(VkCommandBuffer cb, const char *fmt, ...) {
     GpSub *g = &gp_sub[cur_sub];
-    if (!g->started || g->gen != g_prof_gen || !prof_enabled() || g->n >= GPQ - 1) return;
+    if (!g->started || g->gen != prof_generation() || !prof_enabled() || g->n >= GPQ - 1) return;
     char buf[160];
     va_list ap;
     va_start(ap, fmt);
@@ -337,7 +342,7 @@ static void gp_begin(VkCommandBuffer cb) {
     g->n = 0;
     g->started = false;
     if (!prof_enabled() || !gp_ready()) return;
-    g->gen = g_prof_gen;
+    g->gen = prof_generation();
     g->frame = renderer_present_count();
     g->started = true;
     rec_CmdResetQueryPool(cb, gp_qp, (uint32_t)(cur_sub * GPQ), GPQ);
@@ -386,7 +391,7 @@ static uint64_t gp_mask(void) {
 }
 
 static void gp_read(GpSub *g, unsigned si) {
-    if (!prof_enabled() || g->gen != g_prof_gen || !g->n) return;
+    if (!prof_gpu_enabled(g->gen) || !g->n) return;
     static uint64_t t[GPQ + 1];
     if (vkGetQueryPoolResults(g_vk.dev, gp_qp, (uint32_t)(si * GPQ), g->n + 1, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
     double tpn = prof_ticks_per_ns() * g_vk.props.limits.timestampPeriod;  // CPU ticks per GPU tick
@@ -397,10 +402,10 @@ static void gp_read(GpSub *g, unsigned si) {
     if (gp_prev_gen != g->gen) { gp_prev_gen = g->gen; gp_prev_end = 0; }
     static uint32_t idle_site;
     if (!idle_site) idle_site = prof_site_dyn("(gpu idle)");
-    if (gp_prev_end && base > gp_prev_end) prof_put_gpu(idle_site, gp_prev_end, base, g->frame << 32);
+    if (gp_prev_end && base > gp_prev_end) prof_put_gpu(g->gen, idle_site, gp_prev_end, base, g->frame << 32);
     for (uint32_t i = 0; i < g->n; i++) {
         uint64_t a = base + (uint64_t)((double)((t[i] - t[0]) & gp_mask()) * tpn), b = base + (uint64_t)((double)((t[i + 1] - t[0]) & gp_mask()) * tpn);
-        prof_put_gpu(g->site[i], a, b, g->draws[i] | (g->frame << 32));
+        prof_put_gpu(g->gen, g->site[i], a, b, g->draws[i] | (g->frame << 32));
     }
     gp_prev_end = base + (uint64_t)((double)((t[g->n] - t[0]) & gp_mask()) * tpn);
 }
@@ -469,6 +474,15 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
 void renderer_submit(void) {
     gpu_lock();
     vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
+    gpu_unlock();
+}
+
+// Stop admitting new CPU markers first, then close the in-progress submission and retain its delayed results.
+// This runs on the profiler's writer, with the same renderer lock as normal submission and query collection.
+static void gp_finish_capture(void) {
+    gpu_lock();
+    renderer_submit();
+    gp_collect(true);
     gpu_unlock();
 }
 
@@ -969,6 +983,7 @@ static void st_defaults(void) {
 }
 
 void vk_exec_init(void) {
+    prof_gpu_finish_hook(gp_finish_capture);
     no_dyn_cache = getenv("SAVAGEWIND_VK_NO_DYN_CACHE") != NULL;
     st_defaults();
     pso_init();
@@ -1537,7 +1552,7 @@ static void vk_end_pass_at(int line) {
             snprintf(nm, sizeof nm, "pass ended at exec.c:%d", line);
             end_site[line].id = prof_site_dyn(nm);
         }
-        prof_acc_add(&end_site[line], 0);
+        prof_acc_add_gen(prof_generation(), &end_site[line], 0);
     }
     if (!pass_void) rec_CmdEndRendering(vk_cmd());
     in_pass = false;
@@ -5713,7 +5728,7 @@ static void wait_built(_Atomic int *state) {  // (0 building: until built or fai
 }
 
 static void draw_(CmdRec *r, bool indexed) {
-    uint64_t pz0 = PZ_NOW();
+    ProfZone pz0 = PZ_NOW();
     fg_before_draw();
     if (!st.program) { stat_skipped++; return; }
     static int no_key_gen = -1;
@@ -5980,7 +5995,7 @@ static void draw_(CmdRec *r, bool indexed) {
     bool native = topology(mode, &topo, &cls);
     if (!native && mode != 6 && mode != 7 && mode != 9) { stat_skipped++; return; }
 
-    uint64_t pz1 = PZ_NOW();
+    ProfZone pz1 = PZ_NOW();
     PZ_SPAN("exec/draw/pre", pz0, pz1);
     // ---- pipeline
     static struct { uint64_t gen; Prog *pr; uint8_t cls, fb; } km;
@@ -6074,7 +6089,7 @@ have_pipe:
     if (no_dyn_cache) vk_dyn_forget();
     dyn_check();
     if (!DYN_SAME(pipe, pp->pipe)) rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe);
-    uint64_t pz2 = PZ_NOW();
+    ProfZone pz2 = PZ_NOW();
     PZ_SPAN("exec/draw/key", pz1, pz2);
 
     // ---- depth / stencil (dynamic)
@@ -6165,13 +6180,13 @@ have_pipe:
     float tint[8] = {0};  // per-draw tint (translate.c `ltint`): no game-specific highlight sets one yet
     // fragment textures are bound before deciding the viewport (tex_sc / tex_wh), rscale depends on the decision:
     // build the vertex set now and the fragment set after the decision (stage_set fills tex_sc for stage 1).
-    uint64_t pz3 = PZ_NOW();
+    ProfZone pz3 = PZ_NOW();
     PZ_SPAN("exec/draw/dyn", pz2, pz3);
     uint32_t dyn[64];
     int ndyn = 0;
     hud_clip = false;  // (hud_patch, while the vertex stage's constant buffers are bound)
     VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndyn);
-    uint64_t pz4 = PZ_NOW();
+    ProfZone pz4 = PZ_NOW();
     PZ_SPAN("exec/draw/sets", pz3, pz4);
     VkDescriptorImageInfo fii[64];
     sdw_fix.s = 0;
@@ -6207,7 +6222,7 @@ have_pipe:
             vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndyn);
         }
     }
-    uint64_t pz5 = PZ_NOW();
+    ProfZone pz5 = PZ_NOW();
     PZ_SPAN("exec/draw/tex", pz4, pz5);
     if (fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
         // Draws into the swapchain image (see renderer.m): composites fill the window, UI goes in a centred 16:9 box.
@@ -6253,7 +6268,7 @@ have_pipe:
     }
     apply_scissor();
     float rs0[4] = {vp_sx, vp_sy, vp_ox, vp_oy};
-    uint64_t pz6 = PZ_NOW();
+    ProfZone pz6 = PZ_NOW();
     VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn, &ndyn);
     sdw_fix.s = 0, up_fix.sx = 0;
     PZ_SPAN("exec/draw/sets", pz6, PZ_NOW());
@@ -6268,7 +6283,7 @@ have_pipe:
     }
     if (mvec_draw) rec_CmdPushConstants(cb, pr->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, MVEC_PUSH, mvec_pc);
 
-    uint64_t pz7 = PZ_NOW();
+    ProfZone pz7 = PZ_NOW();
     // ---- indices (copied; the largest index bounds the vertex data copied below)
     uint32_t first = 0, count = (uint32_t)r->x[2], inst, base_inst, max_index = 0;
     int32_t base_vertex = 0;
@@ -6402,7 +6417,7 @@ have_pipe:
     if (g_debug_frame) pick_after_draw();
     {   // (the profiler) a draw in the GPU row now open
         GpSub *g = &gp_sub[cur_sub];
-        if (g->started && g->n && g->gen == g_prof_gen) g->draws[g->n - 1]++;
+        if (g->started && g->n && g->gen == prof_generation() && prof_enabled()) g->draws[g->n - 1]++;
     }
 }
 

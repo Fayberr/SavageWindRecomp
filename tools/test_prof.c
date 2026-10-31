@@ -143,6 +143,7 @@ static void wait_idle(void) {
 
 static void run_capture(int frames, Counts *out) {
     pthread_t th[WORKERS];
+    g_nsampled = 0;
     g_rounds = frames;
     pthread_barrier_init(&bar, NULL, WORKERS + 1);
     for (long i = 0; i < WORKERS; i++) pthread_create(&th[i], NULL, worker, (void *)(intptr_t)i);
@@ -190,7 +191,7 @@ int main(void) {
     printf("capture 1: %llu events, %u threads, %u sites: zones %llu, acc %llu (calls %llu), counters %llu, frames %llu\n",
            (unsigned long long)c.records, c.threads, c.sites, (unsigned long long)c.zones, (unsigned long long)c.accs,
            (unsigned long long)c.acc_calls, (unsigned long long)c.counters, (unsigned long long)c.frames);
-    CHECK(c.frames == ROUNDS, "frames %llu", (unsigned long long)c.frames);
+    CHECK(c.frames == ROUNDS + 1, "frames including the closing boundary: %llu", (unsigned long long)c.frames);
     CHECK(c.zones == 2ull * ROUNDS * (WORKERS + 1), "zones %llu", (unsigned long long)c.zones);
     CHECK(c.counters == 1ull * ROUNDS * (WORKERS + 1), "counters %llu", (unsigned long long)c.counters);
     CHECK(c.threads >= WORKERS + 1, "threads %u", c.threads);  // (the sampler thread is one more)
@@ -201,15 +202,14 @@ int main(void) {
           (unsigned long long)c.stack_recs);
     CHECK(c.modules >= 1, "modules %u", c.modules);
 #endif
-    // each work unit calls draw and draw/pre 10 times; the last frame of every thread is flushed only by the next
-    // frame boundary, so all but that one are in the file
-    CHECK(c.acc_calls >= 2ull * 10 * (ROUNDS - 1) * (WORKERS + 1) && c.acc_calls <= 2ull * 10 * ROUNDS * (WORKERS + 1),
+    // Each work unit calls draw and draw/pre 10 times. The writer must preserve the final totals too.
+    CHECK(c.acc_calls == 2ull * 10 * ROUNDS * (WORKERS + 1),
           "acc calls %llu", (unsigned long long)c.acc_calls);
 
     // a second capture works (threads register again) and does not contain the first one's events
     Counts c2;
     run_capture(10, &c2);
-    CHECK(c2.ok && c2.frames == 10 && c2.zones == 2ull * 10 * (WORKERS + 1), "capture 2: frames %llu zones %llu",
+    CHECK(c2.ok && c2.frames == 11 && c2.zones == 2ull * 10 * (WORKERS + 1), "capture 2: frames %llu zones %llu",
           (unsigned long long)c2.frames, (unsigned long long)c2.zones);
 
     // the command: the words a front end hands over
