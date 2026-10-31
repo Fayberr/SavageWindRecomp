@@ -68,13 +68,31 @@ static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// MEM_WRITE_WATCH: Windows keeps which pages were written (plat_written_pages; the Vulkan backend refreshes its copy of
+// the heap's geometry from it). SAVAGEWIND_NO_WRITE_WATCH=1, or a system that refuses it: a plain reservation.
+static bool g_write_watch;
+
 bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
-    void *p = VirtualAlloc((void *)(uintptr_t)lo, hi - lo, MEM_RESERVE, PAGE_READWRITE);
+    void *p = NULL;
+    if (!getenv("SAVAGEWIND_NO_WRITE_WATCH")) {
+        p = VirtualAlloc((void *)(uintptr_t)lo, hi - lo, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE);
+        if (p && p != (void *)(uintptr_t)lo) VirtualFree(p, 0, MEM_RELEASE), p = NULL;
+        g_write_watch = p != NULL;
+    }
+    if (!p) p = VirtualAlloc((void *)(uintptr_t)lo, hi - lo, MEM_RESERVE, PAGE_READWRITE);
     if (p != (void *)(uintptr_t)lo) return false;
     g_lo = lo;
     g_hi = hi;
     AddVectoredExceptionHandler(1, vectored_handler);
     return true;
+}
+
+long plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, size_t max) {
+    if (!g_write_watch || addr < g_lo || addr + size > g_hi || !max) return -1;
+    ULONG_PTR n = max;
+    DWORD gran;
+    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)(uintptr_t)addr, size, (void **)pages, &n, &gran) != 0) return -1;
+    return n >= max ? -1 : (long)n;  // (a full list may have left pages out)
 }
 
 // Decommit everything: the range stays reserved, and pages come back zeroed when committed again (lazily).
