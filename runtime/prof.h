@@ -16,7 +16,7 @@
 //   prof_frame(n);        the presenting thread, once per frame: frame n starts
 //   prof_thread_name(s);  names the calling thread in the report
 //
-// Compile every marker away with -DSW_PROF_DISABLE.
+// Compile the SW_* marker macros away with -DSW_PROF_DISABLE (direct recorder calls remain).
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
