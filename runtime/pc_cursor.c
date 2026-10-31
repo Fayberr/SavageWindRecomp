@@ -22,6 +22,7 @@ static bool frame_press, frame_release, frame_held;
 static unsigned last_press, last_release;
 static uint64_t next_log;
 static bool click_pending;
+static uint64_t activated_node,activated_from;  // the last hover activation, and the focus it replaced
 static uint64_t click_deadline;
 static uint64_t injected_manager;
 static uint32_t saved_action;
@@ -75,7 +76,7 @@ void pc_cursor_frame(void) {
         (framepace_menu_ui() || framepace_title_ui() || *(uint32_t *)(uintptr_t)g_site.pause_state == 4);
     active = enabled() && ui;
     if(!pc_cursor_active()){
-        options_scroll_valid=false;options_screen_active=options_rows_active=0;
+        options_scroll_valid=false;options_screen_active=options_rows_active=0;activated_node=0;
         map_canvas_active=false;map_nav_ns=0;map_view_valid=false;
         held=false;last_press=presses;last_release=releases;wheel=0;click_pending=false;
         gesture_down=map_down=false;map_anchor_active=map_picker_seen=false;
@@ -839,16 +840,23 @@ void rt_pc_cursor_manager(Cpu *c, uint64_t activate, uint64_t bounds) {
         }
         if(dump)dumped_screens[id]=true;
     }
-    if(!hit)return;
+    if(!hit){activated_node=0;return;}
     // The PC hover is drawn this frame; the game's own highlight may still be playing its transition.
     if(hit&&best<1e29f) {
         uint64_t button=LD64(hit+0x18),pane=LD64(button+0x60);
         if(ptr(pane)&&*(float*)(pane+0x50)>40&&*(float*)(pane+0x50)<150)
             set_hover(*(float*)(pane+0x7c),*(float*)(pane+0x8c),*(float*)(pane+0x50)*.5f);
     }
-    if(LD64(control+0x48)!=hit) {
+    uint64_t focus=LD64(control+0x48);
+    // Activating a node plays the select sound. A screen that owns its selection (the Adventure Log quest list) puts the
+    // focus straight back on it, so "focus != hovered node" stays true while the pointer rests: activate once per change
+    // of the highlight (a new node, or the game moving its focus somewhere else), never again for the same one.
+    if(focus==hit)activated_node=0;  // the game kept it, so this screen does not take the focus back
+    bool restored=hit==activated_node&&focus==activated_from&&!click_pending;
+    if(focus!=hit&&!restored) {
         call(c,activate,control,hit,0);
         ST8(hit_screen+0x106,1);
+        activated_node=hit;activated_from=focus;
         if(getenv("SAVAGEWIND_PC_CURSOR_LOG"))LOG("[pc-hover] node %llx point %.1f %.1f\n",hit,point[0],point[1]);
     }
     if(click_pending) {
@@ -863,6 +871,7 @@ RT_ON_RESET(pc_cursor_reset) {
     options_scroll_valid=false;options_scroll=0;options_keyboard=false;options_page_pending=false;pointer_keyboard_input=false;pointer_mouse_events=0;options_keyboard_mouse_events=0;options_screen_active=options_rows_active=0;
     active = false; held = false; frame_press = frame_release = frame_held = false;
     click_pending=false;
+    activated_node=activated_from=0;
     injected_manager=0;
     quick_confirmed=false;confirm_until=hover_until=0;wheel=0;map_down=false;special_frame=UINT64_MAX;
     sampled_frame=UINT64_MAX;gesture_down=gesture_dragged=false;
