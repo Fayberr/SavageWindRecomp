@@ -3,6 +3,12 @@
 // tools/test_input_focus.c -Wl,--gc-sections $(pkg-config --libs sdl3) -lm -o /tmp/test_input_focus
 #include <assert.h>
 #include <stdio.h>
+#include "../runtime/hle.h"
+// PE/COFF retains `used` registration entries. This harness calls the HID reader directly.
+#undef HLE_FUNC
+#define HLE_FUNC(sym, fn) static void fn(Cpu *c)
+#undef RT_ON_RESET
+#define RT_ON_RESET(fn) static void fn(void)
 #include "../runtime/hle/input.c"
 
 Settings g_settings;
@@ -22,6 +28,17 @@ void motion_sensor_event(const SDL_Event *e) { (void)e; sensor_events++; }
 void vibration_update(SDL_Gamepad *p, bool focused) { (void)p; vibrating = focused; }
 uint64_t renderer_present_count(void) { return 0; }
 uint64_t plat_now_ns(void) { return 0; }
+
+// PE linkers also keep exported helpers from input.c. These paths are outside this harness.
+static _Noreturn void unexpected_helper(void) { fputs("unexpected runtime helper\n", stderr); abort(); }
+Cpu *kernel_current_cpu(void) { unexpected_helper(); }
+void watch_arm(void) { unexpected_helper(); }
+int bind_pad_from_name(const char *name) { (void)name; unexpected_helper(); }
+int bind_slot_from_name(const char *name) { (void)name; unexpected_helper(); }
+bool bind_capture_event(const SDL_Event *e) { (void)e; unexpected_helper(); }
+void bind_capture_begin(int dev, int slot) { (void)dev; (void)slot; unexpected_helper(); }
+void bind_reset(int dev) { (void)dev; unexpected_helper(); }
+void motion_script(float p, float r, float ps, float ys) { (void)p; (void)r; (void)ps; (void)ys; unexpected_helper(); }
 
 static void focus(bool on) {
     SDL_Event e = {0};
@@ -83,6 +100,8 @@ int main(void) {
     assert(id);
     SDL_Joystick *joy = SDL_OpenJoystick(id);
     assert(joy);
+    pad = SDL_OpenGamepad(id);  // use the virtual pad even when a physical controller is connected
+    assert(pad);
     for (int i = 0; i < BIND_PAD_COUNT; i++) g_bind_pad[i] = -1;
     g_bind_pad[BIND_A] = SDL_GAMEPAD_BUTTON_EAST;
     g_bind_pad[BIND_ZL] = PADB_LTRIGGER;
