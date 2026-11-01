@@ -460,6 +460,14 @@ void pc_cursor_options_tick(uint64_t screen) {
 }
 
 static void options_click(Cpu *c,uint64_t screen,uint64_t row,unsigned kind,const float box[4]) {
+    if(rt_opt_two_column(row)>=0) {
+        uint64_t button=LD64(row+(kind==1?0x20:0x28));
+        // Same native Decide request used by Options update: +0x38. The button
+        // owns the animation/sound and later invokes its confirmed callback.
+        // Calling row-decide directly here would bypass that native feedback.
+        if(ptr(button)&&ptr(LD64(button)))call(c,LD64(LD64(button)+0x38),button,0,0);
+        return;
+    }
     unsigned action=0;
     if(kind==0) {
         bool want=point[0]<box[0] ? LD8(row+0x54)==0 : point[0]<(box[0]+box[2])*.5f;

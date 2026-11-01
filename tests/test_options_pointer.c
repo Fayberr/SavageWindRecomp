@@ -22,7 +22,7 @@ bool framepace_title_ui(void){return false;}
 uint64_t framepace_script_frame(uint64_t value){return value;}
 void input_pc_escape(bool down){(void)down;abort();}
 void input_pc_map_axes(float out[2]){(void)out;abort();}
-static unsigned actions,refreshes,last_action,scroll_updates,activations,help_updates;
+static unsigned actions,refreshes,last_action,scroll_updates,activations,help_updates,native_decides;
 static uint64_t activated_node;
 static uint64_t quest_screen,quest_widget,quest_control,quest_nodes[2],quest_icons[4];
 static uint64_t quest_master;
@@ -75,6 +75,7 @@ void guest_call(Cpu *cpu,uint64_t address){
         assert(cpu->x[0]==quest_screen+0x178&&cpu->x[1]==0x7001e2f4a8ull);page_changes++;
     }else if(address==0x7000123408ull){abort();} // Native clipping mutates focus; never scan through it.
     else if(address==0x700012340cull){cpu->x[0]=1;}
+    else if(address==0x7000123410ull){native_decides++;}
     else if(address==0x70013f59f8ull){assert(cpu->x[0]==quantity_screen);}
     else abort();
 }
@@ -184,8 +185,10 @@ int main(void) {
     unsigned action_count=actions;
     point[0]=125;assert(!options_row_at(screen,box,&cell));
     point[0]=-100;assert(!options_row_at(screen,box,&cell));
+    uint64_t cell_vt=GUEST_LO+0x1600;
+    ST64(key_button,cell_vt);ST64(cell_vt+0x38,0x7000123410ull);
     point[0]=0;options_click(&cpu,screen,row,1,box);
-    assert(actions==action_count+1&&last_action==0); // choice cell's edge confirms, never changes a value
+    assert(actions==action_count&&native_decides==1); // the native button animates before its confirmed callback
     dual_row=0;ST32(row+0x50,0);
     uint64_t router=GUEST_LO+0x5900,router_vt=GUEST_LO+0x5a00;
     ST64(ui+0x48,router);ST64(router,router_vt);ST64(router_vt+0x28,0x7000123400ull);
