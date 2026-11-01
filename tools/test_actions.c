@@ -141,6 +141,7 @@ static void capture_and_settings(void) {
     assert(!strcmp(act_name(JUMP), "Jump") && !strcmp(bind_input_name(BIND_ACTION + JUMP), "Jump"));
     assert(act_name(ATTACK + 20) == NULL && !strcmp(bind_input_name(BIND_ACTION + 7), "Action"));
     assert(act_hidden(7) && act_hidden(29) && !act_hidden(JUMP) && !act_hidden(13) && !act_hidden(40));
+    for (int i = 0; i < ACT_COUNT; i++) assert(act_hidden(i) || act_name(i));  // every action on the page has a name
     // a second action on the same key
     bind_capture_begin(BIND_DEV_KEY, BIND_ACTION + ATTACK);
     assert(bind_capture_event(&e) && g_act_key[ATTACK] == SDL_SCANCODE_E && g_act_key[JUMP] == SDL_SCANCODE_E);
