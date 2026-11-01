@@ -15,6 +15,36 @@ static unsigned focused_kind, focus_count, help_count;
 static uint64_t focused_row;
 const char *tr(const char *s) { return s; }
 extern "C" {
+// PE resolves unused UI references before discarding their sections. These unrelated
+// services must never be called by this routing test, on either test platform.
+#ifdef _WIN32
+int color_lut_list(void) { abort(); }
+void pc_cursor_options_page_changed(void) { abort(); }
+void pc_cursor_options_tick(uint64_t) { abort(); }
+bool upscaler_available(int) { abort(); }
+bool renderer_gpu_rtx(void) { abort(); }
+void menu_request_window_apply(void) { abort(); }
+int windisplay_list(WinDisplay *) { abort(); }
+int windisplay_target(void) { abort(); }
+void windisplay_set(int) { abort(); }
+int winsize_list(WinSize *, bool) { abort(); }
+WinSize winsize_effective(bool) { abort(); }
+void winsize_name(WinSize, const char *, char *, int) { abort(); }
+WinSize winsize_desktop(void) { abort(); }
+float winsize_refresh_rate(void) { abort(); }
+bool upscale_modes_available(void) { abort(); }
+int color_preset_current(void) { abort(); }
+void color_preset_apply(int) { abort(); }
+const char *color_lut_name(int) { abort(); }
+int color_lut_index(const char *) { abort(); }
+const char *color_lut_id(int) { abort(); }
+int language_text_count(void) { abort(); }
+int language_text_index(void) { abort(); }
+const int g_color_preset_count = 0, g_nvoice_languages = 0;
+const ColorPreset g_color_presets[] = {{}};
+const TextLanguage g_text_languages[] = {{}};
+const VoiceLanguage g_voice_languages[] = {{}};
+#endif
 Cpu *kernel_current_cpu(void) { return &test_cpu; }
 void settings_save(void) {}
 void menu_size_list_open(void) { assert(false); }
