@@ -83,9 +83,10 @@ int bind_pad_from_name(const char *name);
 // ---- Per-action bindings
 // The game asks "is action N held / pressed" through two functions (tools/patches.py _act_query); each action reads one
 // Switch button (a table in the game: several actions share a button). Every action owns an explicit host key and
-// controller binding, initially copied from that button's factory defaults for 1.9.0. Raw Switch rebinds no longer
-// change actions at runtime. Legacy ini raw-button rebinds migrate for action/device pairs without an act_* line.
-// Menus (title, pause, map) use the raw Switch layer. runtime/hle/input.c publishes host state to bindings.c.
+// controller binding, initially copied from that button's factory defaults for 1.9.0. An action differing on either
+// device reads both host bindings directly. A factory-default action leaves the game to answer from its Switch layer,
+// preserving JumpButtonChange and raw Switch injection. Before act_schema = 2, legacy ini raw-button rebinds migrate
+// for action/device pairs without an act_* line. Menus also use the Switch layer. input.c publishes host state.
 #define ACT_COUNT 41
 enum { ACT_FOLLOW = -1, ACT_NONE = -2 };
 extern int16_t g_act_key[ACT_COUNT];  // SDL_Scancode / BIND_MOUSE + button, or ACT_NONE
@@ -110,7 +111,7 @@ void act_publish(uint64_t keys, uint64_t pads);                             // (
 // live = false in the game's menus, with the window unfocused or the overlay up: the Switch layer answers then.
 void act_poll(bool live);
 // The hook: the answer to hold (kind 0) / trigger (kind 1) of action `id` on game pad object `pad`, or -1 = the game
-// answers (a menu or an id out of range). `masks` is the game's mask table.
+// answers (factory defaults, a menu or an id out of range). `masks` is the game's mask table.
 int rt_act_query(int kind, uint64_t pad, uint64_t id, uint64_t lr, uint64_t masks);
 
 // Logging build (SAVAGEWIND_ACTLOG=1): a live list of what the game says is pressed / held, drawn over the game by the menu

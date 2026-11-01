@@ -828,8 +828,8 @@ static void fill_state(Cpu *c) {
         LOG("[input] watching controller object %llx\n", (unsigned long long)(c->x[1] - 8));
     }
     bool menu = (!win_focused && !host_test) || menu_input_captured();  // host controls belong to the focused game window
-    // Actions answer from their own host bindings while the game is being played; in its menus (and with
-    // the window unfocused or the overlay up) the Switch layer answers, so no binding can lock the player out
+    // Customized actions use host bindings during play. Factory-default actions and all queries in menus, with
+    // the window unfocused or the overlay up, use the Switch layer, so no binding can lock the player out.
     act_poll(!menu && !framepace_title_ui() && !framepace_menu_ui());
     uint64_t b = menu ? script_buttons : key_buttons | pad_buttons | escape_buttons | script_buttons;
     b=pc_cursor_buttons(b);

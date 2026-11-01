@@ -33,14 +33,15 @@ static void defaults_are_untouched(void) {
         assert(b >= 0 && act_is_default(id));
         assert(g_act_key[id] == g_bind_key[b] && g_act_pad[id] == g_bind_pad[b]);
         key_down[g_act_key[id]] = 1;
-        assert(act_scan_keys(0, held) >> id & 1);
+        assert(!(act_scan_keys(0, held) >> id & 1));
         key_down[g_act_key[id]] = 0;
-        assert(act_scan_pad(0, 1u << g_act_pad[id]) >> id & 1);
+        assert(!(act_scan_pad(0, 1u << g_act_pad[id]) >> id & 1));
     }
     act_masks(masks);
-    host(0, 0, 0);
+    host(1ull << BIND_X, 1ull << BIND_X, 1u << SDL_GAMEPAD_BUTTON_NORTH);
     act_poll(true);
-    for (int id = 0; id < ACT_COUNT; id++) assert(hold(id) == 0 && trig(id) == 0);
+    for (int id = 0; id < ACT_COUNT; id++) assert(hold(id) == -1 && trig(id) == -1);
+    host(0, 0, 0);
     assert(rt_act_query(0, 0, 41, 0, 0) == -1 && rt_act_query(1, 0, 4000000000ull, 0, 0) == -1);
 }
 
@@ -49,7 +50,7 @@ static void a_bound_action_follows_its_key(void) {
     assert(!act_is_default(JUMP) && act_is_default(ATTACK));
     act_poll(true);
     assert(hold(JUMP) == 0 && trig(JUMP) == 0);
-    assert(hold(ATTACK) == 0);  // other actions keep their explicit defaults
+    assert(hold(ATTACK) == -1);  // factory-default actions leave the game in control
     key_down[SDL_SCANCODE_G] = 1;
     host(0, 0, 0);
     act_poll(true);
@@ -127,9 +128,49 @@ static void the_default_side_keeps_its_factory_binding(void) {
     act_poll(true);
     assert(hold(JUMP) == 0);
     act_set(BIND_DEV_PAD, JUMP, ACT_FOLLOW);
+    assert(!act_is_default(JUMP));  // the changed key still keeps both host sides active
+    host(0, 0, 1u << SDL_GAMEPAD_BUTTON_NORTH);
+    act_poll(true);
+    assert(hold(JUMP) == 1);
     act_set(BIND_DEV_KEY, JUMP, ACT_FOLLOW);
     assert(act_is_default(JUMP));
     host(0, 0, 0);
+    act_poll(true);
+    assert(hold(JUMP) == -1 && trig(JUMP) == -1);
+}
+
+static void a_pad_only_override_uses_both_host_sides(void) {
+    act_set(BIND_DEV_PAD, JUMP, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER);
+    host(1ull << BIND_X, 1ull << BIND_X, 0);
+    act_poll(true);
+    assert(hold(JUMP) == 0);  // custom on one device means raw Switch state is ignored on both
+    key_down[SDL_SCANCODE_SPACE] = 1;
+    host(0, 0, 0);
+    act_poll(true);
+    assert(hold(JUMP) == 1 && trig(JUMP) == 1);  // unchanged keyboard side uses its factory host key
+    key_down[SDL_SCANCODE_SPACE] = 0;
+    host(0, 0, 1u << SDL_GAMEPAD_BUTTON_LEFT_SHOULDER);
+    act_poll(true);
+    assert(hold(JUMP) == 1);
+    bind_reset_slot(BIND_ACTION + JUMP);
+    assert(hold(JUMP) == -1 && trig(JUMP) == -1);
+    act_set(BIND_DEV_PAD, JUMP, ACT_NONE);
+    host(0, 0, 0);
+    act_poll(true);
+    assert(hold(JUMP) == 0);
+    act_reset();
+    act_poll(true);
+    assert(hold(JUMP) == -1 && trig(JUMP) == -1);
+    assert(bind_settings_load("act_key_2", "G"));
+    key_down[SDL_SCANCODE_G] = 1;
+    host(0, 0, 0);
+    act_poll(true);
+    assert(hold(JUMP) == 1 && trig(JUMP) == 1);
+    key_down[SDL_SCANCODE_G] = 0;
+    act_reset();
+    host(0, 0, 0);
+    act_poll(true);
+    assert(hold(JUMP) == -1 && trig(JUMP) == -1);
 }
 
 static void the_switch_button_comes_from_the_game_table(void) {
@@ -244,12 +285,16 @@ static void reset_bindings(void) {
     bind_reset(BIND_DEV_KEY);
     bind_reset(BIND_DEV_PAD);
     act_reset();  // fresh ini load: no explicit act_* lines have been seen yet
+    assert(bind_settings_load("act_schema", "0"));  // simulate a new process loading a legacy file
 }
 
 static void migration_and_independent_defaults(void) {
     reset_bindings();
     char legacy[] = "bind_key_x = H\nbind_pad_x = south\nact_key_11 = G\nact_pad_11 = none\n";
     load_bindings(legacy);
+    host(0, 0, 0);
+    act_poll(true);
+    assert(hold(JUMP) == 0);  // migration refreshed the custom-action gate
     assert(g_bind_key[BIND_X] == SDL_SCANCODE_H && g_bind_pad[BIND_X] == SDL_GAMEPAD_BUTTON_SOUTH);
     assert(g_act_key[JUMP] == SDL_SCANCODE_H && g_act_pad[JUMP] == SDL_GAMEPAD_BUTTON_SOUTH);
     assert(g_act_key[11] == SDL_SCANCODE_G && g_act_pad[11] == ACT_NONE);
@@ -284,11 +329,47 @@ static void migration_and_independent_defaults(void) {
     bind_reset(BIND_DEV_PAD);
     assert(act_is_default(JUMP) && bind_is_default(BIND_DEV_PAD) && bind_is_default(BIND_DEV_KEY));
     char *defaults = save_bindings();
-    assert(!*defaults);
+    assert(!strcmp(defaults, "act_schema = 2\n"));
     free(defaults);
     reset_bindings();
     assert(bind_settings_load("bind_key_x", "none") && g_act_key[JUMP] == ACT_NONE);
     assert(bind_settings_load("bind_pad_x", "none") && g_act_pad[JUMP] == ACT_NONE);
+    reset_bindings();
+}
+
+static void schema_migration_is_one_time(void) {
+    reset_bindings();
+    char legacy[] = "bind_key_x = H\nbind_pad_x = south\n";
+    load_bindings(legacy);
+    assert(g_act_key[JUMP] == SDL_SCANCODE_H && g_act_pad[JUMP] == SDL_GAMEPAD_BUTTON_SOUTH);
+    bind_reset_slot(BIND_ACTION + JUMP);
+    char *saved = save_bindings();
+    assert(!strncmp(saved, "act_schema = 2\n", strlen("act_schema = 2\n")));
+    assert(!strstr(saved, "act_key_2 =") && !strstr(saved, "act_pad_2 ="));
+    assert(strstr(saved, "bind_key_x = H\n") && strstr(saved, "bind_pad_x = south\n"));
+    // Fresh reloads keep Jump at its own defaults and preserve all other migrated values byte for byte.
+    for (int round = 0; round < 2; round++) {
+        char *copy = malloc(strlen(saved) + 1);
+        assert(copy);
+        strcpy(copy, saved);
+        reset_bindings();
+        load_bindings(copy);
+        free(copy);
+        assert(g_act_key[JUMP] == SDL_SCANCODE_SPACE && g_act_pad[JUMP] == SDL_GAMEPAD_BUTTON_NORTH);
+        assert(g_act_key[19] == SDL_SCANCODE_H && g_act_pad[19] == SDL_GAMEPAD_BUTTON_SOUTH);
+        host(0, 0, 0);
+        act_poll(true);
+        assert(hold(JUMP) == -1 && trig(JUMP) == -1 && hold(19) == 0);
+        char *again = save_bindings();
+        assert(!strcmp(saved, again));
+        free(saved);
+        saved = again;
+    }
+    free(saved);
+    // Resetting action defaults within a schema-2 session must not re-enable legacy migration.
+    act_reset();
+    assert(bind_settings_load("bind_key_x", "G") && bind_settings_load("bind_pad_x", "west"));
+    assert(g_act_key[JUMP] == SDL_SCANCODE_SPACE && g_act_pad[JUMP] == SDL_GAMEPAD_BUTTON_NORTH);
     reset_bindings();
 }
 
@@ -384,10 +465,12 @@ int main(void) {
     menus_use_the_switch_layer();
     two_actions_share_a_key();
     the_default_side_keeps_its_factory_binding();
+    a_pad_only_override_uses_both_host_sides();
     capture_and_settings();
     migration_and_independent_defaults();
+    schema_migration_is_one_time();
     host_pad_slots();
     names_and_groups();
-    puts("action bindings: explicit defaults, migration, held / pressed, menus, shared keys, pad capture, contexts, reset and ini passed");
+    puts("action bindings: default fallthrough, custom host bindings, schema migration, held / pressed, menus, shared keys, pad capture, contexts, reset and ini passed");
     return 0;
 }

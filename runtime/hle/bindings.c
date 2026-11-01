@@ -320,8 +320,10 @@ void bind_settings_save(FILE *f) {
 
 // ------------------------------------------------------------------ per-action bindings
 // Each action owns its host defaults, copied from the factory Switch layout. ACT_FOLLOW remains an API reset
-// command for the existing UI, never a stored binding or a live dependency on g_bind_*.
+// command for the existing UI, never a stored binding. Only actions differing from their defaults use host answers.
 int16_t g_act_key[ACT_COUNT], g_act_pad[ACT_COUNT];
+static bool a_schema;  // schema 2 or newer: legacy raw-button migration has already happened
+static _Atomic uint64_t a_custom;  // at least one device differs from its factory action default
 static uint64_t a_explicit_key, a_explicit_pad;  // ini/action edits take precedence over legacy raw-button lines
 
 static const uint32_t *k_masks;  // the game's table: one pad mask (sead::Controller bit) per action
@@ -350,6 +352,13 @@ bool act_is_default(int id) {
         (g_act_key[id] == act_default(BIND_DEV_KEY, id) && g_act_pad[id] == act_default(BIND_DEV_PAD, id));
 }
 
+static void act_refresh(void) {
+    uint64_t custom = 0;
+    for (int id = 0; id < ACT_COUNT; id++)
+        if (!act_is_default(id)) custom |= 1ull << id;
+    a_custom = custom;
+}
+
 void act_set(int dev, int id, int host) {
     if (id < 0 || id >= ACT_COUNT) return;
     if (host < 0 && host != ACT_NONE) host = act_default(dev, id);
@@ -360,6 +369,7 @@ void act_set(int dev, int id, int host) {
         g_act_key[id] = (int16_t)host;
         a_explicit_key |= 1ull << id;
     }
+    act_refresh();
 }
 
 void act_reset(void) {
@@ -368,6 +378,7 @@ void act_reset(void) {
         g_act_pad[i] = (int16_t)act_default(BIND_DEV_PAD, i);
     }
     a_explicit_key = a_explicit_pad = 0;
+    act_refresh();
 }
 
 // Initialized before settings or either Controls page can read the public arrays (also in standalone tests).
@@ -409,12 +420,14 @@ static int act_default(int dev, int id) {
 
 // Applied while reading legacy ini lines, independent of line order and independently for each device.
 static void act_migrate(int dev, int slot) {
+    if (a_schema) return;
     uint64_t explicit = dev == BIND_DEV_PAD ? a_explicit_pad : a_explicit_key;
     int16_t *actions = dev == BIND_DEV_PAD ? g_act_pad : g_act_key;
     int host = dev == BIND_DEV_PAD ? g_bind_pad[slot] : g_bind_key[slot];
     for (int id = 0; id < ACT_COUNT; id++)
         if (!(explicit >> id & 1) && mask_button(k_masks_190[id]) == slot)
             actions[id] = host < 0 || (dev == BIND_DEV_KEY && !host) ? ACT_NONE : (int16_t)host;
+    act_refresh();
 }
 
 int act_switch_button(int id) {
@@ -424,8 +437,9 @@ int act_switch_button(int id) {
 
 uint64_t act_scan_keys(uint64_t key_buttons, int (*held)(int scancode)) {
     (void)key_buttons;  // kept for callers; actions read host inputs, never the live Switch layout
-    uint64_t out = 0;
+    uint64_t out = 0, custom = a_custom;
     for (int id = 0; id < ACT_COUNT; id++) {
+        if (!(custom >> id & 1)) continue;
         int k = g_act_key[id];
         out |= (uint64_t)(k > 0 && held(k)) << id;
     }
@@ -434,8 +448,9 @@ uint64_t act_scan_keys(uint64_t key_buttons, int (*held)(int scancode)) {
 
 uint64_t act_scan_pad(uint64_t pad_buttons, uint32_t host_buttons) {
     (void)pad_buttons;
-    uint64_t out = 0;
+    uint64_t out = 0, custom = a_custom;
     for (int id = 0; id < ACT_COUNT; id++) {
+        if (!(custom >> id & 1)) continue;
         int k = g_act_pad[id];
         out |= (uint64_t)(k >= 0 && k < PADB_HOST_COUNT && (host_buttons >> k & 1)) << id;
     }
@@ -536,12 +551,13 @@ static _Atomic bool a_served;  // a pressed query was answered since the last po
 
 void act_poll(bool live) {
     static bool was_live;
-    uint64_t cur = live ? (a_keys | a_pads) : 0, prev = a_prev;
+    uint64_t custom = a_custom;
+    uint64_t cur = live ? (a_keys | a_pads) & custom : 0, prev = a_prev;
     if (live && !was_live) prev = cur;  // held through a menu closing: not a new press
     uint64_t edge = cur & ~prev;
     // A poll nobody read (no pressed query since the last one) keeps its edge for the next, so a press is never lost
     // however often the game polls compared with how often it updates its pad
-    a_trig = (a_served ? 0 : a_trig) | edge;
+    a_trig = ((a_served ? 0 : a_trig) | edge) & custom;
     a_served = false;
     a_hold = cur;
     a_prev = cur;
@@ -552,7 +568,7 @@ void act_poll(bool live) {
 
 int rt_act_query(int kind, uint64_t pad, uint64_t id, uint64_t lr, uint64_t masks) {
     if (!k_masks && masks) k_masks = (const uint32_t *)(uintptr_t)masks;
-    bool custom = id < ACT_COUNT;
+    bool custom = id < ACT_COUNT && (a_custom >> id & 1);
     if (act_log_on()) act_log_query(kind, pad, (unsigned)id, lr, custom && a_live);
     if (id >= ACT_COUNT || !a_live || !custom) return -1;
     int r;
@@ -568,6 +584,11 @@ int rt_act_query(int kind, uint64_t pad, uint64_t id, uint64_t lr, uint64_t mask
 
 // ---- savagewind.ini: act_key_<id> / act_pad_<id> = <key | button | none>, written only when not the default
 static bool act_settings_load(const char *key, const char *val) {
+    if (!strcmp(key, "act_schema")) {
+        a_schema = atoi(val) >= 2;
+        act_refresh();
+        return true;
+    }
     bool pad = !strncmp(key, "act_pad_", 8), kb = !strncmp(key, "act_key_", 8);
     if (!pad && !kb) return false;
     char *end;
@@ -589,8 +610,8 @@ static bool act_settings_load(const char *key, const char *val) {
 }
 
 static void act_settings_save(FILE *f) {
-    // Differences-only output cannot preserve a factory-default action override of a customized raw button:
-    // its omitted line would migrate on reload. This format conflict needs a persistence decision by the lead.
+    // This must precede every raw bind_* line: missing action lines now mean factory defaults, not migration.
+    fprintf(f, "act_schema = 2\n");
     for (int i = 0; i < ACT_COUNT; i++) {
         int k = g_act_key[i], p = g_act_pad[i];
         if (k != act_default(BIND_DEV_KEY, i)) fprintf(f, "act_key_%d = %s\n", i, k == ACT_NONE ? "none" : bind_key_label(k));

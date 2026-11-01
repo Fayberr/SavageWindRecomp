@@ -2,9 +2,11 @@
 
 Each game action owns one keyboard/mouse binding and one controller binding. Its factory defaults are copied from
 its Switch button's original layout using the fixed 1.9.0 mask table below: Jump starts on Space / North, Interact
-on E / East, and so on. Rebinding a raw Switch button no longer changes actions. Multiple actions may share an input.
-Reset restores each action's factory defaults. `ACT_FOLLOW` remains a reset command accepted by `act_set`; it is no
-longer stored in `g_act_key` or `g_act_pad`. `ACT_NONE` unbinds an action side.
+on E / East, and so on. If either device differs from its factory default, the action reads its own host bindings on
+both devices, independent of raw Switch rebinds. With both devices at factory defaults, the game answers through the
+Switch layer as before, preserving its Jump button change option and raw Switch injection. Multiple actions may share
+an input. Reset restores each action's factory defaults. `ACT_FOLLOW` remains a reset command accepted by `act_set`;
+it is no longer stored in `g_act_key` or `g_act_pad`. `ACT_NONE` unbinds an action side.
 
 Movement and camera directions keep their keyboard-only slots and defaults (W S A D / I K J L). Walk, Tilt and all
 seven gyro slots accept both devices; their new controller sides default to unbound (`-1`). Walk scales its device's
@@ -53,9 +55,10 @@ by these helpers. Use `bind_pad_slot` for controller availability and `bind_is_d
 
 ## savagewind.ini
 
-Only the actions that differ from the default are written:
+The schema marker is written before all action and raw-button bindings, followed by factory-default differences:
 
 ```
+act_schema = 2
 act_key_2 = G
 act_pad_3 = south
 act_pad_9 = none
@@ -63,18 +66,16 @@ act_pad_9 = none
 
 `act_key_<id>` / `act_pad_<id>` take a key or controller button name as `bind_key_*` / `bind_pad_*` do (`none`: no
 binding). `<id>` is the game's action number, 0 to 40. A missing action/device line starts from its factory default;
-when loading a legacy `bind_key_<button>` or `bind_pad_<button>` line, actions reading that button inherit its value
-unless an explicit action line exists on that device. Explicit lines win in either file order. Migration uses the
-fixed 1.9.0 table, never the current game table. Runtime raw-button edits do not perform migration.
+when loading a legacy file without `act_schema = 2`, `bind_key_<button>` and `bind_pad_<button>` lines migrate into
+bindings for actions reading that button unless an explicit action line exists on that device. Explicit lines win
+in either file order. Migration uses the
+fixed 1.9.0 table, never the current game table. On the next save, `act_schema = 2` disables that migration for future
+loads. This preserves omitted factory-default action values even when raw buttons differ. Resetting actions does not
+clear the schema flag. Runtime raw-button edits do not perform migration.
 
 Added controller keys: `bind_pad_walk`, `bind_pad_tilt`, `bind_pad_gyro_up`, `bind_pad_gyro_down`, `bind_pad_gyro_left`,
 `bind_pad_gyro_right`, `bind_pad_gyro_turn_left`, `bind_pad_gyro_turn_right`, `bind_pad_gyro_center`. These and existing
 raw controller bindings accept `none`. All existing keyboard, action and raw-button ini names remain unchanged.
-
-Persistence conflict awaiting a lead decision: differences-only output cannot represent a factory-default action
-that overrides a customized raw button. For example, raw X = H and explicit Jump = Space loads correctly, but saving
-omits Jump's factory-default line, so the next load migrates Jump to H. The current saver retains the requested
-factory-differences-only policy. Preserving that override requires an exception to that policy or migration metadata.
 
 ## How it works
 
@@ -84,20 +85,21 @@ or pressed word, which the game fills from the Switch-style state the runtime ha
 
 `tools/patches.py` `_act_query` puts a call in front of both functions (sites `act_hold`, `act_trig`; the mask table
 is `act_masks`; all three are found by instruction patterns in `tools/game_sites.py`, an optional group like the
-others). `rt_act_query` (runtime/hle/bindings.c) answers every valid action during gameplay and declines in menus,
-when the window is unfocused or the runtime overlay is open, and for invalid action ids.
+others). `rt_act_query` (runtime/hle/bindings.c) answers customized actions during gameplay. It declines for actions
+at factory defaults, in menus, when the window is unfocused or the runtime overlay is open, and for invalid action ids.
+An atomic custom-action mask is refreshed after edits, resets and migration; only those actions are scanned and polled.
 
-An answered action reads host keys/mouse buttons and controller buttons directly, including factory-default actions.
-The main thread publishes which actions each side holds on every key or button event; the game thread freezes that once per
-controller poll (`act_poll`, in `fill_state`), and "pressed" is the edge between two polls. A press nobody asked about
+An answered action reads host keys/mouse buttons and controller buttons directly. A device left at its factory default
+uses that default host input when the other device is customized. The main thread publishes which actions each side
+holds on every key or button event; the game thread freezes that once per controller poll (`act_poll`, in `fill_state`), and "pressed" is the edge between two polls. A press nobody asked about
 before the next poll is kept for the next query, so a short tap is not lost.
 
 ## Known limits
 
-- Host action bindings bypass the game's own **Jump button** option, including factory-default actions. Bind those
-  actions directly. This consequence of explicit defaults needs in-game acceptance.
-- Raw Switch injection (`SAVAGEWIND_INPUT` or a control-endpoint button) does not feed the host action bindings.
-  Action tests and calibration should use host key/controller injection instead.
+- Customized actions bypass the game's own **Jump button** option; bind those actions directly. Factory-default
+  actions retain the game's option.
+- Raw Switch injection (`SAVAGEWIND_INPUT` or a control-endpoint button) reaches factory-default actions through the
+  game, but customized actions require host key/controller injection.
 - The button icons the game draws follow the Switch layer and the controller family, not the per-action bindings.
 - The 13 ids the game never asks about (1, 4, 6, 7, 8, 16, 20 to 24, 29, 30) are not on the page. No id above 40 is used:
   all 175 query sites (157 calls and 18 tail branches, in 91 functions) pass a constant from 0 to 40.
@@ -111,13 +113,14 @@ these bindings (frame numbers must be after the save has loaded). For example:
 SAVAGEWIND_ACTLOG=1 SAVAGEWIND_HOST_INPUT="3000:key:Space:60" SAVAGEWIND_EXIT_AT=5000 <the game's executable>
 ```
 
-The historical `tools/actlog_script.py` emits raw Switch injection for calibrating the game table; it does not drive
-host action bindings in the new model.
+`tools/actlog_script.py` emits raw Switch injection for calibrating the game table with factory-default actions.
+Use host injection for customized actions.
 
 ## Tests
 
 `make test-actions` (no game files): the answers to the hold / pressed queries, menus falling back, two actions on one
-key, all explicit defaults, legacy migration in either order, action and host-slot capture, gyro context swaps,
-reset and ini round trips (`tools/test_actions.c`), and the generated hook (`tools/test_act_site.py`).
+key, factory-default fallthrough, customization on either device, legacy migration in either order, one-time schema
+migration and reload idempotence, action and host-slot capture, gyro context swaps, reset and ini round trips
+(`tools/test_actions.c`), and the generated hook (`tools/test_act_site.py`).
 `make test-pc-controls` also checks Walk scaling, shared key/pad Tilt, mouse routing, sensorless dual-stick eligibility,
 and all gyro directions with menu/focus/context gates. `tools/test_game_sites.py` covers the site patterns.
