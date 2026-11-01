@@ -2,9 +2,10 @@
 
 2026-11-01, BotW 1.9.0. Branches: `fleet/s209` and `spike/two-button-row`.
 
-**Result so far: implemented and Windows-built, not proven on a live Options screen.**
-The native game screen's geometry, focus animations and sound still need Fabian's check.
-An existing `a4-act` game session prevented a second gameplay launch and was left untouched.
+**Result: three rows render two real native buttons side by side in the running game.**
+The hidden Windows probe reached Title > Options > Key bindings without an observed crash.
+Its screenshot shows Interact, Jump and Attack with separate key/pad text and the native highlight.
+Native column navigation and keyboard capture also ran. Sound and physical input acceptance remain open.
 
 ## Implemented
 
@@ -42,8 +43,32 @@ also keep their original redraw. `SAVAGEWIND_TWO_BUTTON_ROWS=0` disables the run
 - Windows release executable, configuration executable and frozen generator build pass.
   This includes the edited `.mm` file. Build log: `X:\.Development\swr-wt\row-spike\build\row-spike-build.log`.
 - `vibe-check runtime/ui/game_options.mm` reports no findings; `git diff --check` passes.
-- Live UI, native hover/confirm sounds, long labels, scrolling, repeated directions, reset/reopen and
-  physical controller input remain unverified. Host tests do not establish these properties.
+
+### Hidden runtime probe, completed 2026-11-01
+
+- Private library setup completed in 602 seconds with `Game files ready. -> READY`.
+  Probe PID 45340 loaded game version 1.9.0 and 103 sites. Its dedicated control port was 58909;
+  the listener's owning PID was checked before sending commands. Physical input and audio were disabled.
+- The existing control API navigated the actual title menu and Options to Key bindings. The page had
+  62 rows. Six `[row-spike]` configuration lines show the two parts on each of the three target rows,
+  with native root x positions changed from 130 to 40/190. The game continued rendering the page.
+- Native cursor-node reads confirmed right selected Interact's ordinary/pad button, down selected
+  Jump's pad button, up returned to Interact's pad button, and left selected its choice/key button.
+  These were real runtime node/button pointers, not host-test expectations.
+- Confirm on the left cell logged `capture slot 256 device key`. Its screenshot shows `Press a key...`
+  only in that cell; the controller cell still shows B. The timeout produced an Interact redraw.
+- Screenshots saved successfully through the control API's `shot` command, under the private install:
+  `two-button-row.png` (1280x720, frame 4961), `two-button-row-left.png` (frame 11652), and
+  `two-button-row-key-capture.png` (frame 11769). The first and capture images were visually inspected.
+- `probe-stderr.log` contains no warning/error/failure/fatal/assertion/crash matches. Stdout is empty;
+  stderr is the useful game log. The last periodic entry is frame 11962, followed by control connection
+  closure near the configured `SAVAGEWIND_EXIT_AT=12000` limit. Exit status was not recorded.
+  PID 45340 was already gone when the explicit stop check ran. Old PID 45452 from `a4-act` remained running.
+
+**Not tested live:** controller capture, assigning a physical key/pad binding, mouse hover/click,
+sounds (audio was disabled), long/localized labels, scrolling, held/repeated directions, reset/reopen
+and the pause-menu entry point. The frame limit ended the probe before the controller-capture step.
+Device filtering and mouse routing have host tests; these do not replace physical/native acceptance.
 
 ## Fabian: launch and inspect
 
@@ -60,16 +85,17 @@ The original action-binding checkout and play folder were not changed.
    Compare highlight and sounds with an unchanged row/page; return and reopen the page.
 5. Logs are in the isolated folder: `play-stderr.log`, `play-stdout.log`, and `play-task.log`.
    `[row-spike]` lines identify configured buttons, selections and capture devices.
-   `-Mode shot` captures the interactive desktop to `row-spike\desktop.png`; no game screenshot is claimed here.
+   The probe screenshots listed above are already available there. `-Mode shot` additionally captures
+   the interactive desktop to `row-spike\desktop.png`; that desktop-capture helper was not exercised.
 
 Build/install/setup scripts are committed under `tools/windows/row-spike-*.ps1`, with copies in
 `C:\Users\derfa`. The setup mode builds only this installation's game code and then exits.
 
 ## Recommendation
 
-**Go with changes, provisionally.** Static structure and host routing support the approach;
-live feasibility is still unproven, so do not roll this out to the full page yet.
-After the native screen passes inspection, allow roughly 2 to 4 focused days for a full page:
+**Go with changes.** The live render and column navigation establish the core two-native-button approach.
+Finish the live input/sound checks and Fabian's visual acceptance before expanding it.
+Allow roughly 2 to 4 focused days for a full page:
 final widths and long labels, disabled controller cells, native navigation/scroll polish and device QA.
 Column headers likely need two added text panes through the existing in-memory Common archive rebuild,
 scoped to P_BINDS, plus space above the list. That remains a feasibility note, outside this spike.
