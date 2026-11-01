@@ -819,7 +819,7 @@ bool two_button_panes(uint64_t root, TwoButtonPanes &p) {
         if (!(p.frames[i] = two_pane(root, frames[i]))) return false;
     return (p.plate = two_pane(root, "W_Base_02")) != 0;
 }
-void two_geometry(const TwoButtonPanes &p, BindingRowColumn col, bool owns_plate) {
+void two_geometry(const TwoButtonPanes &p, BindingRowColumn col) {
     const auto layout = binding_row_layout();
     two_float(p.root, 0x30, col.center());
     two_float(p.root, 0x48, 1.f);
@@ -831,14 +831,12 @@ void two_geometry(const TwoButtonPanes &p, BindingRowColumn col, bool owns_plate
     }
     for (int i = 0; i < 8; i++)
         two_float(p.frames[i], 0x50, col.width + (i == 7 ? layout.glow_extra : 0.f));
-    // Each part carries the 540-wide row plate (W_Base_02). Only the first part keeps it, re-centred on the row
-    // (the part's root moved, so its local x is minus the root's x); the second part's copy is hidden.
-    uint8_t flags = *(uint8_t *)(uintptr_t)(p.plate + 0x58);
-    if (owns_plate) {
-        two_float(p.plate, 0x30, -col.center());
-        two_float(p.plate, 0x50, binding_row_plate_width);
-        wr8(p.plate + 0x58, *(uint8_t *)(uintptr_t)(p.plate + 0x58) | 1u);
-    } else wr8(p.plate + 0x58, flags & ~1u);
+    // Each part carries the 540-wide row plate (W_Base_02), which the game shows only while its own button is the
+    // selected one. Both keep it, re-centred on the row (the part's root moved, so the plate's local x is minus the
+    // root's x): the band then shows whichever of the two buttons is selected.
+    two_float(p.plate, 0x30, -col.center());
+    two_float(p.plate, 0x50, binding_row_plate_width);
+    wr8(p.plate + 0x58, *(uint8_t *)(uintptr_t)(p.plate + 0x58) | 1u);
 }
 void two_header_geometry(const TwoButtonPanes &p, BindingRowColumn col, float scale) {
     two_float(p.root, 0x30, col.center());
@@ -944,7 +942,7 @@ bool two_configure(uint64_t row) {
         wr8(roots[col] + 0x58, *(uint8_t *)(uintptr_t)(roots[col] + 0x58) | 1);
         const auto column = col ? layout.pad : layout.key;
         if (header) two_header_geometry(panes[col], column, hscale);
-        else two_geometry(panes[col], column, col == 0);
+        else two_geometry(panes[col], column);
         fprintf(stderr, "[row-spike] %s %llx column %d button %llx center %.1f width %.1f\n",
                 header ? "header" : "row", (unsigned long long)row, col, (unsigned long long)buttons[col],
                 column.center(), column.width);
@@ -1122,7 +1120,9 @@ extern "C" int rt_opt_two_row_state(uint64_t row) {
     return 1;
 }
 extern "C" int rt_opt_two_redraw(uint64_t row) {
+    long t_in = page_ms();
     if (!two_configure(row)) return 0;
+    long t_cfg = page_ms();
     uint32_t msg = MSG_BASE + (rd32(row + 0x50) - GAME_ENTRIES) * 256;
     for (int col = 0; col < 2; col++) {
         uint64_t layout = rd64(rd64(row + (col ? 0x28 : 0x20)) + 0x20);
@@ -1130,6 +1130,7 @@ extern "C" int rt_opt_two_redraw(uint64_t row) {
         two_text(layout, "T_Text_01", msg + (col ? MSG_PAD : MSG_KEY));
     }
     rt_opt_two_row_state(row);
+    fprintf(stderr, "[row-spike-t] redraw: configure %ld ms, texts %ld ms\n", t_cfg - t_in, page_ms() - t_cfg);
     return 1;
 }
 extern "C" int rt_opt_decide(uint64_t row);

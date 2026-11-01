@@ -71,7 +71,7 @@ int main() {
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
 #endif
     assert(mem == (void *)base);
-    // The key part keeps the native row plate; the pad part hides its copy.
+    // Both parts keep the native row plate, centred on the row.
     const auto geometry = binding_row_layout();
     assert(geometry.label_right < geometry.key.x);
     assert(geometry.key.x + geometry.key.width < geometry.pad.x);
@@ -93,15 +93,16 @@ int main() {
     }
     TwoButtonPanes panes;
     assert(two_button_panes(root, panes));
-    two_geometry(panes, geometry.key, true);
+    two_geometry(panes, geometry.key);
     assert(*(float *)(uintptr_t)(root + 0x48) == 1.f);
     assert(*(float *)(uintptr_t)(panes.texts[0] + 0x48) == 1.f);
     assert(*(uint8_t *)(uintptr_t)(panes.plate + 0x58) & 1);
     assert(*(float *)(uintptr_t)(panes.plate + 0x30) == -geometry.key.center());
     assert(*(float *)(uintptr_t)(panes.plate + 0x50) == binding_row_plate_width);
-    two_geometry(panes, geometry.pad, false);
-    assert(!(*(uint8_t *)(uintptr_t)(panes.plate + 0x58) & 1));
-    two_geometry(panes, geometry.key, true);
+    two_geometry(panes, geometry.pad);
+    assert(*(uint8_t *)(uintptr_t)(panes.plate + 0x58) & 1);
+    assert(*(float *)(uintptr_t)(panes.plate + 0x30) == -geometry.pad.center());
+    two_geometry(panes, geometry.key);
     assert(*(float *)(uintptr_t)(panes.frames[0] + 0x50) == geometry.key.width);
     assert(*(float *)(uintptr_t)(panes.frames[1] + 0x50) == geometry.key.width);
     assert(*(uint8_t *)(uintptr_t)(panes.frames[0] + 0x58) & 0x10);
