@@ -1002,7 +1002,12 @@ extern "C" int rt_opt_two_callback(uint64_t screen, uint64_t button, int which) 
             if (want != col) two_focus(screen, row, want);
             fprintf(stderr, "[row-spike] select row %llx column %d\n", (unsigned long long)row, want);
         } else if (which == 1) rt_opt_two_row_state(row);
-        else if (which == 2) rt_opt_decide(row);
+        else if (which == 2) {
+            uint32_t action = rd32(screen + 0x36c0);
+            wr32(screen + 0x36c0, 0); // this callback is the native control's confirmed event
+            rt_opt_decide(row);
+            wr32(screen + 0x36c0, action);
+        }
         return 1;
     }
     return 0;

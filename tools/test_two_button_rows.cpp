@@ -74,6 +74,12 @@ int main() {
     bind_capture_event(&e); assert(bind_capture_active(&dev, &slot, &ms) && g_act_pad[0] == before);
     e.type = SDL_EVENT_GAMEPAD_BUTTON_DOWN; e.gbutton.button = SDL_GAMEPAD_BUTTON_NORTH;
     bind_capture_event(&e); assert(g_act_pad[0] == SDL_GAMEPAD_BUTTON_NORTH && g_act_key[0] == SDL_SCANCODE_F8);
+    // Native confirmed callbacks can arrive before the screen update sets its action code.
+    wr32(screen + 0x36c0, 3);
+    rt_opt_two_callback(screen, rd64(row + 0x28), 2);
+    assert(bind_capture_active(&dev, &slot, &ms) && dev == BIND_DEV_PAD);
+    assert(rd32(screen + 0x36c0) == 3);
+    bind_capture_cancel();
     // Up/down enters a different row's left control but preserves the right column.
     test_cpu.x[19] = 17; test_cpu.v[0] = 23;
     assert(rt_opt_two_callback(screen, rd64(next + 0x20), 0));
