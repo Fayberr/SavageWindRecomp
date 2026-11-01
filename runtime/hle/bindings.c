@@ -297,7 +297,7 @@ static _Atomic bool a_live;
 static const char *const k_act_names[ACT_COUNT] = {
     [0] = "Interact", [2] = "Jump", [3] = "Attack", [5] = "Shield bash", [9] = "Lower shield", [10] = "Crouch step", [11] = "Dodge",
     [12] = "Sprint", [13] = "Guard / lock on", [14] = "Cancel", [15] = "Scope", [17] = "Crouch", [18] = "Bow",
-    [19] = "Paraglider", [25] = "Dismount", [26] = "Speed up horse", [27] = "Pet horse", [28] = "Throw weapon", [31] = "Take photo",
+    [19] = "Paraglider", [25] = "Dismount", [26] = "Speed up horse", [27] = "Pet horse", [28] = "Throw weapon", [31] = "Take photo", [32] = "Climb (no effect)",
     [33] = "Aim rune", [34] = "Activate rune", [35] = "Call horse", [37] = "Throw distance",
 };
 // No code in the game reaches these by a number (they may still be asked by a computed one): kept off the page
