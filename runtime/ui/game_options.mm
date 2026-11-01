@@ -749,6 +749,11 @@ uint64_t g_two_header;
 int g_two_column;
 uint64_t g_two_current;
 bool g_two_focusing;
+// Timing probe (spike only): milliseconds since the page's rows were created
+std::chrono::steady_clock::time_point g_page_t0, g_tick_last;
+long page_ms(void) {
+    return (long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_page_t0).count();
+}
 
 bool is_binds_header(const Item *it) { return it && it->action == A_BINDS_HEADER; }
 bool row_is_header(uint64_t row) { return row && (row == g_two_header || is_binds_header(item_of_row(row))); }
@@ -953,6 +958,7 @@ bool two_configure(uint64_t row) {
         two_float(title, 0x50, layout.label_width);
         g_two_rows.push_back({row});
     }
+    fprintf(stderr, "[row-spike-t] %s configured at +%ld ms (%zu rows)\n", header ? "header" : "row", page_ms(), g_two_rows.size());
     return true;
 }
 
@@ -1083,6 +1089,8 @@ extern "C" void rt_opt_rows(void) {
     g_reopen = false;
     g_dirty.clear();
     g_two_rows.clear(); g_two_header = 0; g_two_column = 0; g_two_current = 0;
+    g_page_t0 = g_tick_last = std::chrono::steady_clock::now();
+    fprintf(stderr, "[row-spike-t] page %d rows created (+0 ms)\n", page);
 }
 
 // Called only by the strict optional hook group. Other pages use their original instructions.
@@ -1356,6 +1364,12 @@ extern "C" uint64_t rt_opt_tick(uint64_t screen) {
     if (g_quit_dialog) {  // (the quit question is up: 1 skips the screen's update, whose dialog handling takes answers)
         quit_poll();
         if (g_quit_dialog) return 1;
+    }
+    {
+        auto now = std::chrono::steady_clock::now();
+        long gap = (long)std::chrono::duration_cast<std::chrono::milliseconds>(now - g_tick_last).count();
+        if (gap > 80 && g_cur_page == P_BINDS) fprintf(stderr, "[row-spike-t] options tick gap %ld ms at +%ld ms\n", gap, page_ms());
+        g_tick_last = now;
     }
     int d, s, ms;
     if (g_cap_row && bind_capture_active(&d, &s, &ms)) cap_slot_was = s;

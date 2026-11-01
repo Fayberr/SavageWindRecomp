@@ -398,7 +398,14 @@ static uint64_t options_row_at(uint64_t screen,float box[4],unsigned *kind_out) 
             for(unsigned cell=1;cell<=2;cell++) {
                 uint64_t button=LD64(row+(cell==1?0x20:0x28));
                 if(!ptr(button)||!options_box(LD64(button+0x60),box))continue;
-                if(point[0]>=box[0]&&point[0]<=box[2]&&point[1]>=box[1]&&point[1]<=box[3]) {*kind_out=cell;return row;}
+                if(point[0]>=box[0]&&point[0]<=box[2]&&point[1]>=box[1]&&point[1]<=box[3]) {
+                    static uint64_t log_row;static unsigned log_cell;
+                    if(log_row!=row||log_cell!=cell) {
+                        log_row=row;log_cell=cell;
+                        float other[4]={0,0,0,0};uint64_t ob=LD64(row+(cell==1?0x28:0x20));if(ptr(ob))options_box(LD64(ob+0x60),other);
+                        fprintf(stderr,"[row-spike-hover] row %llx hit cell %u point %.1f,%.1f box %.1f..%.1f other %.1f..%.1f\n",(unsigned long long)row,cell,point[0],point[1],box[0],box[2],other[0],other[2]);
+                    }
+                    *kind_out=cell;return row;}
             }
             continue;
         }
