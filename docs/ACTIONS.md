@@ -55,7 +55,6 @@ before the next poll is kept for the next query, so a short tap is not lost.
   Jump and Interact); bind what you want directly.
 - The button icons the game draws follow the Switch layer and the controller family, not the per-action bindings.
 - Most actions have no name yet (they show as "Action N"). Run the game once with the logging build below to find them.
-- Version 1.8.2 is untested: the sites are unverified there, and the group is left out if its patterns fail.
 
 ## Naming the actions (logging build)
 
