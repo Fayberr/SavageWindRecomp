@@ -140,28 +140,23 @@ int main() {
     for (uint32_t i = 0; i < 4; i++) wr32(order_list + 4 * i, GAME_ENTRIES + i);
     wr32(OPT_ROWS, 4); wr64(OPT_ORDER, order_list);
     g_two_header = header; g_cur_page = P_BINDS;
-    // Fake toggle parts: tog, band, box0, box1 per row (0x400 apart). Boxes start as the native black at 78 %.
-    auto fake = [&](uint64_t at, uint64_t r) {
-        for (int i = 0; i < 4; i++) wr8(at + i * 0x400 + 0x58, 0x80);
-        for (int i = 2; i < 4; i++)
-            for (unsigned o : two_mat_white) wr32(at + i * 0x400 + o, 0xc8000000u);
-        return TwoRow{r, at, at + 0x400, {at + 0x800, at + 0xc00}};
+    // Fake toggle parts: tog, band, disable, dark, box0, box1 per row (0x400 apart)
+    auto fake = [&](uint64_t at, uint64_t r, uint64_t next_row) {
+        for (int i = 0; i < 6; i++) wr8(at + i * 0x400 + 0x58, 0x80);
+        *(float *)(uintptr_t)(at + 0x30) = 130.f;
+        for (int i = 4; i < 6; i++) *(float *)(uintptr_t)(at + i * 0x400 + 0x54) = 40.f;
+        (void)r; (void)next_row;
+        return TwoRow{r, at, at + 0x400, at + 0x800, at + 0xc00, {at + 0x1000, at + 0x1400}, {-135.f, 53.f}, -1};
     };
-    g_two_rows = {fake(base + 0xc000, row), fake(base + 0xe000, next)};
+    g_two_rows = {fake(base + 0xc000, row, next), fake(base + 0xe000, next, row)};
     const TwoRow &r0 = g_two_rows[0], &r1 = g_two_rows[1];
     auto on = [](uint64_t pl) { return (*(uint8_t *)(uintptr_t)(pl + 0x58) & 1) != 0; };
-    auto bright = [](const TwoRow &r) {
-        for (unsigned o : two_mat_white) if (*(uint8_t *)(uintptr_t)(r.band + o + 3) != two_band_selected) return false;
-        return true;
+    auto bright = [](const TwoRow &r) { return *(uint8_t *)(uintptr_t)(r.band + two_mat_alpha[0]) == two_band_selected; };
+    auto hovered = [](const TwoRow &r, int col) {
+        return *(uint8_t *)(uintptr_t)(r.box[col] + 0x59) == two_hover_alpha &&
+               *(uint8_t *)(uintptr_t)(r.box[col] + two_mat_white[0]) == two_hover_tint &&
+               *(uint8_t *)(uintptr_t)(r.box[col] + two_mat_white[1] + 2) == two_hover_tint;
     };
-    // A box is opaque grey: the base for every button, lighter only for the selected one (content and frame material).
-    auto box = [](const TwoRow &r, int col, uint8_t grey) {
-        uint32_t want = grey | grey << 8 | grey << 16 | 0xffu << 24;
-        for (unsigned o : two_mat_white) if (rd32(r.box[col] + o) != want) return false;
-        return true;
-    };
-    auto hovered = [&](const TwoRow &r, int col) { return box(r, col, two_box_hover); };
-    auto base_box = [&](const TwoRow &r, int col) { return box(r, col, two_box_base); };
     assert(rt_opt_msg(MSG_BASE + MSG_KEY, msg_out) && std::u16string((const char16_t *)(uintptr_t)rd64(msg_out)) == u"Keyboard/Mouse");
     assert(rt_opt_msg(MSG_BASE + MSG_PAD, msg_out) && std::u16string((const char16_t *)(uintptr_t)rd64(msg_out)) == u"Controller");
     assert(rt_opt_msg(MSG_BASE + MSG_TITLE, msg_out) && std::u16string((const char16_t *)(uintptr_t)rd64(msg_out)).empty());
@@ -204,21 +199,23 @@ int main() {
     assert(rt_opt_two_callback(screen, rd64(next + 0x20), 0));
     assert(focused_row == next && focused_kind == KIND_BUTTON && rd64(screen + 0x36c8) == next);
     assert(test_cpu.x[19] == 17 && test_cpu.v[0] == 23 && help_count == 1);
-    // The selected row's band is bright over the whole row, the other row's faint. Only the selected button is lighter;
-    // the other button of the selected row is exactly the base box of every other row.
+    // The selected row's band is bright over the whole row, the other row's faint. The unselected button of the selected
+    // row gets the darkener under it, the selected button's box is a little see-through.
     assert(on(r0.band) && on(r1.band) && !bright(r0) && bright(r1));
-    assert(hovered(r1, 1) && base_box(r1, 0) && base_box(r0, 0) && base_box(r0, 1));
+    assert(on(r1.disable) && !on(r0.disable) && r1.dark_col == 0);
+    assert(*(float *)(uintptr_t)(r1.dark + 0x30) == r1.dark_x[0]);
+    assert(hovered(r1, 1) && !hovered(r1, 0) && !hovered(r0, 0) && !hovered(r0, 1));
     // Explicit mouse hover selects either device even after crossing rows.
     rt_opt_two_pointer(row, KIND_CHOICE);
     assert(rt_opt_two_callback(screen, rd64(row + 0x20), 0) && rt_opt_two_column(row) == 0);
-    assert(bright(r0) && !bright(r1) && hovered(r0, 0) && base_box(r0, 1) && base_box(r1, 0) && base_box(r1, 1));
-    // A redraw or focus animation by the game (toggle part hidden, native colours back) is undone on the next update.
-    wr8(r0.tog + 0x58, 0x10); wr8(r0.band + two_mat_white[0] + 3, 0x02);
-    wr32(r0.box[0] + two_mat_white[0], 0xe6000000u); wr32(r0.box[1] + two_mat_white[1], 0xc8000000u);
+    assert(bright(r0) && !bright(r1) && on(r0.disable) && !on(r1.disable) && r0.dark_col == 1);
+    assert(*(float *)(uintptr_t)(r0.dark + 0x30) == r0.dark_x[1] && hovered(r0, 0) && !hovered(r0, 1));
+    // A redraw by the game that hides the toggle part again is undone on the next update.
+    wr8(r0.tog + 0x58, 0x10); wr8(r0.band + two_mat_alpha[0], 0x02);
     two_band_refresh(screen);
-    assert(on(r0.tog) && bright(r0) && hovered(r0, 0) && base_box(r0, 1));
+    assert(on(r0.tog) && bright(r0));
     assert(!rt_opt_two_callback(screen, rd64(ordinary + 0x28), 0));
-    assert(!bright(r0) && !bright(r1) && base_box(r0, 0) && base_box(r0, 1) && base_box(r1, 0) && base_box(r1, 1));
+    assert(!bright(r0) && !bright(r1) && !on(r0.disable) && !on(r1.disable) && !hovered(r0, 0));
     assert(rt_opt_two_column(ordinary) == -1 && !rt_opt_two_control(ordinary));
     wr32(screen + 0x36c0, 0); rt_opt_decide(ordinary);
     assert(bind_capture_active(&dev, &slot, &ms) && dev == BIND_DEV_ANY);
