@@ -770,8 +770,7 @@ bool two_candidate(uint64_t row) {
     const Item *it = item_of_row(row);
     if (g_cur_page != P_BINDS || !two_enabled() || !it) return false;
     if (is_binds_header(it)) return true;
-    return it->action == A_BIND && (it->arg == BIND_ACTION || it->arg == BIND_ACTION + 2 ||
-                                    it->arg == BIND_ACTION + 3);
+    return it->action == A_BIND;  // every binding row: label, keyboard/mouse button, controller button
 }
 bool two_ready(uint64_t row) {
     for (const auto &r : g_two_rows) if (r.row == row) return true;
@@ -841,6 +840,7 @@ void two_header_geometry(const TwoButtonPanes &p, BindingRowColumn col, float sc
     two_float(p.root, 0x48, 1.f);
     for (uint64_t text : p.texts) {
         two_float(text, 0x30, 0.f);
+        two_float(text, 0x34, binding_row_header_y);
         two_float(text, 0x48, scale);
         two_float(text, 0x4c, scale);
         two_float(text, 0x50, col.width / scale);
@@ -1289,8 +1289,9 @@ extern "C" int rt_opt_msg(uint32_t id, uint64_t out) {
             int dev, slot, ms;
             bool capture = bind_capture_active(&dev, &slot, &ms) && slot == it->arg &&
                            dev == (key ? BIND_DEV_KEY : BIND_DEV_PAD);
-            s = capture ? tr(key ? "Press a key..." : "Press a button...") :
-                          key ? slot_key_text(it->arg) : slot_pad_text(it->arg);
+            if (!key && !slot_has_pad(it->arg)) s = tr("Stick"), grey = true;  // (keys only: a stick direction)
+            else s = capture ? tr(key ? "Press a key..." : "Press a button...") :
+                              key ? slot_key_text(it->arg) : slot_pad_text(it->arg);
         }
     }
     else if (part == MSG_BUTTON) s = it->button ? tr(it->button) : it->label ? it->label(*it, -1) : "";
@@ -1320,6 +1321,7 @@ extern "C" int rt_opt_decide(uint64_t row) {
         return 1;
     case A_BIND:
         if (two_ready(row) && rd32(rd64(row) + 0x36c0) != 0) return 2;
+        if (two_ready(row) && g_two_column && !slot_has_pad(it->arg)) return 2;  // (no controller side to bind)
         bind_capture_begin(two_ready(row) ? (g_two_column ? BIND_DEV_PAD : BIND_DEV_KEY) : BIND_DEV_ANY, it->arg);
         cap_slot_was = it->arg;
         if (two_ready(row)) fprintf(stderr, "[row-spike] capture slot %d device %s\n", it->arg,
