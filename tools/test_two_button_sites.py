@@ -12,9 +12,9 @@ print('two-button sites: one failed pattern disables the whole spike PASS')
 
 # Guard every site and both failure modes, including a unique match at a wrong address.
 for missing in gs.OPT_TWO_SITES:
-    for wrong in (None, gs.KNOWN['1.9.0'][missing] + 4):
+    for wrong, hits in ((None, 0), (None, 2), (gs.KNOWN['1.9.0'][missing] + 4, 1)):
         class OneBadSite:
             def locate(self, site):
-                return (wrong, 0 if wrong is None else 1) if site.name == missing else (gs.KNOWN['1.9.0'].get(site.name), 1)
+                return (wrong, hits) if site.name == missing else (gs.KNOWN['1.9.0'].get(site.name), 1)
         assert not set(gs.OPT_TWO_SITES) & gs.resolve(OneBadSite(), gs.KNOWN['1.9.0']).keys()
-print('all spike sites: missing and mismatched signatures fall back PASS')
+print('all spike sites: missing, ambiguous and mismatched signatures fall back PASS')

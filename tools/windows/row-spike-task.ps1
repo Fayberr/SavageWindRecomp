@@ -1,4 +1,4 @@
-param([ValidateSet('build', 'setup', 'play', 'smoke', 'shot')][string]$Mode = 'play')
+param([ValidateSet('build', 'setup', 'play', 'shot')][string]$Mode = 'play')
 $ErrorActionPreference = 'Stop'
 $base = 'C:\Users\derfa'
 $script = if ($Mode -eq 'build') { "$base\row-spike-build.ps1" } else { "$base\row-spike-run.ps1" }

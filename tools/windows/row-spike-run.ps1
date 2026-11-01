@@ -1,6 +1,7 @@
-param([ValidateSet('setup', 'play', 'smoke', 'shot')][string]$Mode = 'play')
+param([ValidateSet('setup', 'play', 'shot')][string]$Mode = 'play')
 $ErrorActionPreference = 'Stop'
 $root = 'C:\Users\derfa\swr-check\row-spike'
+Start-Transcript -Path "$root\$Mode-task.log" -Force | Out-Null
 if ($Mode -eq 'shot') {
     Add-Type -AssemblyName System.Windows.Forms, System.Drawing
     $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
@@ -11,7 +12,7 @@ if ($Mode -eq 'shot') {
     $graphics.Dispose(); $bitmap.Dispose()
     exit
 }
-if (Get-Process savagewind -ErrorAction SilentlyContinue) { throw 'A Savage Wind process is already running; left it untouched' }
+if ($Mode -ne 'setup' -and (Get-Process savagewind -ErrorAction SilentlyContinue)) { throw 'A Savage Wind process is already running; left it untouched' }
 Get-ChildItem Env:SAVAGEWIND_* | Remove-Item
 $env:PATH = "C:\msys64\ucrt64\bin;C:\msys64\usr\bin;$env:PATH"
 $env:SAVAGEWIND_DATA_ROOT = $root
@@ -29,11 +30,7 @@ $start = @{
 }
 if ($Mode -eq 'setup') {
     # Empty source rebuilds code from our copied exefs without copying/deleting game resources.
-    $start.Environment = @{ SAVAGEWIND_LAUNCHER_EXTRACT = '' }
-} elseif ($Mode -eq 'smoke') {
-    $env:SAVAGEWIND_INPUT = '600:A:4,900:DOWN:4,960:DOWN:4,1020:DOWN:4,1080:DOWN:4,1140:A:4'
-    $env:SAVAGEWIND_EXIT_AT = '1800'
-    $env:SAVAGEWIND_WINDOW_SHOT_AT = '1500'
+    $start.Environment = @{ SAVAGEWIND_LAUNCHER_EXTRACT = ''; SAVAGEWIND_HIDDEN = '1' }
 }
 $p = Start-Process @start
 "pid $($p.Id) mode $Mode $(Get-Date -Format s)" | Set-Content "$root\started.txt"
