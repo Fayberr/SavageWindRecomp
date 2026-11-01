@@ -906,6 +906,7 @@ bool two_configure(uint64_t row) {
         if (header && kernel_current_cpu()) hide_failed_header(row);
         return false;
     }
+    long t_a = page_ms(), t_b = 0, t_c = 0;
     uint64_t roots[2], buttons[2], arrows[4];
     TwoButtonPanes panes[2];
     const char *arrow_names[] = {"Pa_ArrowL_00", "Pa_ArrowR_00", "P_Arrow_00", "P_Arrow_01"};
@@ -937,8 +938,10 @@ bool two_configure(uint64_t row) {
     // Validate all panes before the first mutation, leaving ordinary rows usable on failure.
     const auto layout = binding_row_layout();
     float hscale = header ? two_header_scale() : 1.f;
+    t_b = page_ms();
     for (int col = 0; col < 2; col++) {
         two_call(rd64(rd64(buttons[col]) + 0x60), buttons[col], header ? 0 : 1);
+        if (col == 1) t_c = page_ms();
         wr8(roots[col] + 0x58, *(uint8_t *)(uintptr_t)(roots[col] + 0x58) | 1);
         const auto column = col ? layout.pad : layout.key;
         if (header) two_header_geometry(panes[col], column, hscale);
@@ -956,7 +959,7 @@ bool two_configure(uint64_t row) {
         two_float(title, 0x50, layout.label_width);
         g_two_rows.push_back({row});
     }
-    fprintf(stderr, "[row-spike-t] %s configured at +%ld ms (%zu rows)\n", header ? "header" : "row", page_ms(), g_two_rows.size());
+    fprintf(stderr, "[row-spike-t] %s configured at +%ld ms (%zu rows): search %ld ms, guest calls %ld ms, rest %ld ms\n", header ? "header" : "row", page_ms(), g_two_rows.size(), t_b - t_a, t_c - t_b, page_ms() - t_c);
     return true;
 }
 
