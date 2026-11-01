@@ -391,6 +391,28 @@ static int act_log_on(void) {
 static _Atomic uint64_t l_seen[2], l_true[2], l_last[2];
 static _Atomic uint64_t l_pads[4];
 static _Atomic unsigned l_polls, l_queries[2];
+// for the on-screen list (written on the game thread, read by the menu layer)
+static _Atomic unsigned l_cnt[2][ACT_COUNT];
+static _Atomic uint32_t l_last_ms[ACT_COUNT];
+static _Atomic uint64_t l_holding;
+
+bool act_log_enabled(void) { return act_log_on(); }
+
+int act_log_rows(ActLogRow *out, int max) {
+    ActLogRow all[ACT_COUNT];
+    int n = 0;
+    for (int i = 0; i < ACT_COUNT; i++) {
+        unsigned p = l_cnt[1][i], h = l_cnt[0][i];
+        if (!p && !h) continue;
+        ActLogRow r = {i, p, h, l_last_ms[i], (l_holding >> i & 1) != 0};
+        int j = n++;
+        while (j > 0 && all[j - 1].last_ms < r.last_ms) { all[j] = all[j - 1]; j--; }  // (newest first)
+        all[j] = r;
+    }
+    if (n > max) n = max;
+    for (int i = 0; i < n; i++) out[i] = all[i];
+    return n;
+}
 
 static void act_log_ids(char *out, size_t n, uint64_t set) {
     size_t o = 0;
@@ -423,10 +445,15 @@ static void act_log_poll(void) {
         uint64_t t = l_true[kind];
         l_true[kind] = 0;
         if (t == l_last[kind]) continue;
+        uint64_t fresh = t & ~l_last[kind];
         l_last[kind] = t;
+        if (!kind) l_holding = t;
+        uint32_t ms = SDL_GetTicks();
+        for (int i = 0; i < ACT_COUNT; i++)
+            if (fresh >> i & 1) { l_cnt[kind][i]++; l_last_ms[i] = ms; }
         char ids[200];
         act_log_ids(ids, sizeof ids, t);
-        LOG("[act] poll %u: game says %s: %s\n", n, kind ? "pressed" : "held", ids);
+        LOG("[act] poll %u: game says %s: %s (t=%.1f s)\n", n, kind ? "pressed" : "held", ids, ms / 1000.0);
     }
     if (n % 600 == 0) {
         LOG("[act] %u polls: %u held queries, %u pressed queries\n", n, (unsigned)l_queries[0], (unsigned)l_queries[1]);
