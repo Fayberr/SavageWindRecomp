@@ -298,7 +298,7 @@ static const char *const k_act_names[ACT_COUNT] = {
     [0] = "Interact", [2] = "Jump", [3] = "Attack", [5] = "Shield bash", [9] = "Lower shield", [11] = "Dodge",
     [12] = "Sprint", [13] = "Guard / lock on", [14] = "Cancel", [15] = "Scope", [17] = "Crouch", [18] = "Bow",
     [19] = "Paraglider", [25] = "Dismount", [26] = "Speed up horse", [27] = "Pet horse", [28] = "Throw weapon",
-    [33] = "Use rune", [35] = "Call horse",
+    [33] = "Use rune", [35] = "Call horse", [37] = "Toggle place distance",
 };
 // No code in the game reaches these by a number (they may still be asked by a computed one): kept off the page
 #define ACT_HIDDEN_MASK ((1ull << 1) | (1ull << 4) | (1ull << 6) | (1ull << 7) | (1ull << 8) | (1ull << 16) | \
@@ -425,7 +425,7 @@ static void act_log_ids(char *out, size_t n, uint64_t set) {
     if (!o) snprintf(out, n, "-");
 }
 
-static void act_log_query(int kind, uint64_t pad, unsigned id, uint64_t lr) {
+static void act_log_query(int kind, uint64_t pad, unsigned id, uint64_t lr, bool custom) {
     l_queries[kind]++;
     if (id >= ACT_COUNT || !pad) return;
     if (!(l_seen[kind] >> id & 1)) {
@@ -438,6 +438,7 @@ static void act_log_query(int kind, uint64_t pad, unsigned id, uint64_t lr) {
         if (p == pad) break;
         if (!p) { l_pads[i] = pad; LOG("[act] pad object %llx asked\n", (unsigned long long)pad); break; }
     }
+    if (custom) return;  // an action with a binding of its own is logged by what the game is told (rt_act_query)
     uint32_t word = *(const uint32_t *)(uintptr_t)(pad + (kind ? 0x10 : 0x11c));
     if (k_masks && (word & k_masks[id])) l_true[kind] |= 1ull << id;
 }
@@ -486,13 +487,18 @@ void act_poll(bool live) {
 
 int rt_act_query(int kind, uint64_t pad, uint64_t id, uint64_t lr, uint64_t masks) {
     if (!k_masks && masks) k_masks = (const uint32_t *)(uintptr_t)masks;
-    if (act_log_on()) act_log_query(kind, pad, (unsigned)id, lr);
-    if (id >= ACT_COUNT || !a_live || !(a_custom >> id & 1)) return -1;
+    bool custom = id < ACT_COUNT && (a_custom >> id & 1);
+    if (act_log_on()) act_log_query(kind, pad, (unsigned)id, lr, custom && a_live);
+    if (id >= ACT_COUNT || !a_live || !custom) return -1;
+    int r;
     if (kind) {
         a_served = true;
-        return (int)(a_trig >> id & 1);
+        r = (int)(a_trig >> id & 1);
+    } else {
+        r = (int)(a_hold >> id & 1);
     }
-    return (int)(a_hold >> id & 1);
+    if (r && act_log_on()) l_true[kind] |= 1ull << id;
+    return r;
 }
 
 // ---- savagewind.ini: act_key_<id> / act_pad_<id> = <key | button | none>, written only when not the default
