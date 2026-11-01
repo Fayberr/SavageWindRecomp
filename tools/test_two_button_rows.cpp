@@ -71,12 +71,14 @@ int main() {
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
 #endif
     assert(mem == (void *)base);
-    // The duplicate full-row plate must disappear without squeezing glyphs or hit areas.
+    // The key part keeps the native row plate; the pad part hides its copy.
     const auto geometry = binding_row_layout();
     assert(geometry.label_right < geometry.key.x);
     assert(geometry.key.x + geometry.key.width < geometry.pad.x);
-    assert(geometry.key.width >= 220 && geometry.pad.width >= 220);
-    assert(geometry.label_width >= 280);
+    // Both columns and the label sit inside the native 540-wide row band (-270..270).
+    assert(geometry.label_right - geometry.label_width >= -270.f);
+    assert(geometry.key.x >= -270.f && geometry.pad.x + geometry.pad.width <= 270.f);
+    assert(geometry.key.width > 0 && geometry.pad.width > 0);
     uint64_t root = base + 0xa000;
     const char *names[] = {"T_Text_00", "T_Text_01", "N_Cursor_00", "B_Hit_00", "W_Base_00",
                           "W_Base_01", "W_BaseLine_02", "W_BaseLine_01", "W_Decide_00", "Window_00", "W_Base_02"};
@@ -91,10 +93,15 @@ int main() {
     }
     TwoButtonPanes panes;
     assert(two_button_panes(root, panes));
-    two_geometry(panes, geometry.key);
+    two_geometry(panes, geometry.key, true);
     assert(*(float *)(uintptr_t)(root + 0x48) == 1.f);
     assert(*(float *)(uintptr_t)(panes.texts[0] + 0x48) == 1.f);
-    assert(!(rd32(panes.plate + 0x58) & 1));
+    assert(*(uint8_t *)(uintptr_t)(panes.plate + 0x58) & 1);
+    assert(*(float *)(uintptr_t)(panes.plate + 0x30) == -geometry.key.center());
+    assert(*(float *)(uintptr_t)(panes.plate + 0x50) == binding_row_plate_width);
+    two_geometry(panes, geometry.pad, false);
+    assert(!(*(uint8_t *)(uintptr_t)(panes.plate + 0x58) & 1));
+    two_geometry(panes, geometry.key, true);
     assert(*(float *)(uintptr_t)(panes.frames[0] + 0x50) == geometry.key.width);
     assert(*(float *)(uintptr_t)(panes.frames[1] + 0x50) == geometry.key.width);
     assert(*(uint8_t *)(uintptr_t)(panes.frames[0] + 0x58) & 0x10);
