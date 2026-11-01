@@ -27,6 +27,7 @@
 #include <SDL3/SDL.h>
 
 #include "i18n.h"
+#include "binding_row_layout.h"
 
 extern "C" {
 #include "../input_bind.h"
@@ -783,6 +784,33 @@ void two_float(uint64_t pane, unsigned field, float value) {
     // then passes force=true to descendants. Never edit the cached world matrix.
     wr8(pane + 0x58, *(uint8_t *)(uintptr_t)(pane + 0x58) | 0x10);
 }
+struct TwoButtonPanes {
+    uint64_t root, texts[2], frames[8], plate;
+};
+bool two_button_panes(uint64_t root, TwoButtonPanes &p) {
+    p.root = root;
+    const char *frames[] = {"N_Cursor_00", "B_Hit_00", "W_Base_00", "W_Base_01",
+                            "W_BaseLine_02", "W_BaseLine_01", "W_Decide_00", "Window_00"};
+    for (int i = 0; i < 2; i++)
+        if (!(p.texts[i] = two_pane(root, i ? "T_Text_01" : "T_Text_00"))) return false;
+    for (int i = 0; i < 8; i++)
+        if (!(p.frames[i] = two_pane(root, frames[i]))) return false;
+    return (p.plate = two_pane(root, "W_Base_02")) != 0;
+}
+void two_geometry(const TwoButtonPanes &p, BindingRowColumn col) {
+    const auto layout = binding_row_layout();
+    two_float(p.root, 0x30, col.center());
+    two_float(p.root, 0x48, 1.f);
+    // Resize native nine-slice frames, hit area and cursor together. Glyphs stay at native scale.
+    for (uint64_t text : p.texts) {
+        two_float(text, 0x48, 1.f);
+        two_float(text, 0x50, col.width - layout.text_inset);
+    }
+    for (int i = 0; i < 8; i++)
+        two_float(p.frames[i], 0x50, col.width + (i == 7 ? layout.glow_extra : 0.f));
+    // Each part carries the old 540-wide row plate at x=-130. Neither belongs to a cell.
+    wr8(p.plate + 0x58, *(uint8_t *)(uintptr_t)(p.plate + 0x58) & ~1u);
+}
 void two_focus(uint64_t screen, uint64_t row, int col) {
     if (g_two_focusing) return;
     g_two_focusing = true;
@@ -797,44 +825,36 @@ void two_text(uint64_t layout, const char *pane, uint32_t id) {
 bool two_configure(uint64_t row) {
     if (two_ready(row)) return true;
     if (!two_candidate(row) || !kernel_current_cpu()) return false;
-    uint64_t roots[2], buttons[2], texts[2][2], arrows[4];
+    uint64_t roots[2], buttons[2], arrows[4];
+    TwoButtonPanes panes[2];
     const char *arrow_names[] = {"Pa_ArrowL_00", "Pa_ArrowR_00", "P_Arrow_00", "P_Arrow_01"};
     for (int col = 0; col < 2; col++) {
         buttons[col] = rd64(row + (col ? 0x28 : 0x20));
         if (!two_ptr(buttons[col]) || !two_ptr(rd64(buttons[col] + 0x20))) return false;
         roots[col] = rd64(rd64(buttons[col] + 0x20) + 0x18);
         if (!two_ptr(roots[col]) || !two_ptr(rd64(buttons[col] + 0x60))) return false;
-        for (int t = 0; t < 2; t++) {
-            texts[col][t] = two_pane(roots[col], t ? "T_Text_01" : "T_Text_00");
-            if (!texts[col][t]) return false;
-        }
+        if (!two_button_panes(roots[col], panes[col])) return false;
     }
     for (int i = 0; i < 4; i++) {
         arrows[i] = two_pane(roots[0], arrow_names[i]);
         if (!arrows[i]) return false;
     }
+    uint64_t row_layout = rd64(row + 0x10);
+    uint64_t title = two_ptr(row_layout) ? two_pane(rd64(row_layout + 0x18), "T_Option_00") : 0;
+    if (!title) return false;
     // Validate all panes before the first mutation, leaving ordinary rows usable on failure.
+    const auto layout = binding_row_layout();
     for (int col = 0; col < 2; col++) {
-        uint64_t root = roots[col];
-        float x = *(float *)(uintptr_t)(root + 0x30);
-        float scale = *(float *)(uintptr_t)(root + 0x48);
         two_call(rd64(rd64(buttons[col]) + 0x60), buttons[col], 1);
-        wr8(root + 0x58, *(uint8_t *)(uintptr_t)(root + 0x58) | 1);
-        two_float(root, 0x30, x + (col ? 60.f : -90.f));
-        two_float(root, 0x48, scale * .5f);
-        // Keep native font proportions while narrowing the button and its hit/cursor panes.
-        for (uint64_t text : texts[col]) {
-            two_float(text, 0x48, *(float *)(uintptr_t)(text + 0x48) * 2.f);
-            two_float(text, 0x50, 124.f);
-        }
-        fprintf(stderr, "[row-spike] row %llx column %d button %llx root %.24s x %.1f -> %.1f scale %.2f\n",
-                (unsigned long long)row, col, (unsigned long long)buttons[col],
-                (const char *)(uintptr_t)(root + 0xb8), x, x + (col ? 60.f : -90.f), scale * .5f);
+        wr8(roots[col] + 0x58, *(uint8_t *)(uintptr_t)(roots[col] + 0x58) | 1);
+        const auto column = col ? layout.pad : layout.key;
+        two_geometry(panes[col], column);
+        fprintf(stderr, "[row-spike] row %llx column %d button %llx center %.1f width %.1f plate hidden\n",
+                (unsigned long long)row, col, (unsigned long long)buttons[col], column.center(), column.width);
     }
     for (uint64_t arrow : arrows) wr8(arrow + 0x58, *(uint8_t *)(uintptr_t)(arrow + 0x58) & ~1u);
-    uint64_t layout = rd64(row + 0x10);
-    uint64_t title = two_ptr(layout) ? two_pane(rd64(layout + 0x18), "T_Option_00") : 0;
-    if (title) two_float(title, 0x30, -30.f), two_float(title, 0x50, 220.f);
+    two_float(title, 0x30, layout.label_right);
+    two_float(title, 0x50, layout.label_width);
     g_two_rows.push_back({row});
     return true;
 }
@@ -1111,7 +1131,16 @@ extern "C" int rt_opt_msg(uint32_t id, uint64_t out) {
     if (!it) return 0;
     const char *s = "";
     bool grey = false;
-    if (part == MSG_TITLE) s = tr(it->title);
+    if (part == MSG_TITLE) {
+        const char *title = it->title;
+        // Probe fixture only: exercise long labels without changing the actions being captured.
+        if (g_cur_page == P_BINDS && it->action == A_BIND && getenv("SAVAGEWIND_TWO_BUTTON_LABEL_TEST")) {
+            if (it->arg == BIND_ACTION) title = "Guard / lock on";
+            if (it->arg == BIND_ACTION + 2) title = "Use rune";
+            if (it->arg == BIND_ACTION + 3) title = "Master Cycle jump";
+        }
+        s = tr(title);
+    }
     else if (part == MSG_DESC) s = it->desc_fn ? it->desc_fn(*it) : tr(it->desc);
     else if (part == MSG_KEY || part == MSG_PAD) {
         int dev, slot, ms;
