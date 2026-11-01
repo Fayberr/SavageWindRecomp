@@ -953,8 +953,7 @@ bool two_configure(uint64_t row) {
         two_float(title, 0x50, layout.label_width);
         g_two_rows.push_back({row});
     }
-    if (g_two_rows.size() % 10 == 0) fprintf(stderr, "[row-spike-t] %zu rows configured at +%ld ms
-", g_two_rows.size(), page_ms());
+    if (g_two_rows.size() % 10 == 0) fprintf(stderr, "[row-spike-t] %zu rows configured at +%ld ms\n", g_two_rows.size(), page_ms());
     return true;
 }
 
