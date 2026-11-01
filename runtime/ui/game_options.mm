@@ -743,7 +743,7 @@ const Item *item_of_index(uint32_t idx) {
 const Item *item_of_row(uint64_t row) { return row ? item_of_index(rd32(row + 0x50)) : nullptr; }
 
 // Three rows plus the column header row. No guest object is enlarged and no shared archive is changed.
-struct TwoRow { uint64_t row; };
+struct TwoRow { uint64_t row, plates[2]; };
 std::vector<TwoRow> g_two_rows;
 uint64_t g_two_header;
 int g_two_column;
@@ -853,6 +853,18 @@ void two_header_geometry(const TwoButtonPanes &p, BindingRowColumn col, float sc
         wr8(frame + 0x58, *(uint8_t *)(uintptr_t)(frame + 0x58) & ~1u);
     wr8(p.plate + 0x58, *(uint8_t *)(uintptr_t)(p.plate + 0x58) & ~1u);
 }
+// Both parts carry a row plate, but the second part is drawn over the first part's button: two visible plates
+// grey the first button (every row, as the unselected plate is a faint band too). So a row shows one plate at a
+// time: the second part's only while its button is the selected one.
+void two_band(uint64_t selected, int col) {
+    for (const auto &r : g_two_rows) {
+        int show = r.row == selected ? col : 0;
+        for (int i = 0; i < 2; i++) {
+            uint8_t f = *(uint8_t *)(uintptr_t)(r.plates[i] + 0x58);
+            wr8(r.plates[i] + 0x58, i == show ? f | 1u : f & ~1u);
+        }
+    }
+}
 uint64_t first_selectable_row(uint64_t screen) {
     if (!screen) return 0;
     uint32_t nrows = rd32(screen + g_site.opt_screen_rows);
@@ -952,7 +964,8 @@ bool two_configure(uint64_t row) {
     } else {
         two_float(title, 0x30, layout.label_right);
         two_float(title, 0x50, layout.label_width);
-        g_two_rows.push_back({row});
+        g_two_rows.push_back({row, {panes[0].plate, panes[1].plate}});
+        wr8(panes[1].plate + 0x58, *(uint8_t *)(uintptr_t)(panes[1].plate + 0x58) & ~1u);
     }
     return true;
 }
@@ -1153,6 +1166,7 @@ extern "C" int rt_opt_two_callback(uint64_t screen, uint64_t button, int which) 
             g_two_column = want; g_two_current = row;
             wr64(screen + 0x36c8, row);
             two_call(g_site.opt_two_help, row);
+            two_band(row, want);
             if (want != col) two_focus(screen, row, want);
             if (two_log()) fprintf(stderr, "[row-spike] select row %llx column %d\n", (unsigned long long)row, want);
         } else if (which == 1) rt_opt_two_row_state(row);
@@ -1164,6 +1178,7 @@ extern "C" int rt_opt_two_callback(uint64_t screen, uint64_t button, int which) 
         }
         return 1;
     }
+    if (which == 0 && !g_two_rows.empty() && rd64(g_two_rows[0].row) == screen) two_band(0, 0);  // (another row: Reset)
     return 0;
 }
 extern "C" void rt_opt_two_pointer(uint64_t row, unsigned kind) {

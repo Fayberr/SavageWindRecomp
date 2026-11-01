@@ -141,7 +141,11 @@ int main() {
     wr64(row_list + 0, ordinary); wr64(row_list + 8, next); wr64(row_list + 16, row); wr64(row_list + 24, header);
     for (uint32_t i = 0; i < 4; i++) wr32(order_list + 4 * i, GAME_ENTRIES + i);
     wr32(OPT_ROWS, 4); wr64(OPT_ORDER, order_list);
-    g_two_header = header; g_two_rows = {{row}, {next}}; g_cur_page = P_BINDS;
+    g_two_header = header; g_cur_page = P_BINDS;
+    const uint64_t plates[4] = {base + 0x3000, base + 0x3100, base + 0x3200, base + 0x3300};
+    for (uint64_t pl : plates) wr8(pl + 0x58, 0x80);
+    g_two_rows = {{row, {plates[0], plates[1]}}, {next, {plates[2], plates[3]}}};
+    auto plate_on = [](uint64_t pl) { return (*(uint8_t *)(uintptr_t)(pl + 0x58) & 1) != 0; };
     assert(rt_opt_msg(MSG_BASE + MSG_KEY, msg_out) && std::u16string((const char16_t *)(uintptr_t)rd64(msg_out)) == u"Keyboard/Mouse");
     assert(rt_opt_msg(MSG_BASE + MSG_PAD, msg_out) && std::u16string((const char16_t *)(uintptr_t)rd64(msg_out)) == u"Controller");
     assert(rt_opt_msg(MSG_BASE + MSG_TITLE, msg_out) && std::u16string((const char16_t *)(uintptr_t)rd64(msg_out)).empty());
@@ -184,10 +188,14 @@ int main() {
     assert(rt_opt_two_callback(screen, rd64(next + 0x20), 0));
     assert(focused_row == next && focused_kind == KIND_BUTTON && rd64(screen + 0x36c8) == next);
     assert(test_cpu.x[19] == 17 && test_cpu.v[0] == 23 && help_count == 1);
+    // One plate per row: the selected button's (the second part's plate would grey the first button)
+    assert(plate_on(plates[0]) && !plate_on(plates[1]) && !plate_on(plates[2]) && plate_on(plates[3]));
     // Explicit mouse hover selects either device even after crossing rows.
     rt_opt_two_pointer(row, KIND_CHOICE);
     assert(rt_opt_two_callback(screen, rd64(row + 0x20), 0) && rt_opt_two_column(row) == 0);
+    assert(plate_on(plates[0]) && !plate_on(plates[1]) && plate_on(plates[2]) && !plate_on(plates[3]));
     assert(!rt_opt_two_callback(screen, rd64(ordinary + 0x28), 0));
+    assert(plate_on(plates[0]) && !plate_on(plates[1]) && plate_on(plates[2]) && !plate_on(plates[3]));
     assert(rt_opt_two_column(ordinary) == -1 && !rt_opt_two_control(ordinary));
     wr32(screen + 0x36c0, 0); rt_opt_decide(ordinary);
     assert(bind_capture_active(&dev, &slot, &ms) && dev == BIND_DEV_ANY);
