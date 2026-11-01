@@ -744,12 +744,10 @@ const Item *item_of_row(uint64_t row) { return row ? item_of_index(rd32(row + 0x
 
 // Three rows plus the column header row. No guest object is enlarged and no shared archive is changed.
 // The row band is the toggle part's own plate (Pa_Btn_00, hidden natively, drawn before both buttons): full width, bright
-// while the row is selected. Under the button that is not selected, that part's box (a darkener) cancels the band
-// shining through the semi-transparent native box, so that button keeps its base colour in a selected row.
+// while the row is selected. The two button boxes are opaque (the native box is black at 78 %, so the backdrop and the
+// band showed through it): a fixed dark grey, lighter only for the selected button. Nothing behind a box changes it.
 struct TwoRow {
-    uint64_t row, tog, band, disable, dark, box[2];
-    float dark_x[2];
-    int dark_col;  // the column the darkener sits under now (-1: not placed yet)
+    uint64_t row, tog, band, box[2];
 };
 std::vector<TwoRow> g_two_rows;
 uint64_t g_band_row;
@@ -859,37 +857,32 @@ void two_header_geometry(const TwoButtonPanes &p, BindingRowColumn col, float sc
         wr8(frame + 0x58, *(uint8_t *)(uintptr_t)(frame + 0x58) & ~1u);
     wr8(p.plate + 0x58, *(uint8_t *)(uintptr_t)(p.plate + 0x58) & ~1u);
 }
-// Window pane colours are materials: the white colour's alpha is the brightness (band, box). Seen at two places of the pane.
-constexpr unsigned two_mat_alpha[2] = {0x16f, 0x207};
-constexpr uint8_t two_band_selected = 0x10, two_band_faint = 0x02;  // the native values of a focused / unfocused plate
-constexpr uint8_t two_dark_alpha = 0x92;   // the darkener under the other button (one value fits both columns' backdrop)
-constexpr uint8_t two_hover_alpha = 0xde;  // pane alpha of the selected button's box: the band shows through a little
+// Window pane colours are materials (content at pane+0x160, frame at pane+0x1f8); the white colour RGBA sits at +0xc of
+// each. Plate W_Base_02: warm white, alpha 0x10 focused / 0x02 not. Box W_Base_00: black, alpha 0xe6 focused / 0xc8 not.
+// Colours are linear (an sRGB framebuffer encodes them): box grey 0x03 shows as about 28, 0x18 as about 85.
+constexpr unsigned two_mat_white[2] = {0x16c, 0x204};
+constexpr uint8_t two_band_selected = 0x20, two_band_faint = 0x02;  // selected: twice the native focused plate
+constexpr uint8_t two_box_base = 0x03, two_box_hover = 0x18;       // opaque box grey: every button / the selected one
 void two_alpha(uint64_t pane, uint8_t v) {
-    for (unsigned o : two_mat_alpha) if (*(uint8_t *)(uintptr_t)(pane + o) != v) wr8(pane + o, v);
+    for (unsigned o : two_mat_white) if (*(uint8_t *)(uintptr_t)(pane + o + 3) != v) wr8(pane + o + 3, v);
+}
+void two_box(uint64_t pane, uint8_t grey) {
+    for (unsigned o : two_mat_white) {
+        const uint8_t want[4] = {grey, grey, grey, 0xff};
+        for (unsigned i = 0; i < 4; i++)
+            if (*(uint8_t *)(uintptr_t)(pane + o + i) != want[i]) wr8(pane + o + i, want[i]);
+    }
 }
 void two_show(uint64_t pane, bool on) {
     uint8_t f = *(uint8_t *)(uintptr_t)(pane + 0x58);
     if ((f & 1u) != (on ? 1u : 0u)) wr8(pane + 0x58, on ? f | 0x11u : (f & ~1u) | 0x10u);
 }
-void two_pane_alpha(uint64_t pane, uint8_t v) {
-    if (*(uint8_t *)(uintptr_t)(pane + 0x59) == v) return;
-    wr8(pane + 0x59, v);
-    wr8(pane + 0x58, *(uint8_t *)(uintptr_t)(pane + 0x58) | 0x10u);
-}
+// The focus animation rewrites the box and plate colours on a focus change only; this runs every frame and wins.
 void two_band_row(TwoRow &r, bool selected, int col) {
     two_show(r.tog, true);
     two_show(r.band, true);
     two_alpha(r.band, selected ? two_band_selected : two_band_faint);
-    two_show(r.disable, selected);
-    if (selected) {
-        int other = 1 - col;
-        if (r.dark_col != other) {
-            two_float(r.dark, 0x30, r.dark_x[other]);
-            r.dark_col = other;
-        }
-        two_alpha(r.dark, two_dark_alpha);
-    }
-    for (int i = 0; i < 2; i++) two_pane_alpha(r.box[i], selected && i == col ? two_hover_alpha : 0xff);
+    for (int i = 0; i < 2; i++) two_box(r.box[i], selected && i == col ? two_box_hover : two_box_base);
 }
 // One row at a time is the selected one; the rest show the faint band. Also run every frame (two_band_refresh): the
 // game redraws a row's parts when a binding changes.
@@ -980,13 +973,11 @@ bool two_configure(uint64_t row) {
     uint64_t row_layout = rd64(row + 0x10);
     uint64_t layout_root = two_ptr(row_layout) ? rd64(row_layout + 0x18) : 0;
     uint64_t title = two_ptr(layout_root) ? two_pane(layout_root, "T_Option_00") : 0;
-    TwoRow band = {row, 0, 0, 0, 0, {panes[0].frames[2], panes[1].frames[2]}, {0, 0}, -1};
+    TwoRow band = {row, 0, 0, {panes[0].frames[2], panes[1].frames[2]}};
     if (!header && title) {
         band.tog = two_pane(layout_root, "Pa_Btn_00");
         band.band = two_pane(band.tog, "W_Base_02");
-        band.disable = two_pane(band.tog, "N_Disable_00");
-        band.dark = two_pane(band.disable, "W_Base_00");
-        if (!band.band || !band.disable || !band.dark) title = 0;
+        if (!band.band) title = 0;
     }
     if (!title) {
         if (header) hide_failed_header(row);
@@ -1009,24 +1000,12 @@ bool two_configure(uint64_t row) {
     } else {
         two_float(title, 0x30, layout.label_right);
         two_float(title, 0x50, layout.label_width);
-        // The toggle part: only its plate and its box stay (its other panes are hidden for good).
-        float togx = *(float *)(uintptr_t)(band.tog + 0x30);
-        for (uint64_t c = band.tog, n = 0; n < 2; n++) {
-            uint64_t head = c + 0x20, link = rd64(head + 8);
-            for (unsigned k = 0; k < 16 && two_ptr(link) && link != head; k++, link = rd64(link + 8)) {
-                uint64_t child = link - 8;
-                if (child == band.band || child == band.disable || child == band.dark) continue;
-                wr8(child + 0x58, *(uint8_t *)(uintptr_t)(child + 0x58) & ~1u);
-            }
-            c = band.disable;
+        // The toggle part: only its plate stays (its other panes are hidden for good).
+        uint64_t head = band.tog + 0x20, link = rd64(head + 8);
+        for (unsigned k = 0; k < 16 && two_ptr(link) && link != head; k++, link = rd64(link + 8)) {
+            uint64_t child = link - 8;
+            if (child != band.band) wr8(child + 0x58, *(uint8_t *)(uintptr_t)(child + 0x58) & ~1u);
         }
-        band.dark_x[0] = layout.key.center() - togx;
-        band.dark_x[1] = layout.pad.center() - togx;
-        two_float(band.dark, 0x48, 1.f);
-        two_float(band.dark, 0x4c, 1.f);
-        two_float(band.dark, 0x34, 0.f);
-        two_float(band.dark, 0x50, layout.key.width);
-        two_float(band.dark, 0x54, *(float *)(uintptr_t)(panes[0].frames[2] + 0x54));
         for (int col = 0; col < 2; col++) wr8(panes[col].plate + 0x58, *(uint8_t *)(uintptr_t)(panes[col].plate + 0x58) & ~1u);
         g_two_rows.push_back(band);
         two_band_row(g_two_rows.back(), false, 0);
