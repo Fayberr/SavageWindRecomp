@@ -906,7 +906,6 @@ bool two_configure(uint64_t row) {
         if (header && kernel_current_cpu()) hide_failed_header(row);
         return false;
     }
-    long t_a = page_ms(), t_b = 0, t_c = 0;
     uint64_t roots[2], buttons[2], arrows[4];
     TwoButtonPanes panes[2];
     const char *arrow_names[] = {"Pa_ArrowL_00", "Pa_ArrowR_00", "P_Arrow_00", "P_Arrow_01"};
@@ -938,17 +937,12 @@ bool two_configure(uint64_t row) {
     // Validate all panes before the first mutation, leaving ordinary rows usable on failure.
     const auto layout = binding_row_layout();
     float hscale = header ? two_header_scale() : 1.f;
-    t_b = page_ms();
     for (int col = 0; col < 2; col++) {
         two_call(rd64(rd64(buttons[col]) + 0x60), buttons[col], header ? 0 : 1);
-        if (col == 1) t_c = page_ms();
         wr8(roots[col] + 0x58, *(uint8_t *)(uintptr_t)(roots[col] + 0x58) | 1);
         const auto column = col ? layout.pad : layout.key;
         if (header) two_header_geometry(panes[col], column, hscale);
         else two_geometry(panes[col], column);
-        fprintf(stderr, "[row-spike] %s %llx column %d button %llx center %.1f width %.1f\n",
-                header ? "header" : "row", (unsigned long long)row, col, (unsigned long long)buttons[col],
-                column.center(), column.width);
     }
     for (uint64_t arrow : arrows) wr8(arrow + 0x58, *(uint8_t *)(uintptr_t)(arrow + 0x58) & ~1u);
     if (header) {
@@ -959,7 +953,8 @@ bool two_configure(uint64_t row) {
         two_float(title, 0x50, layout.label_width);
         g_two_rows.push_back({row});
     }
-    fprintf(stderr, "[row-spike-t] %s configured at +%ld ms (%zu rows): search %ld ms, guest calls %ld ms, rest %ld ms\n", header ? "header" : "row", page_ms(), g_two_rows.size(), t_b - t_a, t_c - t_b, page_ms() - t_c);
+    if (g_two_rows.size() % 10 == 0) fprintf(stderr, "[row-spike-t] %zu rows configured at +%ld ms
+", g_two_rows.size(), page_ms());
     return true;
 }
 
@@ -1123,9 +1118,7 @@ extern "C" int rt_opt_two_row_state(uint64_t row) {
     return 1;
 }
 extern "C" int rt_opt_two_redraw(uint64_t row) {
-    long t_in = page_ms();
     if (!two_configure(row)) return 0;
-    long t_cfg = page_ms();
     uint32_t msg = MSG_BASE + (rd32(row + 0x50) - GAME_ENTRIES) * 256;
     for (int col = 0; col < 2; col++) {
         uint64_t layout = rd64(rd64(row + (col ? 0x28 : 0x20)) + 0x20);
@@ -1133,7 +1126,6 @@ extern "C" int rt_opt_two_redraw(uint64_t row) {
         two_text(layout, "T_Text_01", msg + (col ? MSG_PAD : MSG_KEY));
     }
     rt_opt_two_row_state(row);
-    fprintf(stderr, "[row-spike-t] redraw: configure %ld ms, texts %ld ms\n", t_cfg - t_in, page_ms() - t_cfg);
     return 1;
 }
 extern "C" int rt_opt_decide(uint64_t row);
