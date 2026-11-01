@@ -1,23 +1,22 @@
 # Per-action bindings
 
-The **Controls** page is a table of the game's actions: one row per thing the game does (Jump, Attack, Cancel...), with a
-controller button and a key of their own each. By default every action does what it always did: it follows the button of
-the Switch input the game ties it to (Jump follows X, Interact follows A...), so nothing changes until you bind one.
-Below the table are the inputs no action covers (sticks, camera, motion, Plus / Minus, the d-pad's quick menus), and,
-folded under **Advanced**, the Switch buttons the actions follow. Game version 1.9.0.
+Each game action owns one keyboard/mouse binding and one controller binding. Its factory defaults are copied from
+its Switch button's original layout using the fixed 1.9.0 mask table below: Jump starts on Space / North, Interact
+on E / East, and so on. Rebinding a raw Switch button no longer changes actions. Multiple actions may share an input.
+Reset restores each action's factory defaults. `ACT_FOLLOW` remains a reset command accepted by `act_set`; it is no
+longer stored in `g_act_key` or `g_act_pad`. `ACT_NONE` unbinds an action side.
 
-- Click a cell, then press the new key or button (Esc or 5 seconds cancels). Mouse buttons work for keys.
-- A cell shows its binding in gold. In grey it shows the button of the Switch input the action follows, which is what
-  it uses until it is given a binding of its own.
-- Right-click a cell: **Use default** (follow the Switch input again) or **Unbind** (nothing presses the action from
-  that device).
-- Two actions can share a key, and an action can leave its Switch button: nothing swaps. (The Switch table still
-  swaps a button that is already in use.)
-- **Reset actions to defaults** clears all of them.
+Movement and camera directions keep their keyboard-only slots and defaults (W S A D / I K J L). Walk, Tilt and all
+seven gyro slots accept both devices; their new controller sides default to unbound (`-1`). Walk scales its device's
+left stick to 40%. Tilt holds the mouse clutch and enables the existing sensorless controller stick tilt path. Gyro
+buttons and keys combine per direction, only while `gyro_keys_live()`; simultaneous opposite directions cancel.
+Host-slot conflicts swap within the same device and gyro context; action bindings never swap other bindings.
 
-An action with no binding of its own is untouched: the game answers from the Switch layer as before. The game's menus
-(title, pause, map), a window that is not focused and the overlay menu always use the Switch layer too, so no binding
-can lock the player out.
+The game's title, pause and map menus still use the raw Switch layer, including legacy raw-button rebinds. The runtime
+overlay and launcher keep their fixed navigation shortcuts. The separate UI update can use `bind_input_name`,
+`bind_input_group` ("gyro" or NULL), and `bind_menu_role` (provisional A/B/L/R roles, otherwise NULL). No slots are hidden
+by these helpers. Use `bind_pad_slot` for controller availability and `bind_is_default_slot` for defaults, including
+`BIND_ACTION + id`; do not test for a stored `ACT_FOLLOW`.
 
 ## The actions
 
@@ -63,7 +62,19 @@ act_pad_9 = none
 ```
 
 `act_key_<id>` / `act_pad_<id>` take a key or controller button name as `bind_key_*` / `bind_pad_*` do (`none`: no
-binding; a missing line: follow). `<id>` is the game's action number, 0 to 40.
+binding). `<id>` is the game's action number, 0 to 40. A missing action/device line starts from its factory default;
+when loading a legacy `bind_key_<button>` or `bind_pad_<button>` line, actions reading that button inherit its value
+unless an explicit action line exists on that device. Explicit lines win in either file order. Migration uses the
+fixed 1.9.0 table, never the current game table. Runtime raw-button edits do not perform migration.
+
+Added controller keys: `bind_pad_walk`, `bind_pad_tilt`, `bind_pad_gyro_up`, `bind_pad_gyro_down`, `bind_pad_gyro_left`,
+`bind_pad_gyro_right`, `bind_pad_gyro_turn_left`, `bind_pad_gyro_turn_right`, `bind_pad_gyro_center`. These and existing
+raw controller bindings accept `none`. All existing keyboard, action and raw-button ini names remain unchanged.
+
+Persistence conflict awaiting a lead decision: differences-only output cannot represent a factory-default action
+that overrides a customized raw button. For example, raw X = H and explicit Jump = Space loads correctly, but saving
+omits Jump's factory-default line, so the next load migrates Jump to H. The current saver retains the requested
+factory-differences-only policy. Preserving that override requires an exception to that policy or migration metadata.
 
 ## How it works
 
@@ -73,41 +84,40 @@ or pressed word, which the game fills from the Switch-style state the runtime ha
 
 `tools/patches.py` `_act_query` puts a call in front of both functions (sites `act_hold`, `act_trig`; the mask table
 is `act_masks`; all three are found by instruction patterns in `tools/game_sites.py`, an optional group like the
-others). `rt_act_query` (runtime/hle/bindings.c) answers for an action with a binding of its own and declines for every
-other, in which case the game's own code runs.
+others). `rt_act_query` (runtime/hle/bindings.c) answers every valid action during gameplay and declines in menus,
+when the window is unfocused or the runtime overlay is open, and for invalid action ids.
 
-An answered action reads the host: the keyboard side from the keys held, the controller side from the buttons held. A
-side left at the default reads the Switch input the game's table assigns the action, as it did before. The main thread
-publishes which actions each side holds on every key or button event; the game thread freezes that once per
+An answered action reads host keys/mouse buttons and controller buttons directly, including factory-default actions.
+The main thread publishes which actions each side holds on every key or button event; the game thread freezes that once per
 controller poll (`act_poll`, in `fill_state`), and "pressed" is the edge between two polls. A press nobody asked about
 before the next poll is kept for the next query, so a short tap is not lost.
 
 ## Known limits
 
-- An action with a binding of its own ignores the game's own **Jump button** option (it swaps the A and X reads for
-  Jump and Interact); bind what you want directly.
+- Host action bindings bypass the game's own **Jump button** option, including factory-default actions. Bind those
+  actions directly. This consequence of explicit defaults needs in-game acceptance.
+- Raw Switch injection (`SAVAGEWIND_INPUT` or a control-endpoint button) does not feed the host action bindings.
+  Action tests and calibration should use host key/controller injection instead.
 - The button icons the game draws follow the Switch layer and the controller family, not the per-action bindings.
 - The 13 ids the game never asks about (1, 4, 6, 7, 8, 16, 20 to 24, 29, 30) are not on the page. No id above 40 is used:
   all 175 query sites (157 calls and 18 tail branches, in 91 functions) pass a constant from 0 to 40.
 
 ## Naming the actions (logging build)
 
-`SAVAGEWIND_ACTLOG=1` makes the runtime print which action ids the game asks about, from where (the caller's address
-and the pad object), and, once per poll, which actions the game's own pad word says are true. With a script that
-presses one Switch button at a time the log says which actions each button drives, which names the actions and checks
-the runtime's mask-to-button table (the D-pad's up / down are not verified yet).
+`SAVAGEWIND_ACTLOG=1` prints the queried action ids, callers and host-action answers. Use host input to exercise
+these bindings (frame numbers must be after the save has loaded). For example:
 
 ```
-python3 tools/actlog_script.py --state stand        # then --state run, --state aim
-SAVAGEWIND_ACTLOG=1 SAVAGEWIND_INPUT="$(python3 tools/actlog_script.py --start 3000 --state stand 2>/dev/null)" \
-    SAVAGEWIND_EXIT_AT=5000 <the game's executable>
+SAVAGEWIND_ACTLOG=1 SAVAGEWIND_HOST_INPUT="3000:key:Space:60" SAVAGEWIND_EXIT_AT=5000 <the game's executable>
 ```
 
-`--start` must fall after the save has loaded and Link stands in the open (the scripted frames count from the boot);
-`actlog_script.py` prints the frame of each press on stderr.
+The historical `tools/actlog_script.py` emits raw Switch injection for calibrating the game table; it does not drive
+host action bindings in the new model.
 
 ## Tests
 
 `make test-actions` (no game files): the answers to the hold / pressed queries, menus falling back, two actions on one
-key, capture of an action slot, the ini round trip (`tools/test_actions.c`), and the generated hook
-(`tools/test_act_site.py`). `tools/test_game_sites.py` covers the site patterns.
+key, all explicit defaults, legacy migration in either order, action and host-slot capture, gyro context swaps,
+reset and ini round trips (`tools/test_actions.c`), and the generated hook (`tools/test_act_site.py`).
+`make test-pc-controls` also checks Walk scaling, shared key/pad Tilt, mouse routing, sensorless dual-stick eligibility,
+and all gyro directions with menu/focus/context gates. `tools/test_game_sites.py` covers the site patterns.
