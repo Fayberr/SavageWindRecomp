@@ -749,10 +749,11 @@ uint64_t g_two_header;
 int g_two_column;
 uint64_t g_two_current;
 bool g_two_focusing;
-// Timing probe (spike only): milliseconds since the page's rows were created
-std::chrono::steady_clock::time_point g_page_t0, g_tick_last;
-long page_ms(void) {
-    return (long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_page_t0).count();
+// Debug log of the two-button rows (SAVAGEWIND_ROW_SPIKE_LOG=1); every stderr line costs about 6 ms on Windows
+bool two_log(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_ROW_SPIKE_LOG") != nullptr;
+    return on;
 }
 
 bool is_binds_header(const Item *it) { return it && it->action == A_BINDS_HEADER; }
@@ -953,7 +954,6 @@ bool two_configure(uint64_t row) {
         two_float(title, 0x50, layout.label_width);
         g_two_rows.push_back({row});
     }
-    if (g_two_rows.size() % 10 == 0) fprintf(stderr, "[row-spike-t] %zu rows configured at +%ld ms\n", g_two_rows.size(), page_ms());
     return true;
 }
 
@@ -1084,8 +1084,6 @@ extern "C" void rt_opt_rows(void) {
     g_reopen = false;
     g_dirty.clear();
     g_two_rows.clear(); g_two_header = 0; g_two_column = 0; g_two_current = 0;
-    g_page_t0 = g_tick_last = std::chrono::steady_clock::now();
-    fprintf(stderr, "[row-spike-t] page %d rows created (+0 ms)\n", page);
 }
 
 // Called only by the strict optional hook group. Other pages use their original instructions.
@@ -1156,7 +1154,7 @@ extern "C" int rt_opt_two_callback(uint64_t screen, uint64_t button, int which) 
             wr64(screen + 0x36c8, row);
             two_call(g_site.opt_two_help, row);
             if (want != col) two_focus(screen, row, want);
-            fprintf(stderr, "[row-spike] select row %llx column %d\n", (unsigned long long)row, want);
+            if (two_log()) fprintf(stderr, "[row-spike] select row %llx column %d\n", (unsigned long long)row, want);
         } else if (which == 1) rt_opt_two_row_state(row);
         else if (which == 2) {
             uint32_t action = rd32(screen + 0x36c0);
@@ -1327,7 +1325,7 @@ extern "C" int rt_opt_decide(uint64_t row) {
         if (two_ready(row) && g_two_column && !slot_has_pad(it->arg)) return 2;  // (no controller side to bind)
         bind_capture_begin(two_ready(row) ? (g_two_column ? BIND_DEV_PAD : BIND_DEV_KEY) : BIND_DEV_ANY, it->arg);
         cap_slot_was = it->arg;
-        if (two_ready(row)) fprintf(stderr, "[row-spike] capture slot %d device %s\n", it->arg,
+        if (two_ready(row) && two_log()) fprintf(stderr, "[row-spike] capture slot %d device %s\n", it->arg,
                                    g_two_column ? "pad" : "key");
         g_cap_row = row;
         g_dirty.push_back(row);
@@ -1359,12 +1357,6 @@ extern "C" uint64_t rt_opt_tick(uint64_t screen) {
     if (g_quit_dialog) {  // (the quit question is up: 1 skips the screen's update, whose dialog handling takes answers)
         quit_poll();
         if (g_quit_dialog) return 1;
-    }
-    {
-        auto now = std::chrono::steady_clock::now();
-        long gap = (long)std::chrono::duration_cast<std::chrono::milliseconds>(now - g_tick_last).count();
-        if (gap > 80 && g_cur_page == P_BINDS) fprintf(stderr, "[row-spike-t] options tick gap %ld ms at +%ld ms\n", gap, page_ms());
-        g_tick_last = now;
     }
     int d, s, ms;
     if (g_cap_row && bind_capture_active(&d, &s, &ms)) cap_slot_was = s;
