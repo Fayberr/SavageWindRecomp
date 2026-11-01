@@ -117,6 +117,7 @@ uint64_t g_quit_dialog;            // the quit question's dialog while it is up
 uint64_t g_quit_owner;             // ... and the screen it came from (title menu or Options; its input is off meanwhile)
 bool g_quit_texts;                 // ... and its texts are still to be given (its two-button layout comes next)
 uint64_t g_cap_row;                // a binding row whose capture is running
+int cap_slot_was = -1;             // ... and its slot (for the redraw once it has ended)
 uint64_t g_size_row;               // the Window size row whose list was opened
 std::atomic<bool> g_size_redraw;   // ... and a size was picked there (render thread): redraw it
 std::vector<uint64_t> g_dirty;     // rows to redraw, one per frame
@@ -749,6 +750,19 @@ void mark_all_rows(uint64_t screen) {
         if (uint64_t r = rd64(rows + 8 * i)) g_dirty.push_back(r);
 }
 
+// Only the binding rows of these two slots (the one just bound and the one it swapped with): a page of ~55 rows
+// redrawn one per frame took two seconds to show the new key
+void mark_bind_rows(uint64_t screen, int slot, int other) {
+    if (!screen) return;
+    int n = (int)rd32(screen + g_site.opt_screen_rows);
+    uint64_t rows = rd64(screen + g_site.opt_screen_rows + 8);
+    for (int i = 0; i < n && i < 64 && rows; i++) {
+        uint64_t r = rd64(rows + 8 * i);
+        const Item *it = item_of_row(r);
+        if (it && it->action == A_BIND && (it->arg == slot || it->arg == other)) g_dirty.push_back(r);
+    }
+}
+
 uint64_t screen_by_id(uint32_t id) {
     uint64_t mgr = rd64(SCREEN_MGR);
     if (!mgr) return 0;
@@ -995,11 +1009,14 @@ extern "C" uint64_t rt_opt_tick(uint64_t screen) {
         if (g_quit_dialog) return 1;
     }
     int d, s, ms;
+    if (g_cap_row && bind_capture_active(&d, &s, &ms)) cap_slot_was = s;
     if (g_cap_row && !bind_capture_active(&d, &s, &ms)) {
         g_cap_row = 0;
         g_hold_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
         settings_save();
-        mark_all_rows(screen);
+        int rd, rs, other, serial;
+        bind_last_result(&rd, &rs, &other, &serial);
+        mark_bind_rows(screen, cap_slot_was, other);
     }
     if (g_size_redraw.exchange(false) && g_size_row) g_dirty.push_back(g_size_row);
     if (!game_options_input_hold()) pc_cursor_options_tick(screen);
