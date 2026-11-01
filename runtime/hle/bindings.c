@@ -366,7 +366,17 @@ static int mask_button(uint32_t m) {
     }
 }
 
-int act_switch_button(int id) { return k_masks && id >= 0 && id < ACT_COUNT ? mask_button(k_masks[id]) : -1; }
+// The game's table for 1.9.0 (CALLSITES of the reverse engineering: all 41 masks). The pages show what an action follows
+// before the game has asked for anything (the start screen, the pause menu), when k_masks is not yet the game's own.
+static const uint32_t k_masks_190[ACT_COUNT] = {
+    0x1, 0x2, 0x8, 0x10, 0x8, 0x1, 0x8, 0x2, 0x8, 0x2, 0x8, 0x8, 0x2, 0x4, 0x2, 0x40, 0x1, 0x80, 0x20, 0x8, 0x2,
+    0x10000, 0x20000, 0x10000, 0x20000, 0x2, 0x1, 0x2000, 0x4000, 0x4, 0x2, 0x4000, 0x4000, 0x2000, 0x1, 0x20000,
+    0x10, 0x20000, 0x1, 0x2, 0x2000};
+
+int act_switch_button(int id) {
+    if (id < 0 || id >= ACT_COUNT) return -1;
+    return mask_button((k_masks ? k_masks : k_masks_190)[id]);
+}
 
 uint64_t act_scan_keys(uint64_t key_buttons, int (*held)(int scancode)) {
     uint64_t out = 0, cu = a_custom;
