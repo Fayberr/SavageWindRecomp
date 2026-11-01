@@ -37,6 +37,8 @@ extern "C" {
 #include "../color_grade.h"
 #include "../pc_cursor.h"
 #include "../window_size.h"
+void guest_call(Cpu *, uint64_t);
+Cpu *kernel_current_cpu(void);
 void rt_request_reboot(int kind);           // runtime/main.c (1: start the game again)
 void menu_request_window_apply(void);       // menu.mm (fullscreen / window size, applied by the window loop)
 void menu_size_list_open(void);             // menu.mm (Window size's list, over the screen)
@@ -70,7 +72,7 @@ const int GAME_ENTRIES = 14;
 const uint32_t GAME_CAMERA_Y = 1, GAME_CAMERA_X = 2, GAME_GYRO = 4, GAME_CAMERA_SENSITIVITY = 7, GAME_AMIIBO = 9,
                GAME_VOICE_BUTTON = 11, GAME_VOICE_LEVEL = 12, GAME_VR = 13;
 const uint32_t MSG_BASE = 9000;  // this file's message ids: MSG_BASE + item * 256 + part (the game's are 0000-0100)
-enum { MSG_TITLE = 0, MSG_DESC = 1, MSG_BUTTON = 2, MSG_VALUE = 16 };
+enum { MSG_TITLE = 0, MSG_DESC = 1, MSG_BUTTON = 2, MSG_KEY = 3, MSG_PAD = 4, MSG_VALUE = 16 };
 enum { MSG_TITLE_QUIT = 1, MSG_QUIT_QUESTION, MSG_QUIT_DESKTOP, MSG_QUIT_START };  // (storage ids below MSG_BASE)
 
 // Row object (0x98 bytes, FUN_7100d1d828): +0x00 screen, +0x50 entry, +0x54 on/off, +0x58 value, +0x5c max,
@@ -737,6 +739,106 @@ const Item *item_of_index(uint32_t idx) {
 }
 const Item *item_of_row(uint64_t row) { return row ? item_of_index(rd32(row + 0x50)) : nullptr; }
 
+// Three rows only. No guest object is enlarged and no shared archive is changed.
+struct TwoRow { uint64_t row; };
+std::vector<TwoRow> g_two_rows;
+int g_two_column;
+uint64_t g_two_current;
+bool g_two_focusing;
+
+bool two_candidate(uint64_t row) {
+    const Item *it = item_of_row(row);
+    return g_cur_page == P_BINDS && g_site.opt_two_redraw && g_site.opt_two_text && g_site.opt_two_help &&
+           g_site.opt_two_pane_calc && g_game_version && !strcmp(g_game_version, "1.9.0") &&
+           (!getenv("SAVAGEWIND_TWO_BUTTON_ROWS") || strcmp(getenv("SAVAGEWIND_TWO_BUTTON_ROWS"), "0")) &&
+           it && it->action == A_BIND && (it->arg == BIND_ACTION || it->arg == BIND_ACTION + 2 ||
+                                        it->arg == BIND_ACTION + 3);
+}
+bool two_ready(uint64_t row) {
+    for (const auto &r : g_two_rows) if (r.row == row) return true;
+    return false;
+}
+uint64_t two_call(uint64_t fn, uint64_t a = 0, uint64_t b = 0, uint64_t d = 0) {
+    Cpu *c = kernel_current_cpu();
+    if (!c) return 0;
+    Cpu saved = *c;
+    c->x[0] = a; c->x[1] = b; c->x[2] = d;
+    guest_call(c, fn);
+    uint64_t result = c->x[0];
+    *c = saved;
+    return result;
+}
+bool two_ptr(uint64_t p) { return p >= 0x7000000000ull && p < 0x7320000000ull; }
+uint64_t two_pane(uint64_t root, const char *name, unsigned depth = 0) {
+    if (!two_ptr(root) || depth > 16) return 0;
+    if (!strncmp((const char *)(uintptr_t)(root + 0xb8), name, 40)) return root;
+    uint64_t head = root + 0x20, link = rd64(head + 8);
+    for (unsigned n = 0; n < 128 && two_ptr(link) && link != head; n++, link = rd64(link + 8))
+        if (uint64_t p = two_pane(link - 8, name, depth + 1)) return p;
+    return 0;
+}
+void two_float(uint64_t pane, unsigned field, float value) {
+    *(float *)(uintptr_t)(pane + field) = value;
+    // Pane::Calculate at opt_two_pane_calc consumes this bit, rebuilds +0x70,
+    // then passes force=true to descendants. Never edit the cached world matrix.
+    wr8(pane + 0x58, *(uint8_t *)(uintptr_t)(pane + 0x58) | 0x10);
+}
+void two_focus(uint64_t screen, uint64_t row, int col) {
+    if (g_two_focusing) return;
+    g_two_focusing = true;
+    g_two_column = col; g_two_current = row;
+    pc_cursor_options_focus(screen, row, col ? KIND_BUTTON : KIND_CHOICE);
+    g_two_focusing = false;
+}
+void two_text(uint64_t layout, const char *pane, uint32_t id) {
+    uint64_t name[] = {g_entries[0].name_vtbl, (uint64_t)(uintptr_t)pane};
+    two_call(g_site.opt_two_text, layout, (uint64_t)(uintptr_t)name, id);
+}
+bool two_configure(uint64_t row) {
+    if (two_ready(row)) return true;
+    if (!two_candidate(row) || !kernel_current_cpu()) return false;
+    uint64_t roots[2], buttons[2], texts[2][2], arrows[4];
+    const char *arrow_names[] = {"Pa_ArrowL_00", "Pa_ArrowR_00", "P_Arrow_00", "P_Arrow_01"};
+    for (int col = 0; col < 2; col++) {
+        buttons[col] = rd64(row + (col ? 0x28 : 0x20));
+        if (!two_ptr(buttons[col]) || !two_ptr(rd64(buttons[col] + 0x20))) return false;
+        roots[col] = rd64(rd64(buttons[col] + 0x20) + 0x18);
+        if (!two_ptr(roots[col]) || !two_ptr(rd64(buttons[col] + 0x60))) return false;
+        for (int t = 0; t < 2; t++) {
+            texts[col][t] = two_pane(roots[col], t ? "T_Text_01" : "T_Text_00");
+            if (!texts[col][t]) return false;
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        arrows[i] = two_pane(roots[0], arrow_names[i]);
+        if (!arrows[i]) return false;
+    }
+    // Validate all panes before the first mutation, leaving ordinary rows usable on failure.
+    for (int col = 0; col < 2; col++) {
+        uint64_t root = roots[col];
+        float x = *(float *)(uintptr_t)(root + 0x30);
+        float scale = *(float *)(uintptr_t)(root + 0x48);
+        two_call(rd64(rd64(buttons[col]) + 0x60), buttons[col], 1);
+        wr8(root + 0x58, *(uint8_t *)(uintptr_t)(root + 0x58) | 1);
+        two_float(root, 0x30, x + (col ? 60.f : -90.f));
+        two_float(root, 0x48, scale * .5f);
+        // Keep native font proportions while narrowing the button and its hit/cursor panes.
+        for (uint64_t text : texts[col]) {
+            two_float(text, 0x48, *(float *)(uintptr_t)(text + 0x48) * 2.f);
+            two_float(text, 0x50, 124.f);
+        }
+        fprintf(stderr, "[row-spike] row %llx column %d button %llx root %.24s x %.1f -> %.1f scale %.2f\n",
+                (unsigned long long)row, col, (unsigned long long)buttons[col],
+                (const char *)(uintptr_t)(root + 0xb8), x, x + (col ? 60.f : -90.f), scale * .5f);
+    }
+    for (uint64_t arrow : arrows) wr8(arrow + 0x58, *(uint8_t *)(uintptr_t)(arrow + 0x58) & ~1u);
+    uint64_t layout = rd64(row + 0x10);
+    uint64_t title = two_ptr(layout) ? two_pane(rd64(layout + 0x18), "T_Option_00") : 0;
+    if (title) two_float(title, 0x30, -30.f), two_float(title, 0x50, 220.f);
+    g_two_rows.push_back({row});
+    return true;
+}
+
 int clamp_value(const Item &it, int x) {
     int n = it.kind == KIND_CHOICE ? it.count(it) : 2;
     return x < 0 ? 0 : x >= n ? n - 1 : x;
@@ -857,6 +959,62 @@ extern "C" void rt_opt_rows(void) {
     g_cur_page = page;
     g_reopen = false;
     g_dirty.clear();
+    g_two_rows.clear(); g_two_column = 0; g_two_current = 0;
+}
+
+// Called only by the strict optional hook group. Other pages use their original instructions.
+extern "C" int rt_opt_two_column(uint64_t row) { return two_ready(row) ? g_two_column : -1; }
+extern "C" uint64_t rt_opt_two_control(uint64_t row) {
+    return two_ready(row) ? rd64(row + (g_two_column ? 0x28 : 0x20)) : 0;
+}
+extern "C" int rt_opt_two_row_state(uint64_t row) {
+    if (!two_ready(row)) return 0;
+    for (unsigned offset : {0x20u, 0x28u}) {
+        uint64_t button = rd64(row + offset);
+        *(uint16_t *)(uintptr_t)(button + 0x3a) |= 4; // both behave as confirmable ordinary controls
+    }
+    return 1;
+}
+extern "C" int rt_opt_two_redraw(uint64_t row) {
+    if (!two_configure(row)) return 0;
+    uint32_t msg = MSG_BASE + (rd32(row + 0x50) - GAME_ENTRIES) * 256;
+    for (int col = 0; col < 2; col++) {
+        uint64_t layout = rd64(rd64(row + (col ? 0x28 : 0x20)) + 0x20);
+        two_text(layout, "T_Text_00", msg + (col ? MSG_PAD : MSG_KEY));
+        two_text(layout, "T_Text_01", msg + (col ? MSG_PAD : MSG_KEY));
+    }
+    rt_opt_two_row_state(row);
+    return 1;
+}
+extern "C" int rt_opt_decide(uint64_t row);
+extern "C" int rt_opt_two_callback(uint64_t screen, uint64_t button, int which) {
+    for (const auto &r : g_two_rows) {
+        uint64_t row = r.row;
+        if (rd64(row) != screen) continue;
+        int col = button == rd64(row + 0x20) ? 0 : button == rd64(row + 0x28) ? 1 : -1;
+        if (col < 0) continue;
+        if (which == 0) {
+            // Up/down keeps the selected device. Mouse focus sets current row first below.
+            int want = !g_two_current || g_two_current == row ? col : g_two_column;
+            g_two_column = want; g_two_current = row;
+            wr64(screen + 0x36c8, row);
+            two_call(g_site.opt_two_help, row);
+            if (want != col) two_focus(screen, row, want);
+            fprintf(stderr, "[row-spike] select row %llx column %d\n", (unsigned long long)row, want);
+        } else if (which == 1) rt_opt_two_row_state(row);
+        else if (which == 2) rt_opt_decide(row);
+        return 1;
+    }
+    return 0;
+}
+extern "C" void rt_opt_two_pointer(uint64_t row, unsigned kind) {
+    if (two_ready(row)) g_two_current = row, g_two_column = kind == KIND_BUTTON;
+}
+extern "C" void rt_opt_two_horizontal(uint64_t screen, unsigned action) {
+    uint64_t row = rd64(screen + 0x36c8);
+    if (!two_ready(row)) return;
+    two_focus(screen, row, action == 2);
+    wr32(screen + 0x36c0, 3); // movement is never confirmation or a value change
 }
 
 // Row init: the flag type of an entry (0 bool, 1 s32); -1: the game's own entry
@@ -950,6 +1108,14 @@ extern "C" int rt_opt_msg(uint32_t id, uint64_t out) {
     bool grey = false;
     if (part == MSG_TITLE) s = tr(it->title);
     else if (part == MSG_DESC) s = it->desc_fn ? it->desc_fn(*it) : tr(it->desc);
+    else if (part == MSG_KEY || part == MSG_PAD) {
+        int dev, slot, ms;
+        bool key = part == MSG_KEY;
+        bool capture = bind_capture_active(&dev, &slot, &ms) && slot == it->arg &&
+                       dev == (key ? BIND_DEV_KEY : BIND_DEV_PAD);
+        s = capture ? tr(key ? "Press a key..." : "Press a button...") :
+                      key ? slot_key_text(it->arg) : slot_pad_text(it->arg);
+    }
     else if (part == MSG_BUTTON) s = it->button ? tr(it->button) : it->label ? it->label(*it, -1) : "";
     else if (part >= MSG_VALUE && it->kind == KIND_CHOICE && (int)(part - MSG_VALUE) < game_count(*it)) {
         int v = game_value(*it, (int)(part - MSG_VALUE));
@@ -976,7 +1142,11 @@ extern "C" int rt_opt_decide(uint64_t row) {
         g_reopen = g_switching = true;
         return 1;
     case A_BIND:
-        bind_capture_begin(BIND_DEV_ANY, it->arg);
+        if (two_ready(row) && rd32(rd64(row) + 0x36c0) != 0) return 2;
+        bind_capture_begin(two_ready(row) ? (g_two_column ? BIND_DEV_PAD : BIND_DEV_KEY) : BIND_DEV_ANY, it->arg);
+        cap_slot_was = it->arg;
+        if (two_ready(row)) fprintf(stderr, "[row-spike] capture slot %d device %s\n", it->arg,
+                                   g_two_column ? "pad" : "key");
         g_cap_row = row;
         g_dirty.push_back(row);
         return 2;
