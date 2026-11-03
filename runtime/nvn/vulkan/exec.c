@@ -8211,7 +8211,10 @@ static void scene_post(Prog *pr, CmdRec *r) {
         // (else at its size in the window already; FSR 3: FSR 1 for a frame it can't do, its first)
         bool up = (fsr || fsr3) && (ow > b->width + 1 || oh > b->height + 1);
         if (t != taa_t) taa = NULL;
-        scene_mip_bias = (taa || fsr3) && ow && b->width ? log2f((float)b->width / (float)ow) - 1.0f : 0.0f;
+        // At 1.0x (Native AA / TAA) a -1.0 mip bias undersamples high-frequency ground/foliage mips and shimmers;
+        // use -0.35 at native resolution and log2(render/output) - 1.0 when upscaling.
+        scene_mip_bias = (taa || fsr3) && ow && b->width
+                             ? log2f((float)b->width / (float)ow) - (ow > b->width + 1 ? 1.0f : 0.35f) : 0.0f;
         static const char *bias_env = (const char *)1;  // (testing) SAVAGEWIND_MIP_BIAS=<levels>: in place of that
         if (bias_env == (const char *)1) bias_env = getenv("SAVAGEWIND_MIP_BIAS");
         if (bias_env && (taa || fsr3)) scene_mip_bias = (float)atof(bias_env);
