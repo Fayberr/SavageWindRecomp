@@ -1276,8 +1276,10 @@ const char *renderer_stats(void) {
     return stats_text;
 }
 
+static uint64_t sbuf_gen;  // bumped whenever st.sbuf changes (cbuf_info memoises the driver constants on it)
 static void st_defaults(void) {
     memset(&st, 0, sizeof st);
+    sbuf_gen++;
     for (int i = 0; i < 16; i++) {
         st.viewport[i][2] = 1280; st.viewport[i][3] = 720;
         st.scissor[i][2] = 16384; st.scissor[i][3] = 16384;
@@ -4555,10 +4557,28 @@ static bool fxaa_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out
     return true;
 }
 
+static VkDescriptorBufferInfo cbuf_info_drv(int stage, ShaderInfo *si, uint32_t gx, uint32_t gy, uint32_t gz);
+static VkDescriptorBufferInfo cbuf_info_k(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz);
+
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
-    static const uint8_t zeros[0x10000];
     if (k == 0) {
+        // Vertex and fragment driver constants hold only that stage's storage-buffer table, which changes a few times a
+        // frame while ~3000 draws ask for it (the dedupe below found the copy again, after zeroing, filling and
+        // comparing 2 KB each time). Same table (sbuf_gen), size and submission: the last copy.
+        static struct { uint64_t seq, gen, size; VkDescriptorBufferInfo bi; } memo[2];
+        uint64_t mseq = vk_pending_seq();
+        uint64_t msize = si->cbuf_size[0] > 0x800 ? 0x800 : (si->cbuf_size[0] ? si->cbuf_size[0] : 256);
+        if (stage < 2 && memo[stage].seq == mseq && memo[stage].gen == sbuf_gen && memo[stage].size == msize) return memo[stage].bi;
+        VkDescriptorBufferInfo mbi = cbuf_info_drv(stage, si, gx, gy, gz);
+        if (stage < 2) { memo[stage].seq = mseq; memo[stage].gen = sbuf_gen; memo[stage].size = msize; memo[stage].bi = mbi; }
+        return mbi;
+    }
+    return cbuf_info_k(stage, si, k, gx, gy, gz);
+}
+
+static VkDescriptorBufferInfo cbuf_info_drv(int stage, ShaderInfo *si, uint32_t gx, uint32_t gy, uint32_t gz) {
+    {
         uint32_t drv[0x800 / 4] = {0};
         if (stage == 5) {
             drv[0x200 / 4] = gx; drv[0x204 / 4] = gy; drv[0x208 / 4] = gz;
@@ -4581,6 +4601,11 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
         if (size < 0x500 && stage == 5) size = 0x500;
         return ubo_span(copy_dedupe(stage == 5 ? DEDUPE_DRV_C : stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, drv, size, 256), size);
     }
+}
+
+static VkDescriptorBufferInfo cbuf_info_k(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
+    static const uint8_t zeros[0x10000];
+    (void)gx; (void)gy; (void)gz;
     if (k == 1) {  // compiler constants stored after the shader code
         NvnShaderStage *ss = &st.program->stages[stage];
         uint64_t size = ss->const_size ? ss->const_size : 16;
@@ -9987,6 +10012,7 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_BIND_STORAGE_BUFFERS:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 16 && r->x[0] < 6; i++)
                 memcpy(&st.sbuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
+            sbuf_gen++;
             break;
         case CMD_BIND_TEXTURES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
