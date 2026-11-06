@@ -1243,6 +1243,21 @@ static uint64_t romfs_file_start(uint64_t off) {
     return ~0ull;
 }
 
+// The last RomFS files each thread read, for the crash report (fs_dump_recent_reads): a crash while a model is
+// being built names the file that thread read just before. The thread is the guest CPU's address.
+#define FS_RING 256
+static struct { uint64_t ns; const void *cpu; const char *path; uint64_t off; } fs_ring[FS_RING];
+static atomic_uint fs_ring_n;
+
+void fs_dump_recent_reads(void) {
+    unsigned n = atomic_load(&fs_ring_n), from = n > FS_RING ? n - FS_RING : 0;
+    fprintf(stderr, "recent RomFS reads (thread = guest cpu, newest last):\n");
+    for (unsigned i = from; i < n; i++) {
+        typeof(fs_ring[0]) e = fs_ring[i % FS_RING];
+        if (e.path) fprintf(stderr, "  %9.3f s  cpu %p  %s @%llx\n", e.ns / 1e9, e.cpu, e.path, (unsigned long long)e.off);
+    }
+}
+
 // Path of the game's RomFS file containing image offset `off` (NULL if none).
 const char *romfs_file_at(uint64_t off) {
     const RomImage *m = &images[0];
@@ -1288,10 +1303,12 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
         if (m != &images[0]) break;
         {
             const char *path = romfs_file_at(off);
-            static const char *last;
+            static __thread const char *last;
             if (path && path != last) {
                 last = path;
                 recent_files[atomic_load(&recent_n) & 7] = path, atomic_fetch_add(&recent_n, 1);
+                unsigned k = atomic_fetch_add(&fs_ring_n, 1) % FS_RING;
+                fs_ring[k] = (typeof(fs_ring[0])){plat_now_ns(), kernel_current_cpu(), path, off};
                 if (getenv("SAVAGEWIND_LOG_FILES")) LOG("[fs] read %s\n", path);
             }
             // SAVAGEWIND_LOG_STREAMS=1: every read of a stream's header (a .bfstm read from its start: the sound

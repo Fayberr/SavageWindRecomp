@@ -220,6 +220,26 @@ static const char *host_sym(uint64_t pc, uint64_t *offset) {
 }
 
 void (*rt_crash_note)(void);
+void fs_dump_recent_reads(void);  // runtime/services/fs.c
+
+// For the model loader crash (the node alloc at f_700155a6b0 returned null): the loader object and the heap it
+// allocates from, as 8-byte words, with a string for each word that points at one.
+static void dump_guest(const char *label, uint64_t a, size_t n) {
+    uint64_t w[64];
+    if (n > sizeof w) n = sizeof w;
+    if (!control_mem_peek(a, w, n)) { fprintf(stderr, "%s %llx: unreadable\n", label, (unsigned long long)a); return; }
+    fprintf(stderr, "%s %llx:\n", label, (unsigned long long)a);
+    for (size_t i = 0; i < n / 8; i++) {
+        char str[48] = "";
+        unsigned char t[40];
+        if (w[i] > 0x10000 && control_mem_peek(w[i], t, sizeof t)) {
+            size_t k = 0;
+            while (k < sizeof t - 1 && t[k] >= 32 && t[k] < 127) k++;
+            if (k >= 5) { memcpy(str, t, k); str[k] = 0; }
+        }
+        fprintf(stderr, "  +%03zx %016llx %s\n", i * 8, (unsigned long long)w[i], str);
+    }
+}
 
 void rt_fatal_trace(void) {
     fprintf(stderr, "host backtrace (guest functions are f_<addr>):\n");
@@ -256,6 +276,22 @@ void rt_fatal_trace(void) {
     int nfiles = fs_recent_files(files, 8);
     if (nfiles) fprintf(stderr, "last RomFS files read (newest last):\n");
     for (int i = 0; i < nfiles; i++) fprintf(stderr, "  %s\n", files[i]);
+    fprintf(stderr, "crashing thread: guest cpu %p\n", (void *)c);
+    if (c && c->x[30] == 0x700155a7a0ull) {
+        uint64_t heap = 0;
+        dump_guest("loader object", c->x[19], 0x200);
+        if (control_mem_peek(c->x[19] + 0x48, &heap, 8) && heap) {
+            uint64_t parent = 0;
+            dump_guest("its heap", heap, 0x200);
+            // the unit heap the temporary heap was carved from, and the heap above that
+            if (control_mem_peek(heap + 0x48, &parent, 8) && parent) {
+                uint64_t gp = 0;
+                dump_guest("parent heap", parent, 0x200);
+                if (control_mem_peek(parent + 0x48, &gp, 8) && gp) dump_guest("grandparent heap", gp, 0x200);
+            }
+        }
+    }
+    fs_dump_recent_reads();
     plat_fatal_notice();
     // our crash handler also catches SIGABRT: without this abort() re-entered it forever (a 5 GB log)
     signal(SIGABRT, SIG_DFL);
