@@ -20,6 +20,7 @@
 
 #include "../../kernel.h"
 #include "../../prof.h"
+#include "../../control.h"
 #include "../../platform.h"
 #include "shaders.h"
 #include "vk.h"
@@ -44,6 +45,7 @@
 #include "../hud_scale.h"
 
 static uint64_t stat_build_waits;  // draws that waited for their pipeline (draw_must_happen)
+static void stage_cpu_control_init(void);
 static uint64_t stat_links_now;    // pipelines linked on the render thread within the frame's budget (link_now)
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static uint64_t draws_total;  // (every draw since the start, never reset: vk_draw_total)
@@ -1386,6 +1388,7 @@ static void st_defaults(void) {
 }
 
 void vk_exec_init(void) {
+    stage_cpu_control_init();
     prof = getenv("SAVAGEWIND_VK_PROF") != NULL;
     profd = prof && atoi(getenv("SAVAGEWIND_VK_PROF")) != 2;
     prof_gpu_finish_hook(gp_finish_capture);
@@ -2721,14 +2724,40 @@ typedef struct {
 
 // Experimental preparation paths, independently selectable for paired measurements.
 // Bits: 1 precomputed binding order, 2 descriptor writes only on misses, 4 bounded driver constants.
+static _Atomic int stage_cpu_options = -1;
 static int stage_cpu_opts(void) {
-    static int opts = -1;
+    int opts = atomic_load_explicit(&stage_cpu_options, memory_order_relaxed);
     if (opts < 0) {
         const char *e = getenv("SAVAGEWIND_VK_CPU_OPTS");
         opts = e ? (int)strtoul(e, NULL, 0) & 7 : 0;
-        LOG("[vk] CPU preparation experiments: mask %d\n", opts);
+        int unset = -1;
+        if (atomic_compare_exchange_strong_explicit(&stage_cpu_options, &unset, opts,
+                memory_order_relaxed, memory_order_relaxed))
+            LOG("[vk] CPU preparation experiments: mask %d\n", opts);
+        else opts = unset;
     }
     return opts;
+}
+
+static void stage_cpu_command(int argc, char **argv, ControlReply *r) {
+    if (argc > 2) { control_fail(r, "cpuopts [0-7]"); return; }
+    if (argc == 2) {
+        char *end;
+        unsigned long mask = strtoul(argv[1], &end, 10);
+        if (!*argv[1] || *end || mask > 7) { control_fail(r, "cpuopts [0-7]"); return; }
+        atomic_store_explicit(&stage_cpu_options, (int)mask, memory_order_relaxed);
+    }
+    control_field_int(r, "mask", stage_cpu_opts());
+}
+
+static void stage_cpu_control_init(void) {
+    // Both paths resolve identical data. A live switch needs no cache flush and
+    // lets repeated measurements share one loaded scene instead of rebooting.
+    if (!control_enabled() || !getenv("SAVAGEWIND_VK_CPU_BENCH")) return;
+    static const ControlCmd cmd[] = {
+        {"cpuopts", "[0-7]", "CPU preparation experiment mask", stage_cpu_command, 0},
+    };
+    control_register(cmd, 1);
 }
 
 // Preserve the reflected order, including the late scale/tint writes, without

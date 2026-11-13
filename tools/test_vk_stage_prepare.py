@@ -27,6 +27,7 @@ FIXTURE = r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,8 +55,11 @@ typedef struct {VkBuffer buf; uint64_t off; void *ptr;} VkSpan;
 static struct {Range ubuf[6][18], sbuf[6][16];} st;
 static float tex_sc[2][64][2];
 static uint32_t tex_wh[2][64][2];
-static int test_options;
-static int stage_cpu_opts(void) {return test_options;}
+#define LOG(...) ((void)0)
+static _Atomic int stage_cpu_options=-1;
+typedef struct {bool failed; int mask;} ControlReply;
+static void control_fail(ControlReply *r,const char *text) {(void)text;r->failed=true;}
+static void control_field_int(ControlReply *r,const char *key,int mask) {(void)key;r->mask=mask;}
 static bool maxwell_gmem_bda;
 static uint64_t stat_sets, stat_sets_reused, setc_gen, pending_seq=1;
 typedef struct {uint64_t seq,hash,hash2; VkDescriptorSetLayout layout; VkDescriptorSet set; uint32_t n;} SetEnt;
@@ -141,7 +145,7 @@ int main(void) {
             uint64_t expected[MAX_BIND][4];memcpy(expected,captured,sizeof expected);
             int expected_n=ncaptured, expected_calls=calls;
             memset(tex_sc,0,sizeof tex_sc);memset(tex_wh,0,sizeof tex_wh);
-            free(setc);setc=NULL;calls=0;ncaptured=-1;test_options=options;
+            free(setc);setc=NULL;calls=0;ncaptured=-1;atomic_store(&stage_cpu_options,options);
             VkDescriptorSet ds=stage_set(&p,(VkDescriptorSetLayout)5,set,set,&si,row,tint,3,4,5,set?pre:NULL,db,&nb);
             assert(ncaptured==expected_n && calls==expected_calls);
             assert(expected_n<=0 || !memcmp(expected,captured,expected_n*sizeof captured[0]));
@@ -162,10 +166,20 @@ int main(void) {
         }
         unsigned char expected[4096];
         driver_reference(stage,&si,11,12,13);int n=last_copy_size;memcpy(expected,last_copy,n);
-        test_options=4;driver_candidate(stage,&si,11,12,13);
+        atomic_store(&stage_cpu_options,4);driver_candidate(stage,&si,11,12,13);
         assert(last_copy_size==n && !memcmp(expected,last_copy,n));
     }
-    free(setc);puts("stage preparation: 24,000 descriptor comparisons and 13,206 driver layouts passed");
+    char *bad[]={"", "8", "-1", "one", "1x", "99999999999999999999999999999999999999"};
+    for(unsigned i=0;i<sizeof bad/sizeof *bad;i++) {
+        char *argv[]={"cpuopts",bad[i]};ControlReply reply={0};
+        atomic_store(&stage_cpu_options,3);stage_cpu_command(2,argv,&reply);
+        assert(reply.failed && stage_cpu_opts()==3);
+    }
+    for(int mask=0;mask<8;mask++) {
+        char value[2]={(char)('0'+mask),0};char *argv[]={"cpuopts",value};ControlReply reply={0};
+        stage_cpu_command(2,argv,&reply);assert(!reply.failed && reply.mask==mask && stage_cpu_opts()==mask);
+    }
+    free(setc);puts("stage preparation: 24,000 descriptor comparisons, 13,206 driver layouts and live switches passed");
 }
 '''
 
@@ -192,7 +206,8 @@ def main():
     reference_finish = function(reference, 'set_finish').replace('set_finish(', 'reference_set_finish(')
     reference_stage = function(reference, 'stage_set').replace('stage_set(', 'reference_stage_set(').replace(
         'set_finish(', 'reference_set_finish(')
-    source = '\n'.join([FIXTURE, function(current, 'stage_plan_init'),
+    source = '\n'.join([FIXTURE, function(current, 'stage_cpu_opts'), function(current, 'stage_cpu_command'),
+                        function(current, 'stage_plan_init'),
                         reference_finish, reference_stage, function(current, 'set_finish'),
                         function(current, 'stage_set'), driver(reference, 'driver_reference'),
                         driver(current, 'driver_candidate'), MAIN])

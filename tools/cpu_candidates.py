@@ -12,6 +12,65 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
+
+
+def live(args, candidates, exe):
+    import perf_routes as routes
+    a = SimpleNamespace(tree=str(args.tree), data_root=args.data_root, save=args.save,
+                        ini=args.ini, exe=str(exe), port=7790, fullscreen=False,
+                        potato=False, ram_mb=0, vram_mb=0, visible=False,
+                        cache_reset=None, duration=args.duration, look_wait=30,
+                        no_trace=False, sample=0, sample_us=2000, settle=8,
+                        top=3, trace_from_boot=False)
+    with (args.out / 'results.csv').open('w', newline='') as stream:
+        writer = csv.DictWriter(stream, routes.FIELDS, extrasaction='ignore')
+        writer.writeheader()
+        for route in (r for r in routes.ROUTES if r[0] in args.routes):
+            folder = args.out / route[0]
+            folder.mkdir(exist_ok=True)
+            if routes.others(a.tree):
+                raise RuntimeError('Another game is running')
+            proc, log = routes.launch(a, str(folder), '2560x1440', 0,
+                ['SAVAGEWIND_TEST_WARP=' + route[1], 'SAVAGEWIND_VK_CPU_BENCH=1',
+                 'SAVAGEWIND_VK_CPU_OPTS=0', 'SAVAGEWIND_VK_PROF=2'])
+            game = None
+            try:
+                game = routes.Game(a.port)
+                routes.wait_world(game, proc, 240)
+                # Establish any route-specific hop and warm the loaded scene.
+                if route[5]:
+                    game.cmd('teleport', *route[5])
+                    if game.poll(['teleport', 'status'], ('done', 'failed', 'idle'), 30) != 'done':
+                        raise RuntimeError('Route hop failed')
+                    game.cmd('fly', 'on')
+                fixed_route = route[:5] + (None,)
+                for round_index in range(args.rounds):
+                    offset = round_index % len(candidates)
+                    order = candidates[offset:] + candidates[:offset]
+                    if round_index % 2:
+                        order.reverse()
+                    for label, mask in order:
+                        reply = game.cmd('cpuopts', mask)
+                        if reply.get('mask') != mask:
+                            raise RuntimeError('CPU switch was not applied')
+                        tag = 'r{}-{}-{}'.format(round_index+1, route[0], label)
+                        a.settle = 8 if round_index == 0 else 3
+                        print('START ' + tag, flush=True)
+                        result = routes.measure(game, a, routes.game_log(a, str(folder)),
+                                                fixed_route, str(folder), tag)
+                        others = routes.others(a.tree)
+                        if others:
+                            raise RuntimeError('Another game started during measurement: ' + str(others))
+                        result.update(config=label, size='2560x1440', run=round_index+1, others=0)
+                        writer.writerow(result)
+                        stream.flush()
+                        print('{}: {:.2f} fps, {:.3f} ms, renderer {:.3f} ms, p99 {:.3f} ms'.format(
+                            tag, result['fps_avg'], result['frame_ms_avg'], result['cpu_render_ms'],
+                            result['p99_ms']), flush=True)
+            finally:
+                routes.stop_game(game, proc, log)
+    print('DONE: ' + str(args.out), flush=True)
 
 
 def main():
@@ -22,6 +81,7 @@ def main():
     ap.add_argument('--ini', required=True)
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--baseline-exe', type=Path)
+    ap.add_argument('--live', action='store_true', help='switch masks in one loaded game per route')
     ap.add_argument('--rounds', type=int, default=3)
     ap.add_argument('--duration', type=float, default=20)
     ap.add_argument('--routes', nargs='+', default=['plateau', 'castle'])
@@ -33,6 +93,8 @@ def main():
         ap.error('Use known configurations, at least one round and at least five seconds per route')
     candidates = [(n, m) for n, m in candidates if n in args.configs]
     if args.baseline_exe:
+        if args.live:
+            ap.error('--live uses one candidate binary; measure the installed baseline separately')
         candidates.insert(0, ('installed', None))
     args.out.mkdir(parents=True, exist_ok=True)
     exe = args.tree / 'build' / ('savagewind.exe' if sys.platform == 'win32' else 'savagewind')
@@ -40,6 +102,8 @@ def main():
                 'candidate_sha256': hashlib.sha256(exe.read_bytes()).hexdigest(),
                 'ini_sha256': hashlib.sha256(Path(args.ini).read_bytes()).hexdigest()}
     (args.out / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+    if args.live:
+        return live(args, candidates, exe)
     for round_index in range(args.rounds):
         offset = round_index % len(candidates)
         order = candidates[offset:] + candidates[:offset]

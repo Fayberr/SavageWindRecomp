@@ -6,7 +6,7 @@ does not avoid constructing their input writes. These independent experiments
 reduce preparation without changing the resources resolved or cache validity.
 They are off by default while their performance is evaluated.
 
-`SAVAGEWIND_VK_CPU_OPTS` is a bit mask, read once per process:
+`SAVAGEWIND_VK_CPU_OPTS` supplies the initial bit mask:
 
 | Bit | Change |
 | --- | --- |
@@ -63,3 +63,12 @@ route, and report slow frames separately. Individual gains need not add to the
 combined gain. A screening round is not enough to establish small improvements;
 repeat promising configurations in an interleaved order before selecting a
 play build.
+
+For faster repeats, `--live` boots once per route and changes the mask in the
+same loaded scene. It enables the developer-only `cpuopts [0-7]` command with
+`SAVAGEWIND_VK_CPU_BENCH=1`. The command atomically publishes the mask; it changes
+preparation paths with identical contents, so no resource invalidation is needed.
+It is not registered in ordinary play. The normal descriptor cache remains warm
+across switches; this measures steady gameplay, while the separate-boot mode
+also exercises startup. Keep the installed-binary comparison separate from a
+live run. Small effects still require repeated, interleaved measurements.
