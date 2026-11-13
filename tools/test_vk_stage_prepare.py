@@ -49,17 +49,24 @@ typedef struct {uint32_t set, binding; VkDescriptorType type;} VkBindingInfo;
 typedef struct {
     VkBindingInfo binds[MAX_BIND]; int nbinds;
     uint8_t bind_order[2][MAX_BIND], nstage[2], nlate[2];
+    bool reuse_stage[2];
 } Prog;
-typedef struct {int ntex; uint32_t cbuf_size[18];} ShaderInfo;
+typedef struct {int ntex; uint32_t cbuf_size[18]; bool uses_gmem, writes_gmem;} ShaderInfo;
 typedef struct {VkBuffer buf; uint64_t off; void *ptr;} VkSpan;
-static struct {Range ubuf[6][18], sbuf[6][16];} st;
+typedef struct {int unused;} NvnProgram;
+static struct {Range ubuf[6][18], sbuf[6][16]; NvnProgram *program;} st;
+static uint64_t gcopy_gen=1, uub_serial, gw_gen;
+static struct {float s;} sdw_fix;
+static struct {float sx;} up_fix;
+static bool fxaa_off;
 static float tex_sc[2][64][2];
 static uint32_t tex_wh[2][64][2];
 #define LOG(...) ((void)0)
 static _Atomic int stage_cpu_options=-1;
+static _Atomic uint64_t stage_reuse_calls, stage_reuse_eligible, stage_reuse_hits;
 typedef struct {bool failed; int mask;} ControlReply;
 static void control_fail(ControlReply *r,const char *text) {(void)text;r->failed=true;}
-static void control_field_int(ControlReply *r,const char *key,int mask) {(void)key;r->mask=mask;}
+static void control_field_int(ControlReply *r,const char *key,int mask) {if(!strcmp(key,"mask"))r->mask=mask;}
 static bool maxwell_gmem_bda;
 static uint64_t stat_sets, stat_sets_reused, setc_gen, pending_seq=1;
 typedef struct {uint64_t seq,hash,hash2; VkDescriptorSetLayout layout; VkDescriptorSet set; uint32_t n;} SetEnt;
@@ -136,7 +143,7 @@ int main(void) {
         stage_plan_init(&p);
         VkDescriptorImageInfo pre[64];
         for(int t=0;t<64;t++) pre[t]=(VkDescriptorImageInfo){(VkSampler)(uintptr_t)(300+t),(VkImageView)(uintptr_t)(400+t),VK_IMAGE_LAYOUT_GENERAL};
-        for(int options=0;options<8;options++)for(int set=0;set<2;set++) {
+        for(int options=0;options<16;options++)for(int set=0;set<2;set++) {
             float row[4]={1,2,3,4}, tint[8]={1,2,3,4,5,6,7,8};
             uint32_t da[32]={0},db[32]={0};int na=0,nb=0;
             memset(tex_sc,0,sizeof tex_sc);memset(tex_wh,0,sizeof tex_wh);
@@ -169,17 +176,57 @@ int main(void) {
         atomic_store(&stage_cpu_options,4);driver_candidate(stage,&si,11,12,13);
         assert(last_copy_size==n && !memcmp(expected,last_copy,n));
     }
-    char *bad[]={"", "8", "-1", "one", "1x", "99999999999999999999999999999999999999"};
+    // A qualifying material stage: actual preparation is bypassed on a hit,
+    // and every independent input or lifetime change forces preparation again.
+    Prog p={.nbinds=4,.binds={{1,3,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC},
+        {1,32,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},{1,18,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER},
+        {1,19,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER}}};
+    ShaderInfo si={.ntex=1}; stage_plan_init(&p);
+    VkDescriptorImageInfo images[1]={{(VkSampler)5,(VkImageView)6,VK_IMAGE_LAYOUT_GENERAL}};
+    float row[4]={1,1},tint[8]={0};uint32_t da[32],db[32];int na=0,nb=0;
+    atomic_store(&stage_cpu_options,10);gcopy_gen++;
+    stage_set(&p,(VkDescriptorSetLayout)5,1,1,&si,row,tint,0,0,0,images,da,&na);
+    int before=calls;
+    stage_set(&p,(VkDescriptorSetLayout)5,1,1,&si,row,tint,0,0,0,images,db,&nb);
+    assert(na==nb && !memcmp(da,db,na*sizeof da[0]));
+    assert(cached ? calls==before : calls>before);
+    for(int change=0;change<16;change++) {
+        switch(change) {
+        case 0:st.ubuf[1][0].addr++;break; case 1:st.ubuf[1][0].size++;break;
+        case 2:st.sbuf[1][0].addr++;break; case 3:st.sbuf[1][0].size++;break;
+        case 4:gcopy_gen++;break; case 5:uub_serial++;break;case 6:gw_gen++;break;
+        case 7:pending_seq++;break;case 8:setc_gen++;break;
+        case 9:images[0].imageView=(VkImageView)7;break;case 10:images[0].sampler=(VkSampler)8;break;
+        case 11:images[0].imageLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;break;
+        case 12:row[0]++;break;case 13:tint[0]++;break;case 14:tex_sc[1][0][0]++;break;
+        case 15:st.program=(NvnProgram*)1;break;
+        }
+        before=calls;
+        stage_set(&p,(VkDescriptorSetLayout)5,1,1,&si,row,tint,0,0,0,images,NULL,NULL);
+        assert(calls>before);
+        before=calls;
+        stage_set(&p,(VkDescriptorSetLayout)5,1,1,&si,row,tint,0,0,0,images,NULL,NULL);
+        assert(cached ? calls==before : calls>before);
+    }
+    for(int special=0;special<6;special++) {
+        if(special==0)sdw_fix.s=2;if(special==1)up_fix.sx=2;if(special==2)fxaa_off=true;
+        if(special==3)si.uses_gmem=true;if(special==4)si.writes_gmem=true;if(special==5)p.reuse_stage[1]=false;
+        before=calls;
+        stage_set(&p,(VkDescriptorSetLayout)5,1,1,&si,row,tint,0,0,0,images,NULL,NULL);
+        assert(calls>before);
+        sdw_fix.s=up_fix.sx=0;fxaa_off=si.uses_gmem=si.writes_gmem=false;p.reuse_stage[1]=true;
+    }
+    char *bad[]={"", "16", "-1", "one", "1x", "99999999999999999999999999999999999999"};
     for(unsigned i=0;i<sizeof bad/sizeof *bad;i++) {
         char *argv[]={"cpuopts",bad[i]};ControlReply reply={0};
         atomic_store(&stage_cpu_options,3);stage_cpu_command(2,argv,&reply);
         assert(reply.failed && stage_cpu_opts()==3);
     }
-    for(int mask=0;mask<8;mask++) {
-        char value[2]={(char)('0'+mask),0};char *argv[]={"cpuopts",value};ControlReply reply={0};
+    for(int mask=0;mask<16;mask++) {
+        char value[16];snprintf(value,sizeof value,"%d",mask);char *argv[]={"cpuopts",value};ControlReply reply={0};
         stage_cpu_command(2,argv,&reply);assert(!reply.failed && reply.mask==mask && stage_cpu_opts()==mask);
     }
-    free(setc);puts("stage preparation: 24,000 descriptor comparisons, 13,206 driver layouts and live switches passed");
+    free(setc);puts("stage preparation: 48,000 descriptor comparisons, 13,206 driver layouts, reuse invalidation and live switches passed");
 }
 '''
 
@@ -209,7 +256,7 @@ def main():
     source = '\n'.join([FIXTURE, function(current, 'stage_cpu_opts'), function(current, 'stage_cpu_command'),
                         function(current, 'stage_plan_init'),
                         reference_finish, reference_stage, function(current, 'set_finish'),
-                        function(current, 'stage_set'), driver(reference, 'driver_reference'),
+                        function(current, 'stage_set_prepare'), function(current, 'stage_set'), driver(reference, 'driver_reference'),
                         driver(current, 'driver_candidate'), MAIN])
     with tempfile.TemporaryDirectory(prefix='swr-stage-test-') as temp:
         path = Path(temp) / 'test.c'
