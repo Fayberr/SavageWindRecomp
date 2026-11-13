@@ -2710,6 +2710,7 @@ typedef struct {
     VkShaderModule vs, fs;
     VkBindingInfo binds[MAX_BIND];
     int nbinds;
+    uint8_t bind_order[2][MAX_BIND], nstage[2], nlate[2];
     VkDescriptorSetLayout set_layout[2];
     VkPipelineLayout layout;
     struct StageBuildRef { void *v, *f; } stages;  // (the ProgBuild's StageBuilds: graphics pipeline libraries)
@@ -2717,6 +2718,38 @@ typedef struct {
     uint8_t fs_gather;  // (up_fix) the fragment stage's first gathered texture: 0 not looked yet, 1 none, 2 + its slot
     _Atomic int state;  // 0 building, 1 ready, 2 failed
 } Prog;
+
+// Experimental preparation paths, independently selectable for paired measurements.
+// Bits: 1 precomputed binding order, 2 descriptor writes only on misses, 4 bounded driver constants.
+static int stage_cpu_opts(void) {
+    static int opts = -1;
+    if (opts < 0) {
+        const char *e = getenv("SAVAGEWIND_VK_CPU_OPTS");
+        opts = e ? (int)strtoul(e, NULL, 0) & 7 : 0;
+        LOG("[vk] CPU preparation experiments: mask %d\n", opts);
+    }
+    return opts;
+}
+
+// Preserve the reflected order, including the late scale/tint writes, without
+// scanning both stages twice for each draw. Published with the program's state.
+static void stage_plan_init(Prog *p) {
+    for (int set = 0; set < 2; set++) {
+        int n = 0;
+        for (int i = 0; i < p->nbinds; i++) {
+            const VkBindingInfo *b = &p->binds[i];
+            if (b->set == (uint32_t)set && !(b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+                (b->binding == 18 || b->binding == 19))) p->bind_order[set][n++] = (uint8_t)i;
+        }
+        p->nstage[set] = (uint8_t)n;
+        for (int i = 0; i < p->nbinds; i++) {
+            const VkBindingInfo *b = &p->binds[i];
+            if (b->set == (uint32_t)set && b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+                (b->binding == 18 || b->binding == 19)) p->bind_order[set][n++] = (uint8_t)i;
+        }
+        p->nlate[set] = (uint8_t)(n - p->nstage[set]);
+    }
+}
 
 // The push constants of a motion vector program (mvec.c MVEC_PUSH: the history offsets of the previous frame's
 // constant buffers), in the layouts of its stages, their libraries and the program
@@ -2987,6 +3020,7 @@ static void compile_program(void *arg) {
     if (!b) { atomic_store(&p->state, 2); return; }
     p->nbinds = b->nbinds;
     memcpy(p->binds, b->binds, sizeof b->binds[0] * (size_t)b->nbinds);
+    stage_plan_init(p);
     p->vs = b->vs;
     p->fs = b->fs;
     p->set_layout[0] = b->set_layout[0];
@@ -5008,7 +5042,11 @@ static bool fxaa_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
     if (k == 0) {
-        uint32_t drv[0x800 / 4] = {0};
+        uint32_t drv[0x800 / 4];
+        uint64_t size = si->cbuf_size[0] > sizeof drv ? sizeof drv : (si->cbuf_size[0] ? si->cbuf_size[0] : 256);
+        if (size < 0x500 && stage == 5) size = 0x500;
+        bool bounded = (stage_cpu_opts() & 4) != 0;
+        memset(drv, 0, bounded ? size : sizeof drv);
         if (stage == 5) {
             drv[0x200 / 4] = gx; drv[0x204 / 4] = gy; drv[0x208 / 4] = gz;
             for (int i = 0; i < 16; i++) {
@@ -5019,15 +5057,13 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
             }
         } else {
             uint32_t base = 0x110 + 0x100 * (stage == 1 ? 4 : 0);
-            for (int i = 0; i < 16; i++) {
+            for (int i = 0; i < 16 && (!bounded || base + 16 * i < size); i++) {
                 uint32_t *e = &drv[(base + 16 * i) / 4];
                 e[0] = (uint32_t)st.sbuf[stage][i].addr;
                 e[1] = (uint32_t)(st.sbuf[stage][i].addr >> 32);
                 e[2] = (uint32_t)st.sbuf[stage][i].size;
             }
         }
-        uint64_t size = si->cbuf_size[0] > sizeof drv ? sizeof drv : (si->cbuf_size[0] ? si->cbuf_size[0] : 256);
-        if (size < 0x500 && stage == 5) size = 0x500;
         return ubo_span(copy_dedupe(stage == 5 ? DEDUPE_DRV_C : stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, drv, size, 256), size);
     }
     if (k == 1) {  // compiler constants stored after the shader code
@@ -6765,7 +6801,8 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
 typedef struct { uint64_t seq, hash, hash2; VkDescriptorSetLayout layout; VkDescriptorSet set; uint32_t n; } SetEnt;
 static SetEnt *setc;
 
-static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescriptorSet *w, int n) {
+static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescriptorSet *w, int n, const VkBindingInfo *const *binds,
+                                   const VkDescriptorBufferInfo *bi, const VkDescriptorImageInfo *ii) {
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_VK_NO_SET_CACHE") != NULL;
     stat_sets++;
@@ -6776,15 +6813,19 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
         h2 = h ^ 0x6A09E667F3BCC909ull;
         for (int i = 0; i < n; i++) {
             uint64_t v[4];
-            v[0] = w[i].dstBinding | (uint64_t)w[i].descriptorType << 32;
-            if (w[i].pImageInfo) {
-                v[1] = (uint64_t)(uintptr_t)w[i].pImageInfo->sampler;
-                v[2] = (uint64_t)(uintptr_t)w[i].pImageInfo->imageView;
-                v[3] = w[i].pImageInfo->imageLayout;
+            const VkDescriptorImageInfo *image = binds ?
+                (binds[i]->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ? &ii[i] : NULL) : w[i].pImageInfo;
+            const VkDescriptorBufferInfo *buffer = binds ? &bi[i] : w[i].pBufferInfo;
+            v[0] = binds ? binds[i]->binding | (uint64_t)binds[i]->type << 32 :
+                          w[i].dstBinding | (uint64_t)w[i].descriptorType << 32;
+            if (image) {
+                v[1] = (uint64_t)(uintptr_t)image->sampler;
+                v[2] = (uint64_t)(uintptr_t)image->imageView;
+                v[3] = image->imageLayout;
             } else {
-                v[1] = (uint64_t)(uintptr_t)w[i].pBufferInfo->buffer;
-                v[2] = w[i].pBufferInfo->offset;
-                v[3] = w[i].pBufferInfo->range;
+                v[1] = (uint64_t)(uintptr_t)buffer->buffer;
+                v[2] = buffer->offset;
+                v[3] = buffer->range;
             }
             for (int k = 0; k < 4; k++) {
                 h = (h ^ v[k]) * 0x9E3779B97F4A7C15ull; h ^= h >> 29;
@@ -6800,7 +6841,17 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
         }
     }
     VkDescriptorSet ds = vk_alloc_set(layout);
-    for (int i = 0; i < n; i++) w[i].dstSet = ds;
+    for (int i = 0; i < n; i++) {
+        if (binds) {
+            // Most sets hit the cache. Build the Vulkan writes only when the
+            // existing content hashes require an allocation and update.
+            w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstBinding = binds[i]->binding, .descriptorCount = 1, .descriptorType = binds[i]->type};
+            if (binds[i]->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) w[i].pImageInfo = &ii[i];
+            else w[i].pBufferInfo = &bi[i];
+        }
+        w[i].dstSet = ds;
+    }
     if (n) rec_UpdateDescriptorSets((uint32_t)n, w);
     if (e) {
         e->seq = vk_pending_seq() + (setc_gen << 40);  // (the set lives in this submission's pools)
@@ -7074,7 +7125,10 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
 #endif
     struct { uint32_t binding, off; } dv[32];
     int nd = 0;
+    int opts = stage_cpu_opts();
+    bool planned = (opts & 1) != 0, compact = (opts & 2) != 0;
     VkWriteDescriptorSet w[MAX_BIND];
+    const VkBindingInfo *bindings[MAX_BIND];
     VkDescriptorBufferInfo bi[MAX_BIND];
     VkDescriptorImageInfo ii[MAX_BIND];
     int n = 0;
@@ -7086,10 +7140,12 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     float rs[65][4];
     if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
     else rs[0][0] = rs[0][1] = 1, rs[0][2] = rs[0][3] = 0;
-    for (int i = 0; i < p->nbinds; i++) {
-        VkBindingInfo *b = &p->binds[i];
+    int count = planned ? p->nstage[set] : p->nbinds;
+    for (int i = 0; i < count; i++) {
+        VkBindingInfo *b = &p->binds[planned ? p->bind_order[set][i] : i];
         if (b->set != set) continue;
-        w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE, .dstBinding = b->binding,
+        bindings[n] = b;
+        if (!compact) w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE, .dstBinding = b->binding,
                                       .descriptorCount = 1, .descriptorType = b->type};
         if (b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b->binding >= 32) {
             int ti = (int)b->binding - 32;
@@ -7101,13 +7157,13 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 tex_sc[sg][ti][0] = sc[0]; tex_sc[sg][ti][1] = sc[1];
                 tex_wh[sg][ti][0] = wh[0]; tex_wh[sg][ti][1] = wh[1];
             }
-            w[n].pImageInfo = &ii[n];
+            if (!compact) w[n].pImageInfo = &ii[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding == GMEM_BUFFER_INDEX && maxwell_gmem_bda) {
             bi[n] = gmem_info();
-            w[n].pBufferInfo = &bi[n];
+            if (!compact) w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding < 17) {
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
-            w[n].pBufferInfo = &bi[n];
+            if (!compact) w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC && nd < 32) {
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
             int k = nd++;  // (by binding: the order vkCmdBindDescriptorSets takes them in)
@@ -7115,22 +7171,24 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             dv[k].binding = b->binding;
             dv[k].off = (uint32_t)bi[n].offset;
             bi[n].offset = 0;
-            w[n].pBufferInfo = &bi[n];
+            if (!compact) w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
             bi[n] = b->binding == MVEC_HISTORY_BINDING ? mvec_history_info()
                   : b->binding == GSNAP_BUFFER_INDEX   ? gsnap_info(stage)
                   : b->binding == GMEM2_BUFFER_INDEX   ? gmem_info_hi()
                                                        : gmem_info();
-            w[n].pBufferInfo = &bi[n];
+            if (!compact) w[n].pBufferInfo = &bi[n];
         } else {
             continue;  // rscale / tint: written below, once the textures (and their scales) are known
         }
         n++;
     }
-    for (int i = 0; i < p->nbinds; i++) {
-        VkBindingInfo *b = &p->binds[i];
+    count = planned ? p->nlate[set] : p->nbinds;
+    for (int i = 0; i < count; i++) {
+        VkBindingInfo *b = &p->binds[planned ? p->bind_order[set][p->nstage[set] + i] : i];
         if (b->set != set || b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || (b->binding != 18 && b->binding != 19)) continue;
-        w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE, .dstBinding = b->binding,
+        bindings[n] = b;
+        if (!compact) w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE, .dstBinding = b->binding,
                                       .descriptorCount = 1, .descriptorType = b->type};
         if (b->binding == 18) {
             for (int t = 0; t < si->ntex && t < 64; t++)
@@ -7140,11 +7198,11 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             float zero[8] = {0};
             bi[n] = ubo_span(copy_dedupe(DEDUPE_TINT, tint ? tint : zero, 32, 256), 32);
         }
-        w[n].pBufferInfo = &bi[n];
+        if (!compact) w[n].pBufferInfo = &bi[n];
         n++;
     }
     for (int i = 0; i < nd && dyn; i++) dyn[(*ndyn)++] = dv[i].off;
-    return set_finish(layout, w, n);
+    return set_finish(layout, w, n, compact ? bindings : NULL, bi, ii);
 }
 
 // ================================================================== compute
@@ -7234,6 +7292,7 @@ static void build_compute(void *arg) {
     }
     cp->p.nbinds = c->nbinds;
     memcpy(cp->p.binds, c->binds, sizeof c->binds[0] * (size_t)c->nbinds);
+    stage_plan_init(&cp->p);
     cp->p.set_layout[0] = c->set_layout;
     cp->p.layout = c->layout;
     cp->pipe = c->pipe;

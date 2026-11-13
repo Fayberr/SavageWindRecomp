@@ -160,7 +160,7 @@ def others(tree):
     processes this script did not start (the player's game)."""
     if os.name != 'nt':
         return ['{} (session {})'.format(p, s) for p, s in linux_games() if s not in MY_SESSIONS]
-    ps = subprocess.run(['powershell', '-NoProfile', '-Command',
+    ps = subprocess.run(['pwsh', '-NoProfile', '-Command',
                          "Get-CimInstance Win32_Process -Filter \"Name='savagewind.exe'\" | "
                          "ForEach-Object { \"$($_.ProcessId) $($_.ExecutablePath)\" }"], capture_output=True, text=True)
     mine = os.path.normcase(os.path.abspath(tree))
