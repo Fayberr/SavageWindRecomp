@@ -1,74 +1,82 @@
-# CPU stage-preparation experiments
+# CPU candidates handoff
 
-The renderer prepares the resource inputs of both shader stages on every draw.
-The existing descriptor cache avoids most Vulkan allocations and updates, but
-does not avoid constructing their input writes. These independent experiments
-reduce preparation without changing the resources resolved or cache validity.
-They are off by default while their performance is evaluated.
+The experiment is stopped after both routes. The original play executable is
+restored and the Aktueller Build shortcut target is unchanged. Candidates remain
+opt-in on branch `perf/cpu-candidates-20261113`; none was selected for play.
 
-`SAVAGEWIND_VK_CPU_OPTS` supplies the initial bit mask:
+## Results, 2026-11-13
 
-| Bit | Change |
-| --- | --- |
-| 1 | Build an ordered binding plan when a graphics or compute program is compiled. Preserve reflection order and the late scale/tint writes, while avoiding two scans of both stages for each draw. |
-| 2 | Resolve resource data as before, but construct `VkWriteDescriptorSet` objects only after a descriptor-cache miss. Keep both existing content hashes, submission lifetime and invalidation. |
-| 4 | Clear only the driver-constant bytes that can be copied, and omit graphics storage slots outside that range. Preserve compute's minimum 0x500-byte span. |
+Median of three 15-second windows per candidate and route, from one loaded game
+per route. Renderer ms is `cpu_render_ms`: render-thread CPU time divided by
+presented frames, not the wall time of `backend_execute`. FPS is independently
+medianed. All 30 windows completed; no pipeline compiles were recorded in them.
 
-`0` is the candidate binary's control path; `7` enables all three. The controls
-do not change guest-memory snapshots, texture freshness, dynamic offsets, GPU
-barriers or deferred destruction. Program plans are published with the existing
-atomic program-ready state and have the same lifetime as the program.
+| Candidate | Mask | Plateau renderer ms | Plateau FPS | Castle renderer ms | Castle FPS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Control | 0 | 10.035 | 92.55 | 10.285 | 86.58 |
+| Precomputed binding order | 1 | 9.903 | 93.59 | 9.578 | 92.95 |
+| Descriptor writes only on cache misses | 2 | 9.863 | 95.02 | 9.654 | 96.04 |
+| Bounded driver-constant packing | 4 | 10.021 | 92.86 | 9.486 | 98.26 |
+| All three | 7 | 10.005 | 91.79 | 8.999 | 104.88 |
 
-## Correctness checks
+Hardware: Ryzen 5700X3D, RTX 3080 Ti, NVIDIA 610.47, Windows. Source: `cb202ef`
+plus these experiments, MSYS2 UCRT64 clang 23.1.4, PGO + ThinLTO. Output 1440p,
+FSR1 Ultra Quality, FXAA, high shadows, medium draw distance, FG off; other
+visual settings copied from the play INI. Benchmark FPS uncapped, VSync off.
+Stack sampling and per-draw timers off; whole-list timing and frame tracing on.
 
-Freeze the previous executor source before editing, then run:
+**Limits:** control FPS ranged 86.02-93.49 on Plateau and 78.10-103.55 at Castle.
+These medians include substantial temporal variation and do not establish causal
+percentage gains, a 25% CPU reduction or consistent 100 FPS. All-three did not
+improve Plateau's median FPS. The recorded run's order is in `live/run.log`;
+the harness's paired-order correction was made afterward and was not rerun.
+The optional `binding_writes` mask 3 was not performance-tested. No follow-up
+matrix or new optimization was started after the stop instruction.
+
+Evidence: `build/cpu-candidates/live/results.csv`, manifest, route screenshots and
+traces; `live.log` on Windows, `live/run.log` and `live/summary.json` in the Linux
+analysis copy. The preserved executable is `build/cpu-candidates/candidate/`
+with its matching game DLL, ID and manifest. Generated artifacts stay uncommitted.
+
+## Running the harness
+
+From this branch in the Windows checkout, using `pwsh` and Python 3:
+
+```powershell
+$tree = (Get-Location).Path
+$env:PATH = "C:\msys64\ucrt64\bin;C:\msys64\usr\bin;$env:PATH"
+$testSave = 'path\to\pristine-test-save-parent' # contains save_0
+python tools/cpu_candidates.py --tree $tree `
+  --exe "$tree\build\cpu-candidates\candidate\savagewind.exe" `
+  --data-root "$tree\build\smoke-data" --save $testSave `
+  --ini "$tree\build\cpu-candidates\owner-settings.ini" `
+  --out "$tree\build\cpu-candidates\repeat" `
+  --live --rounds 3 --duration 15 --routes plateau castle
+```
+
+The test-save parent must contain `save_0`. Use an isolated data root, a new
+output directory and `pwsh`; the harness copies the save/settings for each boot.
+The five default configurations are `control binding writes driver all`.
+`--live` switches masks through the opt-in developer command `cpuopts`; ordinary
+play defaults to mask 0. Existing descriptor hashes and resource invalidation
+remain in use. No write detection or GPU synchronization is disabled.
+
+Omit `--live` for separate boots; add `--baseline-exe` for an installed-binary
+comparison. Those options cannot be combined. Keep every Windows executable
+named `savagewind.exe` in its own folder with the matching game DLL; renaming
+one breaks the DLL's runtime imports.
+
+## Verification
+
+Windows native build and gameplay completed. Synthetic ASan/UBSan checks passed
+24,000 descriptor comparisons and 13,206 driver layouts per descriptor-cache
+mode (enabled/disabled), plus live-switch validation. Plateau control/all
+screenshots were inspected. No new full Vulkan-validation or long-session run.
+The native build ignored nine stale PGO function profiles. Linux runtime compile
+was unavailable because SDL3 headers were missing; the standalone checks passed.
 
 ```sh
 git show cb202ef:runtime/nvn/vulkan/exec.c > /tmp/swr-reference-exec.c
 python3 tools/test_vk_stage_prepare.py --reference /tmp/swr-reference-exec.c
 python3 tools/test_feedback_alias.py
 ```
-
-The differential test compiles the actual preparation functions with synthetic
-resource providers under AddressSanitizer and UndefinedBehaviorSanitizer. It
-compares write contents and order, resource-provider calls, dynamic offsets,
-cache hits and generation invalidation for all eight masks. It includes empty
-layouts and runs with the descriptor cache enabled and disabled. Driver packing
-is compared for every byte size from 0 through 2200 and all six stages.
-
-These checks do not replace a native build, gameplay inspection or Vulkan
-validation. Windows sparse guest-memory handling is unchanged by the experiment.
-
-## Interleaved measurements
-
-`tools/cpu_candidates.py` wraps the existing `tools/perf_routes.py` harness. Pass
-the existing checkout, an isolated data root, a pristine test-save folder, a
-settings file and an output directory using its required options. It compares
-the control, each bit separately and all bits together, rotating their order on
-subsequent rounds. It uses 1440p output, uncapped rendering and no frame
-generation. The input settings provide upscaling, anti-aliasing, shadows and
-draw distance. Stack sampling and per-draw timers are disabled; whole-list
-timing and frame tracing remain enabled consistently for every configuration.
-
-Use `--baseline-exe` to include the previously installed executable. On Windows,
-place that binary in a separate folder as `savagewind.exe` alongside its matching
-`swgame.dll` and ID. Do not rename the executable: the game DLL imports runtime
-functions by that module name. This baseline distinguishes runtime-switch gains
-from compilation or profile-counter effects.
-
-Each boot receives a fresh copy of the test save and a separate settings file.
-The manifest records executable and settings hashes. Results, logs and
-screenshots remain private build artifacts. Compare FPS and frame time per
-route, and report slow frames separately. Individual gains need not add to the
-combined gain. A screening round is not enough to establish small improvements;
-repeat promising configurations in an interleaved order before selecting a
-play build.
-
-For faster repeats, `--live` boots once per route and changes the mask in the
-same loaded scene. It enables the developer-only `cpuopts [0-7]` command with
-`SAVAGEWIND_VK_CPU_BENCH=1`. The command atomically publishes the mask; it changes
-preparation paths with identical contents, so no resource invalidation is needed.
-It is not registered in ordinary play. The normal descriptor cache remains warm
-across switches; this measures steady gameplay, while the separate-boot mode
-also exercises startup. Keep the installed-binary comparison separate from a
-live run. Small effects still require repeated, interleaved measurements.

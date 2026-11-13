@@ -15,6 +15,12 @@ import sys
 from types import SimpleNamespace
 
 
+def run_order(candidates, index):
+    offset = (index // 2) % len(candidates)
+    order = candidates[offset:] + candidates[:offset]
+    return list(reversed(order)) if index % 2 else order
+
+
 def live(args, candidates, exe):
     import perf_routes as routes
     a = SimpleNamespace(tree=str(args.tree), data_root=args.data_root, save=args.save,
@@ -46,10 +52,7 @@ def live(args, candidates, exe):
                     game.cmd('fly', 'on')
                 fixed_route = route[:5] + (None,)
                 for round_index in range(args.rounds):
-                    offset = round_index % len(candidates)
-                    order = candidates[offset:] + candidates[:offset]
-                    if round_index % 2:
-                        order.reverse()
+                    order = run_order(candidates, round_index)
                     for label, mask in order:
                         reply = game.cmd('cpuopts', mask)
                         if reply.get('mask') != mask:
@@ -81,13 +84,14 @@ def main():
     ap.add_argument('--ini', required=True)
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--baseline-exe', type=Path)
+    ap.add_argument('--exe', type=Path, help='candidate executable; defaults to <tree>/build/savagewind[.exe]')
     ap.add_argument('--live', action='store_true', help='switch masks in one loaded game per route')
     ap.add_argument('--rounds', type=int, default=3)
     ap.add_argument('--duration', type=float, default=20)
     ap.add_argument('--routes', nargs='+', default=['plateau', 'castle'])
     ap.add_argument('--configs', nargs='+', default=['control', 'binding', 'writes', 'driver', 'all'])
     args = ap.parse_args()
-    candidates = [('control', 0), ('binding', 1), ('writes', 2), ('driver', 4), ('all', 7)]
+    candidates = [('control', 0), ('binding', 1), ('writes', 2), ('driver', 4), ('all', 7), ('binding_writes', 3)]
     unknown = set(args.configs) - {n for n, _ in candidates}
     if unknown or not args.configs or args.rounds < 1 or args.duration < 5:
         ap.error('Use known configurations, at least one round and at least five seconds per route')
@@ -97,7 +101,7 @@ def main():
             ap.error('--live uses one candidate binary; measure the installed baseline separately')
         candidates.insert(0, ('installed', None))
     args.out.mkdir(parents=True, exist_ok=True)
-    exe = args.tree / 'build' / ('savagewind.exe' if sys.platform == 'win32' else 'savagewind')
+    exe = args.exe or args.tree / 'build' / ('savagewind.exe' if sys.platform == 'win32' else 'savagewind')
     manifest = {'args': {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                 'candidate_sha256': hashlib.sha256(exe.read_bytes()).hexdigest(),
                 'ini_sha256': hashlib.sha256(Path(args.ini).read_bytes()).hexdigest()}
@@ -105,10 +109,7 @@ def main():
     if args.live:
         return live(args, candidates, exe)
     for round_index in range(args.rounds):
-        offset = round_index % len(candidates)
-        order = candidates[offset:] + candidates[:offset]
-        if round_index % 2:
-            order.reverse()
+        order = run_order(candidates, round_index)
         for label, mask in order:
             folder = args.out / ('r{}-{}'.format(round_index + 1, label))
             argv = [sys.executable, str(args.tree / 'tools' / 'perf_routes.py'), 'run',
