@@ -21,6 +21,15 @@ class OwnershipTests(unittest.TestCase):
             self.assertEqual(routes.others('X:\\test'), ['456 X:\\test\\savagewind.exe'])
             self.assertEqual(run.call_args.args[0][0], 'pwsh')
 
+    def test_reexec_requires_both_parent_and_exact_image(self):
+        import json
+        rows = [dict(ProcessId=124, ParentProcessId=123, ExecutablePath='/test/savagewind.exe'),
+                dict(ProcessId=456, ParentProcessId=999, ExecutablePath='/test/savagewind.exe'),
+                dict(ProcessId=789, ParentProcessId=123, ExecutablePath='/other/savagewind.exe')]
+        with patch.object(routes.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=json.dumps(rows))):
+            self.assertEqual(routes.reexec_child(123, '/test/savagewind.exe'), 124)
+            self.assertIsNone(routes.reexec_child(123, '/missing/savagewind.exe'))
+
     def test_failed_process_query_stops_the_benchmark(self):
         with patch.object(routes.os, 'name', 'nt'), patch.object(routes.subprocess, 'run', return_value=SimpleNamespace(returncode=1)):
             with self.assertRaises(RuntimeError):

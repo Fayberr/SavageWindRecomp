@@ -283,10 +283,48 @@ def launch(args, run_dir, size, affinity, extra_env):
     return proc, log
 
 
+def reexec_child(parent_pid, executable):
+    """Find only a direct child of our launcher with the exact expected image."""
+    command = ('Get-CimInstance Win32_Process -Filter "ParentProcessId = {}" | '
+               'Select-Object ProcessId,ParentProcessId,ExecutablePath | ConvertTo-Json -Compress').format(int(parent_pid))
+    result = subprocess.run(['pwsh', '-NoProfile', '-Command', command], capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError('Could not inspect a Windows re-exec child')
+    rows = json.loads(result.stdout) if result.stdout.strip() else []
+    rows = rows if isinstance(rows, list) else [rows]
+    expected = os.path.normcase(os.path.abspath(executable))
+    found = [int(row['ProcessId']) for row in rows if row.get('ParentProcessId') == parent_pid and
+             row.get('ExecutablePath') and os.path.normcase(os.path.abspath(row['ExecutablePath'])) == expected]
+    return found[0] if len(found) == 1 else None
+
+
+def adopt_reexec(proc):
+    """Windows plat_exec exits its parent; keep waiting for that owned child."""
+    pid = reexec_child(proc.pid, proc.args[0])
+    if pid is None:
+        return False
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel.OpenProcess(0x100000 | 0x1000 | 1, False, pid)
+    if not handle:
+        raise OSError('Could not open the owned re-exec child')
+    old_handle, old_pid = proc._handle, proc.pid
+    proc._handle = type(old_handle)(handle)
+    proc.pid, proc.returncode = pid, None
+    old_handle.Close()
+    MY_PROCESSES.discard(old_pid)
+    MY_PROCESSES.add(pid)
+    print('Adopted Windows re-exec child {}'.format(pid), flush=True)
+    return True
+
+
 def wait_world(game, proc, seconds):
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         if proc.poll() is not None:
+            if os.name == 'nt' and proc.returncode == 0 and adopt_reexec(proc):
+                continue
             raise RuntimeError('the game exited during boot (exit code {:#x})'.format(proc.returncode & 0xffffffff))
         try:
             r = game.cmd('pos', ok=False)
