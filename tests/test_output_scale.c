@@ -5,6 +5,8 @@
 #include "../runtime/nvn/output_scale.c"
 Settings g_settings = {.wide_view = true, .fov = 100, .render_scale = RSCALE_100};
 static bool title, loading, map, pause;
+static uint64_t shown_frame;
+float winsize_refresh_rate(void) { return 60.0f; }
 bool framepace_menu_ui(void) { return pause; }
 bool framepace_map_ui(void) { return map; }
 bool framepace_title_ui(void) { return title; }
@@ -15,7 +17,7 @@ bool fsr4_available(void) { return false; }
 bool vk_dlss_available(void) { return false; }
 uint64_t plat_now_ns(void) { return 1000000000; }
 uint64_t renderer_present_count(void) { return 0; }
-uint64_t framepace_shown_frame(void) { return 0; }
+uint64_t framepace_shown_frame(void) { return shown_frame; }
 static void near(double actual, double expected) {
     assert(fabs(actual - expected) < 1e-6);
 }
@@ -117,5 +119,31 @@ int main(void) {
     near(1600 * o.scene_sx, 3840); near(900 * o.scene_sy, 2160);
     g_settings.render_scale = RSCALE_100;
 #endif
-    puts("PASS: taller map viewport, 16:9 fallback, disabled fill, title, loading and ultrawide");
+    // A CPU-bound scene must return to full resolution when shrinking gains no frames.
+    shown_frame = 180;
+    g_settings.dynamic_res = true;
+    g_settings.fps_limit = 120;
+    near(dynamic_res_target(), 60);
+    for (int i = 0; i < 60; i++) dynamic_res_tick(30, 0, false);
+    near(dynamic_res_scale(), 1.3);
+    for (int i = 0; i < 180; i++) dynamic_res_tick(30, 0, false);
+    near(dynamic_res_scale(), 1);
+
+    // The upscaler owns its dynamic factor; the scene must not shrink a second time.
+    dynamic_res_reset();
+    g_settings.upscaler = UPSCALE_FSR1;
+    g_settings.upscale_quality = UPQ_DYNAMIC;
+    for (int i = 0; i < 60; i++) dynamic_res_tick(30, 0, false);
+    near(dynamic_res_scale(), 1);
+    near(upscale_factor(), 1.3);
+    g_settings.dynamic_res = false;
+    assert(!upscale_mode_offered(UPQ_DYNAMIC));
+
+    // Without the dynamic setting, a losing FG comparison is a hint only.
+    dynamic_res_tick(100, 0, false);
+    for (int i = 0; i < 90; i++) dynamic_res_tick(40, 40, true);
+    assert(dynamic_fg_no_gain());
+    assert(!dynamic_fg_disabled());
+    assert(!g_settings.dynamic_res);
+    puts("PASS: output layout, scene scaling, dynamic CPU fallback, upscaler factor and FG hint");
 }
