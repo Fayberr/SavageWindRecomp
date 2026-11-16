@@ -35,7 +35,7 @@ the order required by Vulkan.
 
 ## Native comparison
 
-Windows, Ryzen 7 5700X3D, RTX 3080 Ti. Same process per scene, 2560x1440, copied
+Windows, Ryzen 7 5700X3D, RTX 3080 Ti, NVIDIA 621.24. Same process per scene, 2560x1440, copied
 owner graphics settings, uncapped and VSync/FG off. Three rotated forward/reverse
 rounds, twelve seconds per mode per round. No capture, sampler or per-draw timers;
 whole-list profiling and the frame trace remain enabled. The test uses fresh
@@ -95,4 +95,43 @@ Plateau and Kakariko, which are outside the training scenes. This comparison
 contains no material-cache changes and uses different binaries, so it requires
 relaunches and cannot have the same-process control of the first experiment.
 
-Results are pending while this report is being completed.
+Two windows per binary per scene, fifteen seconds per window, in an A/B/B/A
+order per scene. The profile uses valid field/Hateno dumps; the attempted Korok
+run left an empty file, which contributed no counters. These are mean results
+from the two valid windows, with no material-preparation cache changes:
+
+| Held-out scene | Installed FPS | Fresh PGO FPS | FPS change | Installed render CPU | Fresh render CPU | Installed p99 | Fresh p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Plateau | 104.82 | 116.19 | +10.85% | 8.97 ms | 8.02 ms | 14.54 ms | 12.72 ms |
+| Kakariko | 115.84 | 117.13 | +1.12% | 7.33 ms | 6.83 ms | 13.86 ms | 13.39 ms |
+
+The Plateau gain repeats in both rounds: 104.67 -> 117.02 and 104.97 -> 115.36
+FPS, with roughly one millisecond less render CPU per frame. Kakariko's render
+CPU improves but FPS barely changes; this is not a universal ten-percent gain.
+Do not add the cache and fresh-PGO results: their combination was not tested.
+
+The use build reports only one mismatched function profile, from the
+instrumentation-dependent path. The old profile had many stale functions.
+The fresh profile and native binaries remain private ignored artifacts, not
+committed runtime outputs. The native fresh build uses the unmodified play
+source and a separate build directory. Its loader check returns 73 and its
+game-library ID is the same as the installed build.
+
+Two second-round Plateau boots failed before measurement. The Windows runtime
+can replace its initial process when reserving the guest address space; the
+harness now handles that known startup behavior by adopting only a direct child
+with the exact expected executable. Failed windows were excluded. Only the
+missing fresh Plateau and final installed windows were rerun; completed windows
+were preserved. All eight accepted windows report zero unrelated games.
+
+The benchmark also exposed a training gotcha: stopping via the control endpoint
+can leave an empty raw PGO file if the periodic 3,000-present dump never ran.
+For a future trainer, use the scripted exit path, which explicitly dumps the
+profile, or verify nonempty dumps before merging. The two usable raw files in
+this experiment are 733,352 bytes each; the merged profile is 869,024 bytes.
+
+The play executable, shortcut pointer and personal save/settings hashes were
+checked unchanged at completion. All test games are closed and owned scheduled
+tasks removed. Neither experiment has been promoted for normal play or submitted
+as an upstream PR. Long-session stability and combined performance remain open.
+
