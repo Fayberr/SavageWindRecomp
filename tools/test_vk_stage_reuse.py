@@ -153,6 +153,12 @@ int main(void) {
     // Compiler constants depend on the fragment code blob, not just the translated shader.
     p2.reuse_mask[1]|=2;call(&p2,&si,images,row,tint,db,&nb);
     program2.stages[1].code_addr++;before=calls;call(&p2,&si,images,row,tint,db,&nb);assert(calls>before);
+    program2.stages[1].const_offset++;before=calls;call(&p2,&si,images,row,tint,db,&nb);assert(calls>before);
+    program2.stages[1].const_size++;before=calls;call(&p2,&si,images,row,tint,db,&nb);assert(calls>before);
+    // The conservative reference mode must invalidate for a different program.
+    atomic_store(&stage_cpu_options,1);call(&p2,&si,images,row,tint,db,&nb);
+    st.program=&program;before=calls;call(&p2,&si,images,row,tint,db,&nb);assert(calls>before);
+    st.program=&program2;atomic_store(&stage_cpu_options,2);
     // Match the unmodified path's descriptors and dynamic offsets for changing resources.
     for(int trial=0;trial<2000;trial++) {
         st.ubuf[1][0].addr=(uint64_t)trial*256;uub_serial++;

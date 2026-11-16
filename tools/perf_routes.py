@@ -152,7 +152,8 @@ def linux_games():
     return found
 
 
-MY_SESSIONS = set()  # (Linux) the sessions of the games this script started
+MY_SESSIONS = set()  # Linux process groups owned by this script
+MY_PROCESSES = set()  # Windows PIDs owned by this script
 
 
 def others(tree):
@@ -160,11 +161,14 @@ def others(tree):
     processes this script did not start (the player's game)."""
     if os.name != 'nt':
         return ['{} (session {})'.format(p, s) for p, s in linux_games() if s not in MY_SESSIONS]
-    ps = subprocess.run(['powershell', '-NoProfile', '-Command',
+    ps = subprocess.run(['pwsh', '-NoProfile', '-Command',
                          "Get-CimInstance Win32_Process -Filter \"Name='savagewind.exe'\" | "
                          "ForEach-Object { \"$($_.ProcessId) $($_.ExecutablePath)\" }"], capture_output=True, text=True)
-    mine = os.path.normcase(os.path.abspath(tree))
-    return [l for l in ps.stdout.splitlines() if l.strip() and mine not in os.path.normcase(l)]
+    if ps.returncode:
+        raise RuntimeError("Could not enumerate Windows game processes")
+    return [line for line in ps.stdout.splitlines()
+            if line.strip() and int(line.split(None, 1)[0]) not in MY_PROCESSES]
+
 
 
 def game_cwd(args):
@@ -228,7 +232,7 @@ def launch(args, run_dir, size, affinity, extra_env):
         for line in f:
             key = line.split('=', 1)[0].strip()
             forced = {'window_size': size, 'frame_rate': '0', 'vsync': 'off', 'perf_overlay': 'off',
-                      'frame_generation': '0', 'fullscreen': '1' if args.fullscreen else '0'}
+                      'frame_generation': '0', 'volume': '0', 'fullscreen': '1' if args.fullscreen else '0'}
             if args.potato:  # (a weak PC plays with the console's shadows: Extreme alone costs ~13 ms of GPU in a forest)
                 forced['shadow_resolution'] = 'console'
             ini.append('{} = {}\n'.format(key, forced[key]) if key in forced else line)
@@ -258,6 +262,7 @@ def launch(args, run_dir, size, affinity, extra_env):
     argv = [exe] if args.data_root else [exe, 'extracted']  # (a data root of its own: its extracted/, as a player's)
     proc = subprocess.Popen(argv, cwd=args.tree, env=env, stdout=log, stderr=subprocess.STDOUT,
                             creationflags=flags, start_new_session=os.name != 'nt')  # (Linux: its own group, killed whole)
+    MY_PROCESSES.add(proc.pid)
     if os.name != 'nt':
         MY_SESSIONS.add(proc.pid)
     if flags:
@@ -631,6 +636,8 @@ def stop_game(game, proc, log):
             except OSError:
                 pass
         proc.wait(10)
+    MY_PROCESSES.discard(proc.pid)
+    MY_SESSIONS.discard(proc.pid)
     log.close()
     time.sleep(3)  # (a game that just ended can keep the next one from starting)
 
