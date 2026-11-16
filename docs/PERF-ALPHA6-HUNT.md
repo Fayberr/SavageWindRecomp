@@ -36,7 +36,8 @@ the order required by Vulkan.
 ## Native comparison
 
 Windows, Ryzen 7 5700X3D, RTX 3080 Ti, NVIDIA 621.24. Same process per scene, 2560x1440, copied
-owner graphics settings, uncapped and VSync/FG off. Three rotated forward/reverse
+owner graphics settings: upscaler off, FXAA on, high shadows, medium draw
+distance, render scale 100%, dynamic resolution off. Uncapped and VSync/FG off. Three rotated forward/reverse
 rounds, twelve seconds per mode per round. No capture, sampler or per-draw timers;
 whole-list profiling and the frame trace remain enabled. The test uses fresh
 copies of a test save, its own data root, and muted copied settings.
@@ -105,7 +106,7 @@ from the two valid windows, with no material-preparation cache changes:
 | Plateau | 104.82 | 116.19 | +10.85% | 8.97 ms | 8.02 ms | 14.54 ms | 12.72 ms |
 | Kakariko | 115.84 | 117.13 | +1.12% | 7.33 ms | 6.83 ms | 13.86 ms | 13.39 ms |
 
-The Plateau gain repeats in both rounds: 104.67 -> 117.02 and 104.97 -> 115.36
+The Plateau gain repeats in both rounds: 104.67 -> 116.96 and 104.97 -> 115.42
 FPS, with roughly one millisecond less render CPU per frame. Kakariko's render
 CPU improves but FPS barely changes; this is not a universal ten-percent gain.
 Do not add the cache and fresh-PGO results: their combination was not tested.
@@ -134,4 +135,3 @@ The play executable, shortcut pointer and personal save/settings hashes were
 checked unchanged at completion. All test games are closed and owned scheduled
 tasks removed. Neither experiment has been promoted for normal play or submitted
 as an upstream PR. Long-session stability and combined performance remain open.
-
