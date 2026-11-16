@@ -154,10 +154,16 @@ const int UPS_DEFAULT = 0;  // (UPSCALE_DEFAULT: Off, the window's resolution)
 std::vector<int> g_shown;   // per item: the value shown instead of get(), one that can't be picked yet (-1: none)
 const char16_t GREY = 3;    // (the game's message colour for greyed values)
 // (shown with Native first, largest to smallest: k_modes_order maps a row index to settings.h UPQ_*)
-const char *const k_modes[] = {"Ultra Quality", "Quality", "Balanced", "Performance", "Ultra Performance", "Native"};
-const int k_modes_order[] = {UPQ_NATIVE, UPQ_ULTRA, UPQ_QUALITY, UPQ_BALANCED, UPQ_PERFORMANCE, UPQ_ULTRA_PERFORMANCE};
+const char *const k_modes[] = {"Ultra Quality", "Quality", "Balanced", "Performance", "Ultra Performance", "Native", "Dynamic"};
+const int k_modes_order[] = {UPQ_NATIVE, UPQ_ULTRA, UPQ_QUALITY, UPQ_BALANCED, UPQ_PERFORMANCE, UPQ_ULTRA_PERFORMANCE,
+                             UPQ_DYNAMIC};
 int upscale_mode_base(void) {
     return (g_settings.upscaler == UPSCALE_FSR3 || g_settings.upscaler == UPSCALE_FSR4) ? 0 : 1;
+}
+// The Dynamic row is part of Video > Advanced > Dynamic resolution: it is not offered at all while that is off. It
+// sits at the end of k_modes_order, so hiding it is just one fewer entry.
+int upscale_mode_count(void) {
+    return (int)(sizeof k_modes_order / sizeof k_modes_order[0]) - (g_settings.dynamic_res ? 0 : 1);
 }
 #ifdef __APPLE__
 const char *const k_aa[] = {"Off", "SMAA"};
@@ -835,7 +841,7 @@ void build_items(void) {
     // before stays stored and comes back with an upscaler.
     Item mode = choice(P_VIDEO_ADV, "Upscaler mode", "",
                        [](const Item &) {
-                           return g_settings.upscaler == UPSCALE_OFF ? 1 : N(k_modes_order) - upscale_mode_base();
+                           return g_settings.upscaler == UPSCALE_OFF ? 1 : upscale_mode_count() - upscale_mode_base();
                        },
                        [](const Item &, int x) {
                            if (g_settings.upscaler == UPSCALE_OFF) return tr("Off");
@@ -844,11 +850,11 @@ void build_items(void) {
                        },
                        [](const Item &) {
                            if (g_settings.upscaler == UPSCALE_OFF) return 0;
-                           int base = upscale_mode_base();
+                           int base = upscale_mode_base(), end = upscale_mode_count();
                            int q = (g_settings.upscale_quality == UPQ_NATIVE && base)
                                        ? (int)UPQ_QUALITY
                                        : g_settings.upscale_quality;
-                           for (int i = base; i < N(k_modes_order); i++)
+                           for (int i = base; i < end; i++)
                                if (k_modes_order[i] == q) return i - base;
                            return 0;
                        },
@@ -905,9 +911,17 @@ void build_items(void) {
                        [](const Item &) { return g_settings.sharpening; },
                        [](const Item &, int x) { g_settings.sharpening = x; }, 0));
     // AMD FSR 3 frame generation (vulkan/framegen.cpp)
-    v.push_back(toggle(P_VIDEO_ADV, "Frame generation (AMD FSR 3)", "Twice the frames on screen. Adds a little delay.",
-                       [](const Item &) { return (int)g_settings.frame_gen; },
-                       [](const Item &, int x) { g_settings.frame_gen = x; }, 0));
+    Item fg = toggle(P_VIDEO_ADV, "Frame generation (AMD FSR 3)", "Twice the frames on screen. Adds a little delay.",
+                     [](const Item &) { return (int)g_settings.frame_gen; },
+                     [](const Item &, int x) { g_settings.frame_gen = x; }, 0);
+    fg.desc_fn = [](const Item &) {
+        if (dynamic_fg_no_gain())
+            return tr("No net gain here: Dynamic resolution would switch this off.");
+        if (dynamic_fg_disabled())
+            return tr("Dynamic resolution switched this off: no net gain.");
+        return tr("Twice the frames on screen. Adds a little delay.");
+    };
+    v.push_back(fg);
 #endif
     v.push_back(toggle(P_VIDEO_ADV, "Asynchronous shaders", "On: no stutter, but some effects appear late.",
                        [](const Item &) { return (int)g_settings.async_shaders; },
@@ -929,7 +943,9 @@ void build_items(void) {
     v.push_back(toggle(P_VIDEO_ADV, "Depth of field", "Blurs the far distance. Off: sharp out to the horizon.",
                        [](const Item &) { return (int)g_settings.depth_of_field; },
                        [](const Item &, int x) { g_settings.depth_of_field = x; }, 1));
-    v.push_back(toggle(P_VIDEO_ADV, "Dynamic resolution", "Lowers the 3D resolution when a frame takes long, as on the console.",
+    v.push_back(toggle(P_VIDEO_ADV, "Dynamic resolution", "Renders the 3D scene smaller when frames are slow, "
+                       "sharper when they aren't; stays full size where that gains nothing. Has no effect with an "
+                       "upscaler: its mode sets the render size.",
                        [](const Item &) { return (int)g_settings.dynamic_res; },
                        [](const Item &, int x) { g_settings.dynamic_res = x; }, 1));
     if (gamelib_compat())  // (runtime/gamelib.h: a CPU without FMA instructions; simd.h simd_fma_unfused)

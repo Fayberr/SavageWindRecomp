@@ -636,10 +636,12 @@ extern "C" void renderer_get_scale(float *sx, float *sy);
 extern "C" void renderer_get_scene_scale(float *sx, float *sy);
 extern "C" bool renderer_gpu_rtx(void);  // (vulkan/device.c, metal.m)
 extern "C" volatile int g_fg_active;     // (hle/framepace.c: the last presented frame was generated)
-// Video > Upscaler mode's names, by UPQ_*, and their order on screen (largest render size first)
-static const char *const k_upscale_modes[UPQ_COUNT] = {"Ultra Quality", "Quality", "Balanced", "Performance", "Ultra Performance", "Native"};
+// Video > Upscaler mode's names, by UPQ_*, and their order on screen (largest render size first). Dynamic is last:
+// it is a row the dynamic-resolution setting adds, so the list is one entry shorter while that setting is off.
+static const char *const k_upscale_modes[UPQ_COUNT] = {"Ultra Quality", "Quality", "Balanced", "Performance",
+                                                       "Ultra Performance", "Native", "Dynamic"};
 static const int k_upscale_mode_order[UPQ_COUNT] = {
-    UPQ_NATIVE, UPQ_ULTRA, UPQ_QUALITY, UPQ_BALANCED, UPQ_PERFORMANCE, UPQ_ULTRA_PERFORMANCE};
+    UPQ_NATIVE, UPQ_ULTRA, UPQ_QUALITY, UPQ_BALANCED, UPQ_PERFORMANCE, UPQ_ULTRA_PERFORMANCE, UPQ_DYNAMIC};
 extern "C" {
 #include "../nvn/output_scale.h"
 }
@@ -977,13 +979,15 @@ static void tab_display(void) {
         int udef = 0;  // (the reset value: UPSCALE_DEFAULT)
         for (int i = 0; i < NU; i++) if (ups_value[i] == UPSCALE_DEFAULT) udef = i;
         if (opt_choice_avail("Upscaler", &ui, &shown, ups, avail, NU, udef, ud)) g_settings.upscaler = ups_value[ui];
-        // its mode (AMD's scale factors), one step in; greyed when the upscaler is off
+        // its mode (AMD's scale factors), one step in; greyed when the upscaler is off. The Dynamic row belongs to
+        // Video > Advanced > Dynamic resolution: while that setting is off the row is not in the list at all.
         bool modes_ok = upscale_modes_available();
+        int nm = g_settings.dynamic_res ? UPQ_COUNT : UPQ_COUNT - 1;
         std::string mode_names[UPQ_COUNT];
         const char *mn[UPQ_COUNT];
         bool mavail[UPQ_COUNT];
         int mi = 2, mdef = 2;  // UPQ_QUALITY's position in k_upscale_mode_order
-        for (int i = 0; i < UPQ_COUNT; i++) {
+        for (int i = 0; i < nm; i++) {
             int q = k_upscale_mode_order[i];
             mode_names[i] = modes_ok ? tr(k_upscale_modes[q])
                                      : std::string(tr(k_upscale_modes[q])) + " " + tr("(coming soon)");
@@ -992,6 +996,7 @@ static void tab_display(void) {
             if (q == g_settings.upscale_quality) mi = i;
             if (q == UPQ_QUALITY) mdef = i;
         }
+        if (mi >= nm) mi = nm - 1;  // (Dynamic was stored but is now hidden: fall back to a visible one)
         float sx, sy;  // the 3D scene's size (BOTW docked: 1600 x 900 times its scale)
         renderer_get_scene_scale(&sx, &sy);
         char rendering[100];
@@ -1003,7 +1008,7 @@ static void tab_display(void) {
         opt_indent(1);
         if (g_settings.upscaler == UPSCALE_OFF) opt_disable_next();
         static int mshown = -1;
-        if (opt_choice_avail("Upscaler mode", &mi, &mshown, mn, mavail, UPQ_COUNT, mdef, md.c_str()))
+        if (opt_choice_avail("Upscaler mode", &mi, &mshown, mn, mavail, nm, mdef, md.c_str()))
             g_settings.upscale_quality = k_upscale_mode_order[mi];
         opt_indent(-1);
     }
@@ -1053,11 +1058,18 @@ static void tab_display(void) {
                    "upscaler off), before the HUD is drawn over it: edges get crisper without halos. Most useful with "
                    "AMD FSR 1.", false);
         // AMD FSR 3 frame generation (vulkan/framegen.cpp; the frame rate counts the presented frames: framepace.c)
-        opt_toggle("Frame generation (AMD FSR 3)", &g_settings.frame_gen, false,
-                   "AMD FSR 3 makes a frame between each two the game draws: about twice the frames on screen. The "
-                   "frame rate above counts them all, so the game itself draws half of it (60 with 120) and the "
-                   "controls answer as at that rate, a little later. In play only: the menus and the map show the "
-                   "game's own frames. Fast moves can leave faint smears around Link and what moves on its own.");
+        static std::string fg_desc;
+        fg_desc = std::string(tr("AMD FSR 3 makes a frame between each two the game draws: about twice the frames on "
+                                 "screen. The frame rate above counts them all, so the game itself draws half of it "
+                                 "(60 with 120) and the controls answer as at that rate, a little later. In play only: "
+                                 "the menus and the map show the game's own frames. Fast moves can leave faint smears "
+                                 "around Link and what moves on its own."));
+        if (dynamic_fg_no_gain())  // (the dynamic setting is off: this is a hint, nothing is switched off)
+            fg_desc += std::string("\n\n") + tr("It is not adding frames here: turning on Dynamic resolution would "
+                                                "switch it off automatically.");
+        else if (dynamic_fg_disabled())
+            fg_desc += std::string("\n\n") + tr("Dynamic resolution switched it off: it had no net gain.");
+        opt_toggle("Frame generation (AMD FSR 3)", &g_settings.frame_gen, false, fg_desc.c_str());
     }
 #endif
     opt_toggle("Asynchronous shaders", &g_settings.async_shaders, true,
@@ -1265,9 +1277,11 @@ static void tab_display(void) {
                "little faster, a flatter image.");
     opt_toggle("Depth of field", &g_settings.depth_of_field, true, "The game blurs the far distance a little. Off: sharp "
                "out to the horizon, a little faster.");
-    opt_toggle("Dynamic resolution", &g_settings.dynamic_res, true, "As on the console: the game lowers its 3D "
-               "resolution (down to 1280x720 before upscaling) while frames take long, and raises it again after. "
-               "Off: always the full resolution. On with the Potato preset.");
+    opt_toggle("Dynamic resolution", &g_settings.dynamic_res, true, "The 3D scene renders smaller when the frame "
+               "rate falls behind, and sharper again when it can be - the game itself scales it back to the window's "
+               "size, so the HUD and menus stay sharp. It only keeps a smaller size where doing so actually gains "
+               "frames; on a machine whose CPU is the limit it stays at the full resolution. Off: always the full "
+               "resolution. On with the Potato preset.");
     if (gamelib_compat())  // (runtime/gamelib.h: a CPU without FMA instructions; simd.h simd_fma_unfused)
         opt_toggle("Fast math", &g_settings.fast_fma, true, "Your CPU has no FMA instructions, so the game's math runs "
                    "in software. On: about 10% faster; some results round a tiny bit differently from the console, "
@@ -1775,6 +1789,8 @@ static void perf_overlay_draw(ImGuiIO &io, float scale) {
         char f[16];
         snprintf(f, sizeof f, "%.1f", upscale_factor());
         line += std::string(" ") + (q >= 0 && q < UPQ_COUNT ? std::string(tr(k_upscale_modes[q])) + " " : "") + f + "x";
+    } else if (q == UPQ_DYNAMIC) {
+        line += std::string(" ") + tr("Dynamic");
     }
     // (FSR 3 / 4 and DLSS anti-alias the scene themselves: the setting does nothing then)
     int aa = rt_antialias();
@@ -1795,6 +1811,23 @@ static void perf_overlay_draw(ImGuiIO &io, float scale) {
 #endif
     if (g_fg_active) line += std::string(line.empty() ? "" : " | ") + tr("Frame generation on");
     if (!line.empty()) ImGui::TextDisabled("%s", line.c_str());
+    // Dynamic resolution / the upscaler's Dynamic mode: what it is holding, at what factor, and how it is measuring.
+    // All the numbers the player needs to see why the picture is at the size it is, in one place.
+    if (dynamic_res_active()) {
+        char dyn[160];
+        double target = dynamic_res_target();
+        snprintf(dyn, sizeof dyn, tr("Dynamic: %s %.2fx, target %.0f fps, %s"),
+                 dynamic_res_is_upscale() ? tr("upscaler") : tr("scene"), dynamic_factor(), target,
+                 g_fg_active ? tr("presented rate") : tr("real rate"));
+        ImGui::TextDisabled("%s", dyn);
+    }
+    // The frame generation verdict is the same whether the dynamic setting is on or off: with it on, frame generation
+    // was switched off; with it off, it is only a hint in the settings and here. Either way the player sees why the
+    // presented rate is what it is.
+    if (dynamic_fg_disabled())
+        ImGui::TextDisabled("%s", tr("Frame generation off: no net gain"));
+    else if (dynamic_fg_no_gain())
+        ImGui::TextDisabled("%s", tr("Frame generation: no net gain"));
     // Link's coordinates; no line at all while there is no Link or the game is in a scene (title, loading, movie, event).
     // Axis letters are not translated.
     float pos[3];
