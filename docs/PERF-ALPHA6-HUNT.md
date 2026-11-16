@@ -137,3 +137,21 @@ The play executable, shortcut pointer and personal save/settings hashes were
 checked unchanged at completion. All test games are closed and owned scheduled
 tasks removed. Neither experiment has been promoted for normal play or submitted
 as an upstream PR. Long-session stability and combined performance remain open.
+
+## Combined personal play build, 2026-11-16
+
+Built the material-cache source at `260ee343` with the refreshed runtime profile
+(`build/hunt/pgo-refresh/fresh.profdata`), `RELEASE=1 PGO=use LTO=thin`, Clang 23.1.4
+and 16 build jobs. The resulting executable SHA256 is
+`7B2BFFBE85BAC4898BD5C98D038842F6169ED302D6ED5CEA9476EFD83DBA2725`.
+Native `--update-health` returned 73 and the game-library ID remains
+`f63df6b1a6001541`. This combination has not been benchmarked; the individual
+improvements above must not be added together.
+
+The personal desktop shortcut now selects the `alpha6-stage-reuse` worktree.
+`tools/play-current.ps1` is the maintained copy of its deployed launcher. It reads
+optional `build/play-options.json` with `{"stageReuse":2}` for the material cache;
+without that file it selects mode 0. Invalid modes stop launch. The launcher
+continues to use the main checkout's personal save and saved graphics settings.
+The previous launcher and build pointer are backed up beside the deployed files.
+Build/profile artifacts and the launch manifest remain ignored under `build/`.
