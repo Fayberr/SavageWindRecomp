@@ -42,9 +42,11 @@ rounds, twelve seconds per mode per round. No capture, sampler or per-draw timer
 whole-list profiling and the frame trace remain enabled. The test uses fresh
 copies of a test save, its own data root, and muted copied settings.
 
+This first comparison uses one prototype binary and its mode0 control. It is
+not a direct FPS comparison with the separately built installed executable.
 These are medians of the three windows for each mode, not a guarantee for play:
 
-| Scene | Original FPS | Conservative FPS | Material FPS | Original render CPU | Material render CPU | Material p99 |
+| Scene | Prototype control FPS | Conservative FPS | Material FPS | Control render CPU | Material render CPU | Material p99 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Plateau | 100.20 | 103.17 | 106.97 | 9.386 ms | 8.783 ms | 13.559 ms |
 | Kakariko | 110.41 | 116.39 | 118.68 | 7.787 ms | 7.333 ms | 12.544 ms |
