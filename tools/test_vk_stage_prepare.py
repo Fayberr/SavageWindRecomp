@@ -44,6 +44,7 @@ FIXTURE = r'''
 #define DEDUPE_DRV_F 4
 #define DEDUPE_DRV_V 5
 #define SETC_TAB 4096
+#define CPU_OPTS_MAX 255
 typedef struct {uint64_t addr, size;} Range;
 typedef struct {uint32_t set, binding; VkDescriptorType type;} VkBindingInfo;
 typedef struct {
@@ -143,7 +144,7 @@ int main(void) {
         stage_plan_init(&p);
         VkDescriptorImageInfo pre[64];
         for(int t=0;t<64;t++) pre[t]=(VkDescriptorImageInfo){(VkSampler)(uintptr_t)(300+t),(VkImageView)(uintptr_t)(400+t),VK_IMAGE_LAYOUT_GENERAL};
-        for(int options=0;options<16;options++)for(int set=0;set<2;set++) {
+        for(int options=0;options<32;options++)for(int set=0;set<2;set++) {
             float row[4]={1,2,3,4}, tint[8]={1,2,3,4,5,6,7,8};
             uint32_t da[32]={0},db[32]={0};int na=0,nb=0;
             memset(tex_sc,0,sizeof tex_sc);memset(tex_wh,0,sizeof tex_wh);
@@ -216,17 +217,36 @@ int main(void) {
         assert(calls>before);
         sdw_fix.s=up_fix.sx=0;fxaa_off=si.uses_gmem=si.writes_gmem=false;p.reuse_stage[1]=true;
     }
-    char *bad[]={"", "16", "-1", "one", "1x", "99999999999999999999999999999999999999"};
+    char *bad[]={"", "256", "-1", "one", "1x", "99999999999999999999999999999999999999"};
     for(unsigned i=0;i<sizeof bad/sizeof *bad;i++) {
         char *argv[]={"cpuopts",bad[i]};ControlReply reply={0};
         atomic_store(&stage_cpu_options,3);stage_cpu_command(2,argv,&reply);
         assert(reply.failed && stage_cpu_opts()==3);
     }
-    for(int mask=0;mask<16;mask++) {
+    for(int mask=0;mask<=255;mask++) {
         char value[16];snprintf(value,sizeof value,"%d",mask);char *argv[]={"cpuopts",value};ControlReply reply={0};
         stage_cpu_command(2,argv,&reply);assert(!reply.failed && reply.mask==mask && stage_cpu_opts()==mask);
     }
-    free(setc);puts("stage preparation: 48,000 descriptor comparisons, 13,206 driver layouts, reuse invalidation and live switches passed");
+    // R1 hash (mask 16): contents that differ never share a set, whatever the table evicts; the same contents share one.
+    for(int fast=0;fast<2;fast++) {
+        atomic_store(&stage_cpu_options,fast?16:0);
+        free(setc);setc=NULL;setc_gen++;
+        Prog q={.nbinds=4,.binds={{0,3,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER},{0,4,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER},
+            {0,32,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},{0,33,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER}}};
+        ShaderInfo qi={.ntex=2}; stage_plan_init(&q);
+        static int owner[400000]; static uint32_t key[400000];
+        memset(owner,0,sizeof owner);
+        int same=0, base=allocations;
+        for(int i=0;i<150000;i++) {
+            uint32_t x=next()%9000, y=next()%7;  // (cbuf_info's offset is x+y: contents are told apart by x+y and the layout)
+            VkDescriptorSet d=stage_set(&q,(VkDescriptorSetLayout)(uintptr_t)(5+y%2),0,0,&qi,NULL,NULL,x,y,0,NULL,NULL,NULL);
+            uint32_t k=(x+y)*2+y%2+1; unsigned id=(unsigned)((int)(uintptr_t)d-base);
+            assert(id<400000);
+            if(owner[id]) {assert(key[id]==k); same++;} else {owner[id]=1; key[id]=k;}
+        }
+        assert(!cached || same>0);
+    }
+    free(setc);puts("stage preparation: 96,000 descriptor comparisons, 13,206 driver layouts, reuse invalidation, 150,000 hashed set lookups and live switches passed");
 }
 '''
 
@@ -253,7 +273,7 @@ def main():
     reference_finish = function(reference, 'set_finish').replace('set_finish(', 'reference_set_finish(')
     reference_stage = function(reference, 'stage_set').replace('stage_set(', 'reference_stage_set(').replace(
         'set_finish(', 'reference_set_finish(')
-    source = '\n'.join([FIXTURE, function(current, 'stage_cpu_opts'), function(current, 'stage_cpu_command'),
+    source = '\n'.join([FIXTURE, function(current, 'stage_cpu_opts'), function(current, 'stage_cpu_command'), function(current, 'mum64'),
                         function(current, 'stage_plan_init'),
                         reference_finish, reference_stage, function(current, 'set_finish'),
                         function(current, 'stage_set_prepare'), function(current, 'stage_set'), driver(reference, 'driver_reference'),
