@@ -2725,7 +2725,7 @@ typedef struct {
 
 // Experimental preparation paths, independently selectable for paired measurements.
 // Bits: 1 binding order, 2 writes on misses, 4 bounded driver constants, 8 unchanged fragment preparation,
-// 16 throughput-bound descriptor-set hash (R1).
+// 16 throughput-bound descriptor-set hash (R1), 32 texture change detection from the write watch (textures.c, R1).
 #define CPU_OPTS_MAX 255
 static _Atomic int stage_cpu_options = -1;
 static _Atomic uint64_t stage_reuse_calls, stage_reuse_eligible, stage_reuse_hits;
@@ -2743,6 +2743,8 @@ static int stage_cpu_opts(void) {
     return opts;
 }
 
+int vk_cpu_opts(void) { return stage_cpu_opts(); }
+
 static void stage_cpu_command(int argc, char **argv, ControlReply *r) {
     if (argc > 2) { control_fail(r, "cpuopts [0-255]"); return; }
     if (argc == 2) {
@@ -2755,6 +2757,13 @@ static void stage_cpu_command(int argc, char **argv, ControlReply *r) {
     control_field_int(r, "reuse_calls", (int)atomic_load_explicit(&stage_reuse_calls, memory_order_relaxed));
     control_field_int(r, "reuse_eligible", (int)atomic_load_explicit(&stage_reuse_eligible, memory_order_relaxed));
     control_field_int(r, "reuse_hits", (int)atomic_load_explicit(&stage_reuse_hits, memory_order_relaxed));
+    uint64_t ww[5];
+    vk_tex_ww_stats(ww);
+    control_field_int(r, "tex_ww_skipped", (int)ww[0]);
+    control_field_int(r, "tex_ww_written", (int)ww[1]);
+    control_field_int(r, "tex_ww_missed", (int)ww[2]);
+    control_field_int(r, "tex_ww_armed", (int)ww[3]);
+    control_field_int(r, "tex_ww_refused", (int)ww[4]);
 }
 
 static void stage_cpu_control_init(void) {
@@ -6129,6 +6138,22 @@ static uint64_t hc_base(int c) { return (uint64_t)c << hc_shift; }
 static uint64_t hc_chunk_size(int c) { uint64_t b = hc_base(c); return hc_nch == 1 ? hc_size : (hc_size - b < (1ull << hc_shift) ? hc_size - b : 1ull << hc_shift); }
 static bool hc_live(int c) { return atomic_load_explicit(&hc_ch[c].state, memory_order_relaxed) == HC_LIVE; }
 
+// Whether any page of [lo, hi) holds geometry the copy mirrors: its write-watch flags are the copy's to reset, not a
+// texture's (textures.c)
+bool vk_heap_geometry_any(uint64_t lo, uint64_t hi) {
+    if (hc_state <= 0 || !hc_geo || hi <= HEAP_BASE || lo >= hi) return false;
+    uint64_t p0 = lo > HEAP_BASE ? (lo - HEAP_BASE) / HC_PAGE : 0, p1 = (hi - HEAP_BASE + HC_PAGE - 1) / HC_PAGE;
+    if (p1 > (uint64_t)hc_words * 64) p1 = (uint64_t)hc_words * 64;
+    for (uint64_t p = p0; p < p1;) {
+        uint64_t w = p >> 6, take = 64 - (p & 63);
+        if (take > p1 - p) take = p1 - p;
+        uint64_t m = (take == 64 ? ~0ull : (1ull << take) - 1) << (p & 63);
+        if (hc_geo[w] & m) return true;
+        p += take;
+    }
+    return false;
+}
+
 // What the plan lets video memory in use come to (chunks), and what is in use now
 static uint64_t hc_limit(uint64_t *usage) {
     uint64_t budget;
@@ -6146,6 +6171,7 @@ static bool hc_on(void) {
     int force = e ? atoi(e) : -1;
     uint64_t probe;
     bool ww = plat_written_pages(HEAP_BASE, HC_PAGE, &probe, 2) >= 0;
+    vk_tex_range_written(HEAP_BASE, HC_PAGE);  // (a texture there lost its flag to the probe)
     uint64_t vram;
     vram_device_local(NULL, NULL, &vram);
     const char *bm = getenv("SAVAGEWIND_VK_HEAP_COPY_BUDGET_MB");
@@ -6429,8 +6455,10 @@ static void hc_list_begin(void) {
         if (peek && plat_any_written(HEAP_BASE + hc_span[i].lo, hc_span[i].hi - hc_span[i].lo) == 0) continue;
         hc_stat_resets++;
         long n = plat_written_pages(HEAP_BASE + hc_span[i].lo, hc_span[i].hi - hc_span[i].lo, hc_pages, hc_pages_max);
-        if (n < 0) { hc_stale(hc_span[i].lo, hc_span[i].hi); full++; continue; }
+        // (the flags it reset are textures' too: they read them from vk_tex_pages_written, textures.c)
+        if (n < 0) { hc_stale(hc_span[i].lo, hc_span[i].hi); full++; vk_tex_range_written(HEAP_BASE + hc_span[i].lo, hc_span[i].hi - hc_span[i].lo); continue; }
         hc_stat_written += (uint64_t)n;
+        vk_tex_pages_written(hc_pages, n);
         for (long k = 0; k < n; k++) {
             uint64_t p = (hc_pages[k] - HEAP_BASE) / HC_PAGE;
             hc_ok[p >> 6] &= ~(1ull << (p & 63));

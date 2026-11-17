@@ -203,6 +203,45 @@ traces; `live.log` on Windows, `live/run.log` and `live/summary.json` in the Lin
 analysis copy. The preserved executable is `build/cpu-candidates/candidate/`
 with its matching game DLL, ID and manifest. Generated artifacts stay uncommitted.
 
+## R1 structural pieces, 2026-11-17
+
+Two pieces of the structural list are implemented behind new `cpuopts` bits. Nothing is benchmarked yet; the gains below
+are estimates from the profile capture 185415 (14.4 ms frames, render thread 13.4 ms) and from cycle models.
+
+| Bit | Piece | Estimate, render CPU/frame |
+| --- | --- | --- |
+| 16 | Multiply-fold descriptor-set hash in `set_finish` (the two 64-bit hashes ran as serial multiply chains, about 21 cycles a write; the fold is about 6 on Zen 3 per `llvm-mca`). The set cache keys, sharing and reuse are unchanged. | 0.3-0.5 ms (`set_finish` self time was 0.64 ms) |
+| 32 | Texture change detection from Windows' write watch (`textures.c`, between `TWW-BEGIN` and `TWW-END`). | 0.5-0.7 ms |
+
+Why bit 32: texture change detection was about 0.85 ms in the capture (`fnv_sample` 0.36, `hash_full` 0.49), of which a
+large part checked nothing: about 53 sampled and 5.8 fully hashed textures per frame, of which only about 1 is dynamic.
+The rest are the sampled check every 8th frame and the 120-frame full-hash backstop. With the bit on, a texture that
+holds at least 4 whole pages is armed after its full read: its pages' write-watch flags are reset first, and a later
+check asks `plat_any_written` (about 0.6 us) instead. Unwritten: nothing is hashed (exact, no backstop needed).
+Written: the whole storage is hashed and compared, so it also finds partial changes a sample misses.
+
+The flags are shared with the heap copy, which resets every page of its spans, textures included. So: a texture owns
+its pages alone (`tww_claim`; one whose pages are another's keeps the sampled check), the heap copy hands the pages it
+reset over (`vk_tex_pages_written`, a bit per page read together with the flags), a texture never resets a page that holds
+geometry (`vk_heap_geometry_any`), and the partial pages at the ends of a storage, which a neighbor may share, are hashed
+at every check. Linux and macOS have no write watch: the bit does nothing there.
+
+Known limit: a write that does not go through the CPU (a GPU write into the imported heap) sets no flag. The old check
+hashed the memory and would see it. Textures the GPU draws into are GPU owned and never checked either way. To look
+for such a case in play, set `SAVAGEWIND_TEX_WW_VALIDATE=1`: an unchanged answer is then also hashed in full, a
+mismatch is logged, counted (`tex_ww_missed` in the `cpuopts` reply) and that texture goes back to the sampled check.
+
+Checks: `python3 tools/test_tex_write_watch.py --self-check` compiles the real block against a model of the write watch
+and the heap copy (random writes, overlapping textures, shared end pages, pages that turn into geometry, overflowing
+lists, failing queries) and requires: no missed write, the heap copy sees every geometry write, no page held twice.
+`--self-check` also breaks the code in six ways and requires each to be caught. Live: `cpuopts 32` (or 48 with bit 16),
+counters `tex_ww_skipped`, `tex_ww_written`, `tex_ww_armed`, `tex_ww_refused`.
+
+Push descriptors were not built: about 92% of descriptor sets are already shared (6,472 set lookups a frame in the
+earlier capture, so allocation and update are the small remainder), which leaves the per-draw bind and hash as the cost
+push descriptors do not remove. Indexed materials are estimated at 1-1.4 ms for a large change (shaders, bindings,
+retirement); not started.
+
 ## Running the harness
 
 From this branch in the Windows checkout, using `pwsh` and Python 3:

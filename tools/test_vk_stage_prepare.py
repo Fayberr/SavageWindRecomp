@@ -68,6 +68,7 @@ static _Atomic uint64_t stage_reuse_calls, stage_reuse_eligible, stage_reuse_hit
 typedef struct {bool failed; int mask;} ControlReply;
 static void control_fail(ControlReply *r,const char *text) {(void)text;r->failed=true;}
 static void control_field_int(ControlReply *r,const char *key,int mask) {if(!strcmp(key,"mask"))r->mask=mask;}
+static void vk_tex_ww_stats(uint64_t out[5]) {memset(out,0,5*sizeof out[0]);}
 static bool maxwell_gmem_bda;
 static uint64_t stat_sets, stat_sets_reused, setc_gen, pending_seq=1;
 typedef struct {uint64_t seq,hash,hash2; VkDescriptorSetLayout layout; VkDescriptorSet set; uint32_t n;} SetEnt;
