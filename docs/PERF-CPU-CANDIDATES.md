@@ -289,7 +289,7 @@ ranges added, and `gw_ubo_near` may only say no when no constant buffer overlaps
 side, wide ranges, the first block only, empty queries, a bit index mismatch) must be caught.
 `tools/test_vk_stage_prepare.py` runs masks 0-255 (96,000 descriptor comparisons against the code from before the
 fragment-preparation cache, and live switches between masks), so it covers the scratch path too. Live: `cpuopts 128`
-(or 192 with bit 64). Bit 128 is the last free bit of the mask (`CPU_OPTS_MAX` is 255). `draw_`'s static texture infos and
+(or 192 with bit 64). (The mask was 255 at this point; bits 256 and 512 follow below.) `draw_`'s static texture infos and
 the `record.c` changes have no switch; they need a build against the commit before them.
 
 Not verified: the frame sizes on Windows (a probe is gone when `draw_` and `stage_set` are under 4 KB). On the Windows
@@ -298,6 +298,72 @@ build the frames were 4,472 bytes (`draw_`) and 14,920 bytes (`stage_set`); the 
 there, which is under the limit but not by much. Check with `llvm-objdump` on the next Windows build. The stack fallback
 (`stage_set_prepare_stack`) keeps the large frame and its probe, but it only runs for a nested call, which the audit
 found none of.
+
+## Prepared stages of a submission and the cascade budget, 2026-11-18 (R2, R4)
+
+Two more switches, both off by default, so a build with mask 0 behaves as before them. The mask now goes to 1023
+(`CPU_OPTS_MAX`; the control command is `cpuopts [0-1023]`). Nothing here is benchmarked, and both estimates are small.
+
+### Bit 256: a table of prepared stages (R2)
+
+Bit 8 (the fragment preparation cache) keeps one prepared fragment stage, the last. With bit 256 `stage_set_wide` keeps
+eight of each stage in a table found by the program and the first three constant buffers' addresses, and does the same
+for the vertex stage, which has no textures: about 4,400 of the 8,900 `stage_set` calls a frame (0.39 us each, 3.5 ms in
+capture 185415 for `sets` altogether). A stage is prepared again unless everything its preparation reads is what it was
+(the key is bit 8's: program, shader info, layout, submission, set-cache generation, guest copy generation, uniform
+buffer serial, storing-shader generation, mask, the stage's 18 constant-buffer and 16 storage ranges, and for the
+fragment stage the scale row, tint, the images and the texture scales). Only within a submission, because the copies
+that preparation makes are transient per submission.
+
+What the vertex stage adds to bit 8's exclusions: no textures, scale rows, tint or group counts, and `hud_patch_inert()`:
+`hud_patch` (stage 0, constant buffer 3) reads live guest memory and has side effects (`hud_clip`, the map chrome frame),
+so a vertex stage is reused only when it has no first target, or the target is not the final image's and the view is not
+narrower than 16:9 (its map and dialog layouts need a narrower view). That predicate has to stay in step with
+`hud_patch`'s early exits; there is a comment at each end. The test checks it against a model of those exits.
+
+Counters (reply of `cpuopts`, per stage `wide_v_*` and `wide_f_*`): `calls`, `eligible`, `hits`, and the first part that
+differed on a miss (`miss_empty`, `miss_program`, `miss_generation`, `miss_ubuf`, `miss_sbuf`, `miss_scale_row`,
+`miss_images`, `miss_scales`). The counters are plain stores by the render thread, not locked adds (the mask-8 counters
+too, which changes nothing a reader can see).
+
+Estimate: 0.3-0.6 ms, uncertain. A hit saves `cbuf_info`, the scale-table copy and the descriptor hashing; a miss costs
+the key compare and the entry write on top of the preparation. Break-even is a hit rate of about 13%. The vertex stage's
+hit rate is not known: its first three constant buffers are per object, and the table has eight entries, so repeated
+objects hit and a stream of different ones does not. The counters answer that in one run. If the vertex hit rate is under
+13%, mask 8 alone is the better setting.
+
+### Bit 512: far shadow cascades every second frame (R4 draw budget)
+
+The sun's shadow cascades are a depth 2D array of 3 layers (D16, 896 x 896), one depth-only pass per layer, about 810 of
+the 4,431 draws a frame in the open world. With the bit set, the layers in `SAVAGEWIND_SHADOW_BUDGET_LAYERS` (a mask of
+layer numbers, default 4 = layer 2) are drawn only every `SAVAGEWIND_SHADOW_BUDGET_PERIOD`-th frame (default 2, 1-8). In
+the frames between, the pass's draws and its depth clear are left out (`shadow_budget_skip`, from `draw_` and `clear`)
+and the layer keeps the last drawn picture, which the frame's lookups read with this frame's matrices. The decision is
+made once per layer and frame (the clear and the draws agree), and a new image starts with every layer drawn. A skipped
+layer notes the frame as drawn in its image (`drawn_frame`, `prev_drawn`), so `one_shot_target` does not treat it as a
+target no pass drew into.
+
+The cost is visual: a far cascade lags the camera by a frame, so a shadow on that layer can swim or flicker at its edge
+when the camera or the sun moves quickly. It changes the picture, which is why it is opt-in and has to be looked at with
+the shadows on, not only timed. Which layer is the farthest is not known without a run (the order near to far is
+unverified): the reply of `cpuopts` has `sb_drawn_layer0..2` and `sb_cleared_layer0..2` (what each layer took) and
+`sb_skip_draws`, `sb_skip_clears`, `sb_skip_passes` (what was left out). A layer with few draws is cheap to leave out and
+costs little; the far layers usually have the fewest.
+
+Estimate: 0.15-0.8 ms of render-thread time a frame, depending on how many of the 810 draws sit on the layers left out;
+the GPU side is about 0.2 ms for all three. The first run should record the draws per layer, then choose.
+
+Checks: `python3 tools/test_shadow_budget.py --self-check` compiles the real `shadow_budget_choose` and
+`shadow_budget_skip` against a model written in the test (layers in a random order, clears and draws, frames repeated,
+skipped and jumped, a new image, passes that are no cascade) under nine environments of layers and period, and checks the
+counters; twenty seeded bugs must be caught. `tools/test_vk_stage_prepare.py --reference <exec.c from before 9df811b>`
+now also runs bit 256 (hash and slot of the table, 400,000 random calls against preparing the stage, the exclusions, each
+key field changed one at a time, the `hud_patch_inert` truth table, counter consistency) and masks 0-1023;
+`--self-check` seeds twenty-nine bugs in the table (a dropped key field or exclusion, a wrong hand-back, missing
+counters), each of which must fail the run.
+
+Live: `SAVAGEWIND_VK_CPU_BENCH=1`, then `cpuopts 256`, `cpuopts 512`, `cpuopts 768` (or the env mask). For a combined
+run, 8 + 16 + 32 + 64 + 128 + 256 = 504 is every non-visual bit, and 1016 adds the cascade budget.
 
 ## Running the harness
 

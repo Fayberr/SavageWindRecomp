@@ -1058,6 +1058,10 @@ static void uub_note(uint64_t lo, uint64_t hi) {
 }
 
 static int stage_cpu_opts(void);
+// (counters of the render thread, read by the control thread: a plain load and store, not a locked add)
+static inline void stat_bump(_Atomic uint64_t *c) {
+    atomic_store_explicit(c, atomic_load_explicit(c, memory_order_relaxed) + 1, memory_order_relaxed);
+}
 
 // The same table in one cache line an entry (cpuopts bit 64): the entries above are 80 bytes, so a hit read two lines
 // (the key, then the serial mask, chunk and span), and half of them started in one line and ended in the next. In the
@@ -2675,9 +2679,77 @@ static VkPipeline clear_pipeline(int index, int kind, uint32_t mask, bool depth,
     return p;
 }
 
+// ---- cpuopts bit 512: the shadow cascades' draw budget (R4)
+// BOTW draws the sun's shadow cascades (a depth 2D array of 3 layers, a pass of depth-only draws for each layer) in every
+// frame: ~810 of the ~4,400 draws a frame in the open world, ~0.2 ms of GPU but a share of the render thread (a draw
+// costs it about the same wherever it goes). With the bit set, the layers named by SAVAGEWIND_SHADOW_BUDGET_LAYERS (a
+// mask of layer numbers, default 4: layer 2) are drawn only every SAVAGEWIND_SHADOW_BUDGET_PERIOD-th frame (default 2);
+// in the frames between, the pass's draws and its clear are left out and the layer keeps the last frame's picture,
+// which the frame's shadow lookups read with this frame's matrices. The cost: a far cascade lags the camera by a
+// frame. Which layer is the farthest is not known without a run: the counts the control command reports (cpuopts: sb_*)
+// show the draws a layer takes. A layer is left alone while the image it is in is not the one it was last seen in.
+#define SB_LAYERS 8
+static struct {
+    uint64_t serial;              // the image the rest is about (TexBackend.serial)
+    uint64_t last[SB_LAYERS];     // 1 + the last frame the layer was drawn (0: none)
+    uint64_t decided[SB_LAYERS];  // 1 + the frame the layer's choice below was made in
+    bool skip[SB_LAYERS];
+} sb;
+static _Atomic uint64_t sb_skip_draws, sb_skip_clears, sb_skip_passes, sb_drawn[SB_LAYERS], sb_cleared[SB_LAYERS];
+
+// Is a layer left out of this frame: only when it is in the set and was drawn less than period frames ago.
+// last: 1 + the frame it was last drawn in (0: never); set to this frame when it is drawn.
+static bool shadow_budget_choose(uint64_t *last, uint64_t frame, bool in_set, uint32_t period) {
+    if (in_set && *last && frame + 1 - *last < period) return true;
+    *last = frame + 1;
+    return false;
+}
+
+// Does the pass in progress draw a cascade layer that is left out of this frame? (a draw or a clear of its depth)
+static bool shadow_budget_skip(bool is_draw) {
+    NvnTexture *d = st.rt.depth;
+    // (the shadow maps' rule, textures.c tex_scale_group: a square depth render target of 512 or more; a depth 2D array of 3)
+    if (st.rt.ncolor || !d || d->target != 4 || d->depth != 3 || !(d->flags & 8) || d->width != d->height || d->width < 512 ||
+        !renderer_format_is_depth(d->format))
+        return false;
+    TexBackend *b = d->backend;
+    uint32_t layer = st.rt.has_dview && (st.rt.dview.setmask & 2) ? st.rt.dview.min_layer : 0;
+    if (!b || layer >= SB_LAYERS) return false;
+    static uint32_t layers = ~0u, period = 2;
+    if (layers == ~0u) {
+        const char *e = getenv("SAVAGEWIND_SHADOW_BUDGET_LAYERS");
+        layers = e ? (uint32_t)strtoul(e, NULL, 0) & 0xff : 4;
+        e = getenv("SAVAGEWIND_SHADOW_BUDGET_PERIOD");
+        period = e ? (uint32_t)strtoul(e, NULL, 0) : 2;
+        if (period < 1) period = 1;
+        if (period > 8) period = 8;
+        LOG("[vk] shadow cascade budget: layers %#x every %u frames\n", layers, period);
+    }
+    uint64_t frame = renderer_present_count();
+    if (sb.serial != b->serial) {
+        memset(&sb, 0, sizeof sb);
+        sb.serial = b->serial;
+    }
+    if (sb.decided[layer] != frame + 1) {
+        sb.decided[layer] = frame + 1;
+        sb.skip[layer] = shadow_budget_choose(&sb.last[layer], frame, (layers >> layer & 1) != 0, period);
+        if (sb.skip[layer]) stat_bump(&sb_skip_passes);
+    }
+    if (!sb.skip[layer]) {
+        stat_bump(is_draw ? &sb_drawn[layer] : &sb_cleared[layer]);
+        return false;
+    }
+    // (begin_pass notes the frames a target was drawn in; draws into a target no pass drew in the previous frame wait for
+    // their shaders instead of being skipped while they build, one_shot_target: a layer drawn every second frame is not one)
+    if (b->drawn_frame != frame) { b->prev_drawn = b->drawn_frame; b->drawn_frame = frame; }
+    stat_bump(is_draw ? &sb_skip_draws : &sb_skip_clears);
+    return true;
+}
+
 static void snapshots_invalidate_clear(NvnTexture *t);
 static void clear(int index, int kind, const void *color, uint32_t mask, bool depth, float dval, bool stencil, uint32_t sval,
                   uint32_t smask) {
+    if (index < 0 && (stage_cpu_opts() & 512) && shadow_budget_skip(false)) return;  // (a cascade layer left out of this frame)
     // (a snapshot of a target taken before this clear is stale after it: Mali's G-buffer snapshots, reused within the
     // pass that follows, were - when the clear began that very pass - the water's sky reflection lost for a frame)
     if (g_vk.is_mali) {  // (other GPUs: as before)
@@ -2766,10 +2838,16 @@ typedef struct {
 // 16 throughput-bound descriptor-set hash (R1), 32 texture change detection from the write watch (textures.c, R1),
 // 64 cache-line guest copy table and prefetches ahead of a draw's constant buffers and textures (R4),
 // 128 block bitmap in front of the storing-shader range search (gw_overlaps, gw_check) and a static scratch for the
-// descriptor writes of a set (stage_set_prepare), so that neither the draw path's frame needs a stack probe (R4).
-#define CPU_OPTS_MAX 255
+// descriptor writes of a set (stage_set_prepare), so that neither the draw path's frame needs a stack probe (R4),
+// 256 reuse of a stage's prepared set within a submission for the vertex stage too and from a table of recent ones
+// instead of the last one (stage_set_wide, R2),
+// 512 far shadow cascades drawn every second frame (shadow_budget_skip, R4). Changes the picture a little: opt-in.
+#define CPU_OPTS_MAX 1023
+#define CPU_OPTS_USAGE "cpuopts [0-1023]"
 static _Atomic int stage_cpu_options = -1;
 static _Atomic uint64_t stage_reuse_calls, stage_reuse_eligible, stage_reuse_hits;
+enum { W_CALLS, W_ELIGIBLE, W_HITS, W_EMPTY, W_PROGRAM, W_GENERATION, W_UBUF, W_SBUF, W_SCALE_ROW, W_IMAGES, W_SCALES, W_N };
+static _Atomic uint64_t wide_stat[2][W_N];
 static int stage_cpu_opts(void) {
     int opts = atomic_load_explicit(&stage_cpu_options, memory_order_relaxed);
     if (opts < 0) {
@@ -2787,11 +2865,11 @@ static int stage_cpu_opts(void) {
 int vk_cpu_opts(void) { return stage_cpu_opts(); }
 
 static void stage_cpu_command(int argc, char **argv, ControlReply *r) {
-    if (argc > 2) { control_fail(r, "cpuopts [0-255]"); return; }
+    if (argc > 2) { control_fail(r, CPU_OPTS_USAGE); return; }
     if (argc == 2) {
         char *end;
         unsigned long mask = strtoul(argv[1], &end, 10);
-        if (!*argv[1] || *end || mask > CPU_OPTS_MAX) { control_fail(r, "cpuopts [0-255]"); return; }
+        if (!*argv[1] || *end || mask > CPU_OPTS_MAX) { control_fail(r, CPU_OPTS_USAGE); return; }
         atomic_store_explicit(&stage_cpu_options, (int)mask, memory_order_relaxed);
     }
     control_field_int(r, "mask", stage_cpu_opts());
@@ -2805,6 +2883,26 @@ static void stage_cpu_command(int argc, char **argv, ControlReply *r) {
     control_field_int(r, "tex_ww_missed", (int)ww[2]);
     control_field_int(r, "tex_ww_armed", (int)ww[3]);
     control_field_int(r, "tex_ww_refused", (int)ww[4]);
+    // bit 256: by stage (v, f), the calls, those that could be reused (eligible), hits, and the first part that differed
+    static const char *const wide_name[W_N] = {"calls", "eligible", "hits", "miss_empty", "miss_program", "miss_generation",
+                                               "miss_ubuf", "miss_sbuf", "miss_scale_row", "miss_images", "miss_scales"};
+    for (int s = 0; s < 2; s++)
+        for (int i = 0; i < W_N; i++) {
+            char key[48];
+            snprintf(key, sizeof key, "wide_%c_%s", s ? 'f' : 'v', wide_name[i]);
+            control_field_int(r, key, (int64_t)atomic_load_explicit(&wide_stat[s][i], memory_order_relaxed));
+        }
+    // bit 512: draws and clears left out, passes left out, and the draws and clears that were let through, by layer
+    control_field_int(r, "sb_skip_draws", (int64_t)atomic_load_explicit(&sb_skip_draws, memory_order_relaxed));
+    control_field_int(r, "sb_skip_clears", (int64_t)atomic_load_explicit(&sb_skip_clears, memory_order_relaxed));
+    control_field_int(r, "sb_skip_passes", (int64_t)atomic_load_explicit(&sb_skip_passes, memory_order_relaxed));
+    for (int i = 0; i < 3; i++) {
+        char key[32];
+        snprintf(key, sizeof key, "sb_drawn_layer%d", i);
+        control_field_int(r, key, (int64_t)atomic_load_explicit(&sb_drawn[i], memory_order_relaxed));
+        snprintf(key, sizeof key, "sb_cleared_layer%d", i);
+        control_field_int(r, key, (int64_t)atomic_load_explicit(&sb_cleared[i], memory_order_relaxed));
+    }
 }
 
 static void stage_cpu_control_init(void) {
@@ -2812,7 +2910,7 @@ static void stage_cpu_control_init(void) {
     // lets repeated measurements share one loaded scene instead of rebooting.
     if (!control_enabled() || !getenv("SAVAGEWIND_VK_CPU_BENCH")) return;
     static const ControlCmd cmd[] = {
-        {"cpuopts", "[0-255]", "CPU preparation experiment mask", stage_cpu_command, 0},
+        {"cpuopts", "[0-1023]", "CPU preparation experiment mask", stage_cpu_command, 0},
     };
     control_register(cmd, 1);
 }
@@ -4883,6 +4981,7 @@ static bool map_capture_patch(const float *g, uint64_t size, float shape, VkDesc
 }
 
 static bool hud_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
+    // (hud_patch_inert, cpuopts bit 256, names where this does nothing at all: keep it in step with the early exits here)
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_NO_HUD_FIX") != NULL;
     extern float output_view_shape(void);
@@ -7455,6 +7554,117 @@ static VkDescriptorSet stage_set_prepare(Prog *p, VkDescriptorSetLayout layout, 
     return stage_set_prepare_stack(p, layout, set, stage, si, rscale_row0, tint, gx, gy, gz, pre_ii, dyn, ndyn);
 }
 
+// ---- cpuopts bit 256: prepared stages of a submission, both stages, a table of recent ones (R2)
+// Bit 8 keeps the last fragment stage prepared. This keeps eight of each stage (the vertex stage too, the 4,400 sets a
+// frame that have no textures), found by the program and the first constant buffers' addresses. A stage is prepared
+// again unless everything its preparation reads is what it was, which is what bit 8 compares and what the vertex stage's
+// constant buffers add (below). Counted by stage and by the first thing that differed: wide_stat.
+#define WIDE_N 8
+typedef struct {
+    const Prog *p;
+    const ShaderInfo *si;
+    const NvnProgram *program;
+    VkDescriptorSetLayout layout;
+    uint64_t seq, sets, guest, serial, gpu;
+    int opts;
+    Range ubuf[18], sbuf[16];
+    float row[4], tint[8];
+    VkDescriptorSet descriptor;
+    uint32_t offsets[32];
+    int n;
+    bool used;
+} ReuseHead;
+typedef struct {
+    ReuseHead h;
+    float scales[64][2];
+    VkDescriptorImageInfo images[64];
+} ReuseFrag;
+static ReuseHead wide_vtab[WIDE_N];
+static ReuseFrag wide_ftab[WIDE_N];
+
+// hud_patch (stage 0, constant buffer 3) leaves the buffer alone, and has no other effect, without a first target, or
+// for one that is not the output's and a view that is not narrower than 16:9 (its map and dialog layouts need a view
+// narrower than 1; every other branch is for the output's targets). Only then is a vertex stage's buffer a function of
+// the ranges and the guest copy alone.
+static bool hud_patch_inert(void) {
+    if (!st.rt.ncolor || !st.rt.color[0]) return true;
+    TexBackend *tb = (TexBackend *)st.rt.color[0]->backend;
+    if (tb && tb->rs_group == RS_OUT) return false;
+    static int off = -1;
+    if (off < 0) off = getenv("SAVAGEWIND_NO_HUD_FIX") != NULL;
+    extern float output_view_shape(void);
+    return off || output_view_shape() >= 1;
+}
+
+// the entry a stage is kept in: by the program and the first three constant buffers' addresses
+static unsigned wide_slot(const Prog *p, const Range *ub) {
+    uint64_t h = ((uintptr_t)p >> 4) * 0x9E3779B97F4A7C15ull ^ ub[0].addr * 0xC2B2AE3D27D4EB4Full ^
+                 ub[1].addr * 0x165667B19E3779F9ull ^ ub[2].addr * 0xD6E8FEB86659FD93ull;
+    return (unsigned)(h >> 61);  // (WIDE_N = 8)
+}
+
+// 0 if the entry holds the stage as prepared for what it is called with now; else which part differs first (W_*)
+static int wide_match(const ReuseHead *e, const Prog *p, const ShaderInfo *si, VkDescriptorSetLayout layout, int stage,
+                      const float *row, const float *tint, int opts, uint64_t seq, uint64_t guest) {
+    if (!e->used) return W_EMPTY;
+    if (e->p != p || e->si != si || e->program != st.program || e->layout != layout) return W_PROGRAM;
+    if (e->seq != seq || e->sets != setc_gen || e->guest != guest || e->serial != uub_serial || e->gpu != gw_gen ||
+        e->opts != opts)
+        return W_GENERATION;
+    if (memcmp(e->ubuf, st.ubuf[stage], sizeof e->ubuf)) return W_UBUF;
+    if (memcmp(e->sbuf, st.sbuf[stage], sizeof e->sbuf)) return W_SBUF;
+    if (row && (memcmp(e->row, row, sizeof e->row) || memcmp(e->tint, tint, sizeof e->tint))) return W_SCALE_ROW;
+    return 0;
+}
+
+static VkDescriptorSet stage_set_wide(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si,
+                                      const float *rscale_row0, const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz,
+                                      const VkDescriptorImageInfo *pre_ii, uint32_t *dyn, int *ndyn, int opts) {
+    if (stage != 0 && stage != 1) return stage_set_prepare(p, layout, set, stage, si, rscale_row0, tint, gx, gy, gz, pre_ii, dyn, ndyn);
+    bool frag = stage == 1;
+    _Atomic uint64_t *stat = wide_stat[stage];
+    stat_bump(&stat[W_CALLS]);
+    bool ok = (uint32_t)stage == set && p->reuse_stage[set] && !si->uses_gmem && !si->writes_gmem && up_fix.sx <= 0;
+    if (frag) ok = ok && si->ntex <= 64 && pre_ii && rscale_row0 && tint && sdw_fix.s <= 1 && !fxaa_off;
+    // (the vertex stage: no textures, no scale rows, no tint, no driver group counts; and not a hud layer's: hud_patch)
+    else ok = ok && si->ntex == 0 && !pre_ii && !rscale_row0 && !tint && !gx && !gy && !gz && hud_patch_inert();
+    if (!ok) return stage_set_prepare(p, layout, set, stage, si, rscale_row0, tint, gx, gy, gz, pre_ii, dyn, ndyn);
+    stat_bump(&stat[W_ELIGIBLE]);
+    unsigned slot = wide_slot(p, st.ubuf[stage]);
+    ReuseHead *e = frag ? &wide_ftab[slot].h : &wide_vtab[slot];
+    uint64_t seq = vk_pending_seq(), guest = __atomic_load_n(&gcopy_gen, __ATOMIC_RELAXED);
+    int why = wide_match(e, p, si, layout, stage, rscale_row0, tint, opts, seq, guest);
+    if (!why && frag) {
+        const ReuseFrag *f = (const ReuseFrag *)e;
+        if (memcmp(f->images, pre_ii, sizeof *pre_ii * si->ntex)) why = W_IMAGES;
+        else if (memcmp(f->scales, tex_sc[1], sizeof f->scales[0] * si->ntex)) why = W_SCALES;
+    }
+    if (!why) {
+        stat_bump(&stat[W_HITS]);
+        if (dyn && ndyn) { memcpy(dyn + *ndyn, e->offsets, sizeof e->offsets[0] * e->n); *ndyn += e->n; }
+        return e->descriptor;
+    }
+    stat_bump(&stat[why]);
+    uint32_t offsets[32];
+    int n = 0;
+    VkDescriptorSet descriptor = stage_set_prepare(p, layout, set, stage, si, rscale_row0, tint, gx, gy, gz, pre_ii, offsets, &n);
+    if (dyn && ndyn) { memcpy(dyn + *ndyn, offsets, sizeof offsets[0] * n); *ndyn += n; }
+    // (a preparation that moved to another submission or another guest copy generation made its set from both: not kept)
+    if (vk_pending_seq() != seq || __atomic_load_n(&gcopy_gen, __ATOMIC_RELAXED) != guest) { e->used = false; return descriptor; }
+    e->p = p; e->si = si; e->program = st.program; e->layout = layout;
+    e->seq = seq; e->sets = setc_gen; e->guest = guest; e->serial = uub_serial; e->gpu = gw_gen; e->opts = opts;
+    memcpy(e->ubuf, st.ubuf[stage], sizeof e->ubuf); memcpy(e->sbuf, st.sbuf[stage], sizeof e->sbuf);
+    if (frag) {
+        memcpy(e->row, rscale_row0, sizeof e->row); memcpy(e->tint, tint, sizeof e->tint);
+        ReuseFrag *f = (ReuseFrag *)e;
+        memcpy(f->images, pre_ii, sizeof *pre_ii * si->ntex);
+        memcpy(f->scales, tex_sc[1], sizeof f->scales[0] * si->ntex);
+    }
+    e->descriptor = descriptor; e->n = n; memcpy(e->offsets, offsets, sizeof offsets[0] * n);
+    e->used = true;
+    return descriptor;
+}
+
 // Reuse preparation itself, before cbuf_info, scale-table copies and descriptor
 // hashing. Textures still resolve in draw_: uploads, feedback, shadow handling
 // and their viewport decisions always run. Only ordinary fragment stages qualify.
@@ -7464,11 +7674,12 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     int opts = stage_cpu_opts();
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_VK_NO_SET_CACHE") != NULL;
-    if (opts & 8) atomic_fetch_add_explicit(&stage_reuse_calls, 1, memory_order_relaxed);
+    if ((opts & 256) && !off) return stage_set_wide(p, layout, set, stage, si, rscale_row0, tint, gx, gy, gz, pre_ii, dyn, ndyn, opts);
+    if (opts & 8) stat_bump(&stage_reuse_calls);
     if (!(opts & 8) || off || stage != 1 || set != 1 || !p->reuse_stage[1] || si->uses_gmem || si->writes_gmem ||
         si->ntex > 64 || !pre_ii || !rscale_row0 || !tint || sdw_fix.s > 1 || up_fix.sx > 0 || fxaa_off)
         return stage_set_prepare(p, layout, set, stage, si, rscale_row0, tint, gx, gy, gz, pre_ii, dyn, ndyn);
-    atomic_fetch_add_explicit(&stage_reuse_eligible, 1, memory_order_relaxed);
+    stat_bump(&stage_reuse_eligible);
     static struct {
         const Prog *p;
         const ShaderInfo *si;
@@ -7490,7 +7701,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         !memcmp(last.row, rscale_row0, sizeof last.row) && !memcmp(last.tint, tint, sizeof last.tint) &&
         !memcmp(last.images, pre_ii, sizeof *pre_ii * si->ntex) &&
         !memcmp(last.scales, tex_sc[1], sizeof last.scales[0] * si->ntex)) {
-        atomic_fetch_add_explicit(&stage_reuse_hits, 1, memory_order_relaxed);
+        stat_bump(&stage_reuse_hits);
         if (dyn && ndyn) { memcpy(dyn + *ndyn, last.offsets, sizeof last.offsets[0] * last.n); *ndyn += last.n; }
         return last.descriptor;
     }
@@ -8415,6 +8626,7 @@ static void draw_(CmdRec *r, bool indexed) {
     ProfZone pz0 = PZ_NOW();
     fg_before_draw();
     if (!st.program) { stat_skipped++; return; }
+    if ((stage_cpu_opts() & 512) && shadow_budget_skip(true)) return;  // (a cascade layer left out of this frame, see there)
     static int no_key_gen = -1;
     if (no_key_gen < 0) no_key_gen = getenv("SAVAGEWIND_VK_NO_KEY_GEN") != NULL;
     static struct { uint64_t gen; uint32_t origin, dmode; NvnProgram *np; Prog *pr; bool points; } pm;
