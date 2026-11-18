@@ -14,11 +14,11 @@ set by `SAVAGEWIND_VK_STAGE_REUSE=0..2`, which wins over the mask's low bits. Th
 | 32 | texture change detection from the write watch (`textures.c`) | R1 |
 | 64 | cache-line guest copy table, prefetches ahead of a draw's constant buffers and textures | R4 |
 | 128 | block bitmap in front of the storing-shader range search, static scratch for the descriptor writes of a set | R4 |
-| 512 | far shadow cascades drawn every second frame (changes the picture a little, opt-in) | R4 |
+| 512 | far shadow cascades drawn every second frame. **Known bad: the ground and rocks flicker while panning** (confirmed 2026-11-18, gone with it off). Leave off | R4 |
 | 1024 | per-thread dispatch table for indirect calls (`runtime/dispatch.c`) | R4 |
 | 2048 | O(1) command buffer unlink (`nvn/cmdbuf.c`) | R4 |
 
-All bits except 512: `3824 - 512 = 3312`, plus the cache mode 2 gives `3314`. With 512 the full mask is `3824 + 2 = 3826`.
+The mask to play with: every bit except 512, `3824 - 512 = 3312`, plus the cache mode 2 gives `3314`. (With 512 it would be `3826`.)
 
 `CPU_OPTS_VALID` is `3 | 3824`. The live command `cpuopts [mask]` (needs `SAVAGEWIND_CONTROL` and
 `SAVAGEWIND_VK_CPU_BENCH=1`) reports and changes it; `tools/stage_reuse_bench.py` and `tools/swr_ab.py` use it.
