@@ -8,13 +8,16 @@ is needed. Pass --reference to a saved exec.c from before the candidate changes.
 import argparse
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
 
 def function(source, name):
-    start = source.index('static ', source.rfind('\n', 0, source.index(name + '(')) + 1)
-    brace = source.index('{', source.index(name + '(', start))
+    # The definition, not a prototype or a call: "static ... name(...) {" at the start of a line.
+    match = re.search(r'^static [^;{}]*?\b' + re.escape(name) + r'\([^;{}]*\)\s*\{', source, re.M)
+    start = match.start()
+    brace = match.end() - 1
     depth = 1
     pos = brace + 1
     while depth:

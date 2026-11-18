@@ -242,6 +242,38 @@ earlier capture, so allocation and update are the small remainder), which leaves
 push descriptors do not remove. Indexed materials are estimated at 1-1.4 ms for a large change (shaders, bindings,
 retirement); not started.
 
+## Render-thread memory stalls, 2026-11-18 (R4)
+
+Where the render thread (`nvn-queue`, about 13.4 ms of a 14.4 ms frame in capture 185415) waits on memory rather than
+computes, read from the line-level sampler (ms a frame = 14.411 x samples / 19,144; the profiler's own cost, about 2 ms,
+is not in normal play). The play build lays out the statics sorted by name, so unrelated variables share cache lines.
+Nothing here is benchmarked.
+
+| Place | ms/frame | What it waits for | Change |
+| --- | ---: | --- | --- |
+| `wait_room` (`record.c`), load of `tail` | 0.10 | R stores `tail` after every packet; T loads it before every one of about 16,000 pushes a frame (true sharing, the line moves between cores each time) | always on: T keeps the last `tail` it saw (it only grows) and reads the real one only when the ring looks full; the ring ends and T's own cursors each get their own line |
+| `guest_copy`, key compare of the slot | 0.36 of 0.57 | the first read of a slot of the 80-byte entry table; most calls are misses, which then write the entry; entries straddle two lines | bit 64: 64-byte entries (`GCopyLine`) |
+| `guest_copy` slot, ahead of its turn | same line | the ranges of a draw's constant buffers are known when the draw is, long before each one is copied | bit 64: `cbuf_prefetch` asks for all slots at the start of `draw_` |
+| `texture_info`, guard line | 0.25 of 0.50 | pool entry, then texture, then backend: three dependent loads per texture per draw | bit 64: `tex_prefetch` level 0 (pool entries) at the start of `draw_`, level 1 (the textures) before the fragment texture loop |
+| `draw_`, after `fi->ntex` | 0.29 (one address) | the fragment shader's info, probably cold (inference from the sample position, not proven) | bit 64: prefetch of both shaders' `ntex` lines |
+
+Estimate: 0.3-0.7 ms of render CPU a frame for the bundle, at best; the prefetches are hints, so a wrong guess costs one
+cache line and never a result. The known limit: prefetching helps only where the miss is on the path; if the sample
+position moves but the frame time does not, the cost was not the stall.
+
+Not done: `___chkstk_ms` (0.09 ms; the 15 KB and 4.4 KB frames of `stage_set` and `draw_`, a static scratch would need
+care with re-entry), the `gw_check` family (0.32 ms together; its memo is defeated by a per-draw serial, a coarse
+granule bitmap in front of `gw_overlaps` would be the next idea), `exec_list` (already prefetched).
+
+Checks: `python3 tools/test_guest_copy_line.py --self-check` compiles the real `guest_copy`, `guest_copy_line`,
+`uub_note` and `guest_copy_flush` with an allocator stand-in and a model of guest memory (draws that repeat ranges,
+colliding slots with other sizes, uniform-buffer writes, list changes, pending-sequence and chunk changes). Every span
+must equal the memory at that moment, and the original table and the line table must answer hit and miss identically on
+every call; five seeded bugs (key address, key size, generation, staleness, written ranges) must each be caught.
+`tools/test_vk_stage_prepare.py` still passes over all masks 0-255 (it needs `--reference` set to the `exec.c` from
+before `9df811b`; the helper now skips prototypes when it extracts a function). Live: `cpuopts 64` (needs
+`SAVAGEWIND_VK_CPU_BENCH=1`), or the env mask `SAVAGEWIND_VK_CPU_OPTS=64`.
+
 ## Running the harness
 
 From this branch in the Windows checkout, using `pwsh` and Python 3:
