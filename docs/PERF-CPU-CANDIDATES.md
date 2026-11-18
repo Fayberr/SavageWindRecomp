@@ -261,10 +261,6 @@ Estimate: 0.3-0.7 ms of render CPU a frame for the bundle, at best; the prefetch
 cache line and never a result. The known limit: prefetching helps only where the miss is on the path; if the sample
 position moves but the frame time does not, the cost was not the stall.
 
-Not done: `___chkstk_ms` (0.09 ms; the 15 KB and 4.4 KB frames of `stage_set` and `draw_`, a static scratch would need
-care with re-entry), the `gw_check` family (0.32 ms together; its memo is defeated by a per-draw serial, a coarse
-granule bitmap in front of `gw_overlaps` would be the next idea), `exec_list` (already prefetched).
-
 Checks: `python3 tools/test_guest_copy_line.py --self-check` compiles the real `guest_copy`, `guest_copy_line`,
 `uub_note` and `guest_copy_flush` with an allocator stand-in and a model of guest memory (draws that repeat ranges,
 colliding slots with other sizes, uniform-buffer writes, list changes, pending-sequence and chunk changes). Every span
@@ -273,6 +269,35 @@ every call; five seeded bugs (key address, key size, generation, staleness, writ
 `tools/test_vk_stage_prepare.py` still passes over all masks 0-255 (it needs `--reference` set to the `exec.c` from
 before `9df811b`; the helper now skips prototypes when it extracts a function). Live: `cpuopts 64` (needs
 `SAVAGEWIND_VK_CPU_BENCH=1`), or the env mask `SAVAGEWIND_VK_CPU_OPTS=64`.
+
+### Stack probes and the storing-shader lookups (bit 128, added the same day)
+
+| Place | ms/frame | What it costs | Change |
+| --- | ---: | --- | --- |
+| `___chkstk_ms` | 0.09 | `stage_set` (with `stage_set_prepare` inlined) has a 15 KB frame and `draw_` 4.5 KB: a frame over one page is entered through a call that probes every page, about 8,900 + 4,400 times a frame | bit 128: the descriptor writes of a set (`PrepScratch`, 11 KB) live in a static for the call (the draw path runs on one thread; a call made while it is in use takes a noinline stack copy). Always on: `draw_`'s 64 texture infos (1.5 KB) are a static, which takes its frame to 2.9 KB |
+| `gw_overlaps`, `gw_ubo_copied`, `gw_check` | 0.32 | per draw, per constant buffer, a memo lookup in `gw_overlaps` and the per-stage memo of `gw_check`, which a per-draw `ubuf_gen` defeats; the set's ranges lie all over the heap, so its bounds reject little | bit 128: a bitmap, one bit per 1 MB block of the heap hashed over 4096 bits (512 bytes), set by `gw_add` for every block of a range, cleared with the set. `gw_overlaps` asks it first, `gw_check` skips a stage whose constant buffers are all off it (`gw_ubo_near`). A bit that is set only means "ask the exact search", so a false positive costs a lookup and a false negative is impossible while no bit clears before the set does |
+
+Estimate 0.05-0.1 ms for the stack probes and 0.1-0.15 ms for the lookups (the memo of `gw_check` and the call to
+`gw_overlaps` stay for ranges that are near the set; `guest_direct` stays). In frame terms this is below the noise of a
+benchmark: it is here because it costs nothing in risk, not because it moves the frame rate.
+
+Checks: `python3 tools/test_gw_filter.py --self-check` compiles the real `gw_add`, `gw_overlaps` (wrapper and exact
+search), `gw_maybe`, `gw_blocks_add` and `gw_ubo_near` against random sets (small buffers, megabytes, a range over the
+bitmap's 4 GB, touching ranges, a full set, resets) and random queries (range ends and one byte either side, block
+borders, wide, empty, wrapped). The answer with the bit on must equal the answer with it off, equal a plain scan of the
+ranges added, and `gw_ubo_near` may only say no when no constant buffer overlaps. Six seeded bugs (an off-by-one on either
+side, wide ranges, the first block only, empty queries, a bit index mismatch) must be caught.
+`tools/test_vk_stage_prepare.py` runs masks 0-255 (96,000 descriptor comparisons against the code from before the
+fragment-preparation cache, and live switches between masks), so it covers the scratch path too. Live: `cpuopts 128`
+(or 192 with bit 64). Bit 128 is the last free bit of the mask (`CPU_OPTS_MAX` is 255). `draw_`'s static texture infos and
+the `record.c` changes have no switch; they need a build against the commit before them.
+
+Not verified: the frame sizes on Windows (a probe is gone when `draw_` and `stage_set` are under 4 KB). On the Windows
+build the frames were 4,472 bytes (`draw_`) and 14,920 bytes (`stage_set`); the stack objects at -O2 on aarch64 go from
+4.1 KB to 2.6 KB (`draw_`) and from 13.4 KB to 1.8 KB (`stage_set_prepare`), so about 2.9 KB and 3.3 KB are expected
+there, which is under the limit but not by much. Check with `llvm-objdump` on the next Windows build. The stack fallback
+(`stage_set_prepare_stack`) keeps the large frame and its probe, but it only runs for a nested call, which the audit
+found none of.
 
 ## Running the harness
 

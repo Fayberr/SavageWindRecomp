@@ -26,6 +26,11 @@ def function(source, name):
     return source[start:pos]
 
 
+def typedef(source, name):
+    match = re.search(r'^typedef struct \{[^{}]*\} ' + re.escape(name) + r';', source, re.M)
+    return match.group(0)
+
+
 FIXTURE = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -280,7 +285,9 @@ def main():
     source = '\n'.join([FIXTURE, function(current, 'stage_cpu_opts'), function(current, 'stage_cpu_command'), function(current, 'mum64'),
                         function(current, 'stage_plan_init'),
                         reference_finish, reference_stage, function(current, 'set_finish'),
-                        function(current, 'stage_set_prepare'), function(current, 'stage_set'), driver(reference, 'driver_reference'),
+                        typedef(current, 'PrepScratch'), function(current, 'stage_set_prepare_in'),
+                        function(current, 'stage_set_prepare_stack'), function(current, 'stage_set_prepare'),
+                        function(current, 'stage_set'), driver(reference, 'driver_reference'),
                         driver(current, 'driver_candidate'), MAIN])
     with tempfile.TemporaryDirectory(prefix='swr-stage-test-') as temp:
         path = Path(temp) / 'test.c'
