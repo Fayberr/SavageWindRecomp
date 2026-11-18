@@ -11,6 +11,7 @@ forward order, every previous link, the head, and the links of a buffer that was
 """
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -130,6 +131,11 @@ def main():
     nvn_h = (ROOT / 'runtime' / 'nvn' / 'nvn.h').read_text()
     if 'struct NvnCmdBuf *registry_next, *registry_prev;' not in nvn_h:
         print('nvn.h no longer declares the two registry links the harness mirrors')
+        return 2
+    # The harness defines the switch itself, so a missing definition in the runtime would only show at the real link.
+    cmdbuf_c = (ROOT / 'runtime' / 'nvn' / 'cmdbuf.c').read_text()
+    if len(re.findall(r'^volatile int g_opt_cb_unlink;', cmdbuf_c, re.M)) != 1:
+        print('runtime/nvn/cmdbuf.c must define g_opt_cb_unlink exactly once (rt.h declares it extern)')
         return 2
     with tempfile.TemporaryDirectory() as work:
         if not args.self_check:

@@ -54,6 +54,7 @@ static HBlock *g_grave;  // dead blocks, oldest first, until three frames have p
 static int g_ngrave, g_capgrave;
 static KMutex g_shadow_lock = KMUTEX_INIT;
 static NvnCmdBuf *g_command_buffers;
+volatile int g_opt_cb_unlink;  // cpuopts bit 2048, mirrored by stage_cpu_publish (exec.c); see rt.h
 uint64_t renderer_present_count(void);
 
 static void push_block(HBlock **v, int *n, int *cap, HBlock b) {
