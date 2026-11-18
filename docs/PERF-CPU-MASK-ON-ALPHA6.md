@@ -35,3 +35,19 @@ Alpha 6's material cache covers the same ground and is already tuned, so they ar
 `tools/pgo/runtime.profdata` is the same in Alpha 6 and here, but the Alpha 6 play build used a fresh profile
 (`build/hunt/pgo-refresh/fresh.profdata`, trained on the Alpha 6 source). The functions changed by the bits above have
 no profile data in it and compile without PGO until the profile is retrained on this tree.
+
+## The max-FPS build (`perf/max-fps`)
+
+Everything that already existed and was measured or expected to help on an RTX 3080 Ti, in one tree:
+
+- `perf/r4-on-alpha6` (this document): Alpha 6, material cache, 64 MB VRAM blocks, FSR 3, the CPU mask.
+- `upstream/test` merged in (8 commits after Alpha 6: the new-render-target terrain fix #923, Alpha 6 fixes, lower
+  requirements).
+- PR 881, no synchronous flush on autosave (the 15-50 ms hitch when "Saving..." shows). `SAVAGEWIND_SYNC_SAVE_FLUSH=1`
+  brings the old behaviour back.
+- The Alpha 6 trained PGO profile (the content of PR 889) at build time.
+
+Left out: DLSS frame generation (PR 345: RTX 40 series and newer only, and it rewrites the frame pacer that FSR 3 uses),
+PR 900 (scene copies: only GPUs without attachment feedback loops, which the NVIDIA cards have), XeSS, macOS, cheats,
+mods, amiibo and interface PRs. The recorder publication batch (`perf/recorder-publish-batch`) is already in the tree
+as `SAVAGEWIND_VK_PUBLISH_KB`.
