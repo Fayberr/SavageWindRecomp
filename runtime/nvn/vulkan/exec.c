@@ -2842,12 +2842,22 @@ typedef struct {
 // 256 reuse of a stage's prepared set within a submission for the vertex stage too and from a table of recent ones
 // instead of the last one (stage_set_wide, R2),
 // 512 far shadow cascades drawn every second frame (shadow_budget_skip, R4). Changes the picture a little: opt-in.
-#define CPU_OPTS_MAX 1023
-#define CPU_OPTS_USAGE "cpuopts [0-1023]"
+// Two switches for the guest's threads, mirrored to plain variables (stage_cpu_publish) because they are read there:
+// 1024 the dispatch of an indirect call from a per-thread table that also holds the host (HLE) targets, without the
+// thread-local lookup and with the slow path out of line (runtime/dispatch.c dispatch_fast),
+// 2048 a command buffer leaves the registry with two pointer writes instead of a walk of the list (nvn/cmdbuf.c).
+#define CPU_OPTS_MAX 4095
+#define CPU_OPTS_USAGE "cpuopts [0-4095]"
 static _Atomic int stage_cpu_options = -1;
 static _Atomic uint64_t stage_reuse_calls, stage_reuse_eligible, stage_reuse_hits;
 enum { W_CALLS, W_ELIGIBLE, W_HITS, W_EMPTY, W_PROGRAM, W_GENERATION, W_UBUF, W_SBUF, W_SCALE_ROW, W_IMAGES, W_SCALES, W_N };
 static _Atomic uint64_t wide_stat[2][W_N];
+// The bits the guest's threads read (runtime/dispatch.c, nvn/cmdbuf.c), as plain variables there.
+static void stage_cpu_publish(int mask) {
+    g_opt_dispatch_fast = (mask & 1024) != 0;
+    g_opt_cb_unlink = (mask & 2048) != 0;
+}
+
 static int stage_cpu_opts(void) {
     int opts = atomic_load_explicit(&stage_cpu_options, memory_order_relaxed);
     if (opts < 0) {
@@ -2855,9 +2865,10 @@ static int stage_cpu_opts(void) {
         opts = e ? (int)strtoul(e, NULL, 0) & CPU_OPTS_MAX : 0;
         int unset = -1;
         if (atomic_compare_exchange_strong_explicit(&stage_cpu_options, &unset, opts,
-                memory_order_relaxed, memory_order_relaxed))
+                memory_order_relaxed, memory_order_relaxed)) {
+            stage_cpu_publish(opts);
             LOG("[vk] CPU preparation experiments: mask %d\n", opts);
-        else opts = unset;
+        } else opts = unset;
     }
     return opts;
 }
@@ -2871,8 +2882,10 @@ static void stage_cpu_command(int argc, char **argv, ControlReply *r) {
         unsigned long mask = strtoul(argv[1], &end, 10);
         if (!*argv[1] || *end || mask > CPU_OPTS_MAX) { control_fail(r, CPU_OPTS_USAGE); return; }
         atomic_store_explicit(&stage_cpu_options, (int)mask, memory_order_relaxed);
+        stage_cpu_publish((int)mask);
     }
     control_field_int(r, "mask", stage_cpu_opts());
+    control_field_int(r, "draws", (int64_t)draws_total);  // (cumulative: ms per draw in tools/swr_ab.py)
     control_field_int(r, "reuse_calls", (int)atomic_load_explicit(&stage_reuse_calls, memory_order_relaxed));
     control_field_int(r, "reuse_eligible", (int)atomic_load_explicit(&stage_reuse_eligible, memory_order_relaxed));
     control_field_int(r, "reuse_hits", (int)atomic_load_explicit(&stage_reuse_hits, memory_order_relaxed));
@@ -2910,7 +2923,7 @@ static void stage_cpu_control_init(void) {
     // lets repeated measurements share one loaded scene instead of rebooting.
     if (!control_enabled() || !getenv("SAVAGEWIND_VK_CPU_BENCH")) return;
     static const ControlCmd cmd[] = {
-        {"cpuopts", "[0-1023]", "CPU preparation experiment mask", stage_cpu_command, 0},
+        {"cpuopts", "[0-4095]", "CPU preparation experiment mask", stage_cpu_command, 0},
     };
     control_register(cmd, 1);
 }

@@ -78,6 +78,8 @@ static float tex_sc[2][64][2];
 static uint32_t tex_wh[2][64][2];
 #define LOG(...) ((void)0)
 static _Atomic int stage_cpu_options=-1;
+volatile int g_opt_dispatch_fast,g_opt_cb_unlink;
+static uint64_t draws_total=12345;
 static _Atomic uint64_t stage_reuse_calls, stage_reuse_eligible, stage_reuse_hits;
 typedef struct {bool failed; int64_t mask; int n; char key[160][48]; int64_t val[160];} ControlReply;
 static void control_fail(ControlReply *r,const char *text) {(void)text;r->failed=true;}
@@ -574,12 +576,16 @@ int main(void) {
     char *bad[]={"", over, "-1", "one", "1x", "99999999999999999999999999999999999999"};
     for(unsigned i=0;i<sizeof bad/sizeof *bad;i++) {
         char *argv[]={"cpuopts",bad[i]};ControlReply reply={0};
-        atomic_store(&stage_cpu_options,3);stage_cpu_command(2,argv,&reply);
-        assert(reply.failed && stage_cpu_opts()==3);
+        atomic_store(&stage_cpu_options,3);g_opt_dispatch_fast=1;g_opt_cb_unlink=0;
+        stage_cpu_command(2,argv,&reply);
+        assert(reply.failed && stage_cpu_opts()==3 && g_opt_dispatch_fast==1 && g_opt_cb_unlink==0);  // (a refused mask changes nothing)
     }
     for(int mask=0;mask<=CPU_OPTS_MAX;mask++) {
         char value[16];snprintf(value,sizeof value,"%d",mask);char *argv[]={"cpuopts",value};ControlReply reply={0};
         stage_cpu_command(2,argv,&reply);assert(!reply.failed && reply.mask==mask && stage_cpu_opts()==mask);
+        // the guest's threads read plain variables: they follow the mask, bit for bit
+        assert(g_opt_dispatch_fast==((mask&1024)!=0) && g_opt_cb_unlink==((mask&2048)!=0));
+        assert(field(&reply,"draws")==12345);
     }
     // R2 (mask 256): the stage's own tests, then random states against preparing the stage
     hud_cases();
@@ -662,7 +668,7 @@ def build(current, reference, mutate=None):
     wide_types = '\n'.join([typedef(current, 'ReuseHead'), typedef(current, 'ReuseFrag'),
                             line(current, 'static ReuseHead wide_vtab'), line(current, 'static ReuseFrag wide_ftab')])
     parts = [FIXTURE.replace('@CPU_OPTS@', options), wide_types, function(current, 'stat_bump'),
-             function(current, 'stage_cpu_opts'), function(current, 'stage_cpu_command'), function(current, 'mum64'),
+             function(current, 'stage_cpu_publish'), function(current, 'stage_cpu_opts'), function(current, 'stage_cpu_command'), function(current, 'mum64'),
              function(current, 'stage_plan_init'),
              reference_finish, reference_stage, function(current, 'set_finish'),
              typedef(current, 'PrepScratch'), function(current, 'stage_set_prepare_in'),
@@ -681,14 +687,19 @@ def build(current, reference, mutate=None):
     return text
 
 
-def run(text, temp, envs, quiet=False):
-    path = Path(temp) / 'test.c'
+def compile_test(text, temp, name='test'):
+    path = Path(temp) / (name + '.c')
     path.write_text(text)
-    exe = Path(temp) / 'test'
+    exe = Path(temp) / name
     r = subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-O1', '-g', '-fsanitize=address,undefined',
                         '-fno-sanitize-recover=all', '-w', str(path), '-o', str(exe)], capture_output=True, text=True)
     if r.returncode:
         sys.exit(r.stderr)
+    return exe
+
+
+def run(text, temp, envs, quiet=False, exe=None):
+    exe = exe or compile_test(text, temp)
     for extra in envs:
         env = dict(os.environ, ASAN_OPTIONS='detect_leaks=0')
         for key in ('SAVAGEWIND_VK_NO_SET_CACHE', 'SAVAGEWIND_NO_HUD_FIX'):
@@ -711,7 +722,7 @@ MUTANTS = [
     ('forgets the set cache generation', 'e->sets != setc_gen || ', ''),
     ('forgets the guest copy generation', 'e->guest != guest || ', ''),
     ('forgets the constant buffer serial', 'e->serial != uub_serial || ', ''),
-    ('forgets the storing shader generation', 'e->gpu != gw_gen || ', ''),
+    ('forgets the storing shader generation', 'e->gpu != gw_gen ||', ''),
     ('forgets the program', 'e->program != st.program || ', ''),
     ('forgets the layout', ' || e->layout != layout', ''),
     ('forgets the shader info', 'e->si != si || ', ''),
@@ -719,8 +730,8 @@ MUTANTS = [
     ('forgets the storage ranges', 'if (memcmp(e->sbuf, st.sbuf[stage], sizeof e->sbuf)) return W_SBUF;', ''),
     ('forgets the scale row', 'memcmp(e->row, row, sizeof e->row) || ', ''),
     ('forgets the tint', ' || memcmp(e->tint, tint, sizeof e->tint)', ''),
-    ('forgets the images', 'if (memcmp(f->images, pre_ii, sizeof *pre_ii * si->ntex)) why = W_IMAGES;', ''),
-    ('forgets the texture scales', 'else if (memcmp(f->scales, tex_sc[1], sizeof f->scales[0] * si->ntex)) why = W_SCALES;', ''),
+    ('forgets the images', 'if (memcmp(f->images, pre_ii, sizeof *pre_ii * si->ntex)) why = W_IMAGES;', 'if (0) why = W_IMAGES;'),
+    ('forgets the texture scales', 'else if (memcmp(f->scales, tex_sc[1], sizeof f->scales[0] * si->ntex)) why = W_SCALES;', 'else if (0) why = W_SCALES;'),
     ('reuses a HUD layer', ' && hud_patch_inert();', ';'),
     ('reuses with the texel grid fix', ' && up_fix.sx <= 0;', ';'),
     ('reuses with the shadow fix', ' && sdw_fix.s <= 1', ''),
@@ -753,12 +764,13 @@ def main():
             return 1
         if args.self_check:
             missed = 0
-            for name, old, new in MUTANTS:
-                text = build(current, reference, (old, new if 'descriptor_of_last' not in new else new))
-                if 'descriptor_of_last' in text:
-                    text = text.replace('descriptor_of_last', '(VkDescriptorSet)(uintptr_t)1')
-                caught = not run(text, temp, envs[:1], quiet=True)
-                print('%-44s %s' % (name, 'caught' if caught else 'MISSED'))
+            exes = []
+            for i, (name, old, new) in enumerate(MUTANTS):  # (all of them built first: one that no longer matches or compiles stops the run at once)
+                text = build(current, reference, (old, new)).replace('descriptor_of_last', '(VkDescriptorSet)(uintptr_t)1')
+                exes.append(compile_test(text, temp, 'mutant%d' % i))
+            for (name, old, new), exe in zip(MUTANTS, exes):
+                caught = not run(None, temp, envs[:1], quiet=True, exe=exe)
+                print('%-44s %s' % (name, 'caught' if caught else 'MISSED'), flush=True)
                 missed += not caught
             return 1 if missed else 0
     return 0

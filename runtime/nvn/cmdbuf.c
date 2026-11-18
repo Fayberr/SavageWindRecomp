@@ -6,6 +6,7 @@
 
 #include "ksync.h"
 #include "nvn.h"
+#include "cbreg.h"
 
 #define JUMP_RESERVE (sizeof(CmdRec) + 8)
 
@@ -245,7 +246,7 @@ NVN(nvnCommandBufferInitialize) {
     NvnCmdBuf *cb = calloc(1, sizeof *cb);
     cb->guest = A(0);
     kmutex_lock(&g_shadow_lock);
-    cb->registry_next = g_command_buffers; g_command_buffers = cb;
+    cb_registry_add(&g_command_buffers, cb);
     kmutex_unlock(&g_shadow_lock);
     SET_HOST(A(0), cb);
     RET(1);
@@ -253,9 +254,7 @@ NVN(nvnCommandBufferInitialize) {
 NVN(nvnCommandBufferFinalize) {
     NvnCmdBuf *cb = cb_of(A(0));
     kmutex_lock(&g_shadow_lock);
-    NvnCmdBuf **link = &g_command_buffers;
-    while (*link && *link != cb) link = &(*link)->registry_next;
-    if (*link) *link = cb->registry_next;
+    cb_registry_remove(&g_command_buffers, cb, g_opt_cb_unlink);
     kmutex_unlock(&g_shadow_lock);
     if (cb && cb->shadow) shadow_leave(cb->shadow, cb->gused);
     free(cb);

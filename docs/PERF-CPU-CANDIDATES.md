@@ -302,7 +302,7 @@ found none of.
 ## Prepared stages of a submission and the cascade budget, 2026-11-18 (R2, R4)
 
 Two more switches, both off by default, so a build with mask 0 behaves as before them. The mask now goes to 1023
-(`CPU_OPTS_MAX`; the control command is `cpuopts [0-1023]`). Nothing here is benchmarked, and both estimates are small.
+(`CPU_OPTS_MAX`; the control command is `cpuopts [0-1023]`; later extended to 4095). Nothing here is benchmarked, and both estimates are small.
 
 ### Bit 256: a table of prepared stages (R2)
 
@@ -364,6 +364,100 @@ counters), each of which must fail the run.
 
 Live: `SAVAGEWIND_VK_CPU_BENCH=1`, then `cpuopts 256`, `cpuopts 512`, `cpuopts 768` (or the env mask). For a combined
 run, 8 + 16 + 32 + 64 + 128 + 256 = 504 is every non-visual bit, and 1016 adds the cascade budget.
+
+## Indirect calls, the command buffer registry, and one play session for all bits, 2026-11-18
+
+The mask now goes to 4095 (`CPU_OPTS_MAX`; the control command is `cpuopts [0-4095]`). Two more switches, both off by
+default, and a tool that measures every bit in one play session instead of one run per bit. Nothing is benchmarked yet.
+
+### Bit 1024: a per-thread table for indirect calls (`rt_dispatch`)
+
+Every indirect call or return through a function pointer in recompiled code goes through `rt_dispatch`. The old path
+(`dispatch_old`) looks the target up in a thread-local table. With bit 1024 the trampoline takes `dispatch_fast`: a
+per-guest-thread table (`KThread.dcache`, 4096 entries of 16 bytes, allocated on the first miss, freed with the thread)
+that a hit answers with one compare and a tail call, and without the thread-local access. A host function (HLE) target is
+stored with its low bit set so one table holds both kinds; an HLE hit also checks that no unwind is in progress. Odd guest
+addresses are never cached, a target with no implementation is never cached, and a CPU context with no thread goes to the
+old path. The `Cpu` layout is untouched, and every tail call is a `musttail`, so the stack does not grow.
+
+The bit is mirrored into a plain global (`g_opt_dispatch_fast`) by `stage_cpu_publish`, because the trampoline has no
+prologue and cannot afford the atomic mask load. A guest thread running at the moment of the switch may take one more call
+on the old path; both paths give the same answer.
+
+Estimate: about 0.2-0.3 ms of guest main-thread time a frame. The self time of the old path was small, so this is the
+least certain of the bits.
+
+### Bit 2048: a command buffer leaves the registry in O(1)
+
+The registry of live command buffers was a singly linked list; `Finalize` walked it to find the buffer. It is now doubly
+linked in all cases (`registry_next` and `registry_prev` in `NvnCmdBuf`, helpers in `runtime/nvn/cbreg.h`). Bit 2048 makes
+`Finalize` unlink through `registry_prev` after checking membership, and fall back to the walk if the check fails. With the
+bit clear the walk is what runs. The reset handler pops the head and frees everything, which needs no `prev` updates.
+
+Estimate: about 0.1-0.3 ms of render-thread time in a scene with many live buffers, nothing in a quiet one.
+
+### Not done: a memo for guest fetches
+
+A third candidate was a memo in front of `guest_fetch` (self time about 0.12 ms). It was left out on purpose. The memo's
+answer depends on state that the asynchronous copier thread changes, and a stale answer changes what the renderer does (it
+feeds a policy decision), so it cannot be a pure cache. A safe version needs a generation counter shared with that thread,
+which is a design of its own for 0.12 ms.
+
+### One play session for every bit: `tools/swr_ab.py`
+
+The tool connects to the control port of the running game, switches the bits with `cpuopts` while you play, reads the
+frame time and thread times (`frames`, `threads`), and fits one effect per bit.
+
+Design: eight real switches (16, 32, 64, 128, 256, 512, 1024, 2048) are placed on eight columns of a 16-run Hadamard design
+(the other seven columns are spare, used as probes: effects found there are noise, and their size is printed as the noise
+floor). The design is run eight times, odd runs inverted, each run in a shuffled order. Every window is 3 s plus 0.5 s for
+the switch to settle, so 140 windows take about 8.4 minutes with the 15 s warm-up. The fit has a fixed effect per pass
+(a block), a time trend, and the number of draws in the window as a covariate (as the part the switches do not explain, so
+bit 512's own saving is not absorbed). Standard errors are widened by 25% for drift the fit does not catch, and windows
+that straddle a pause or hitch are trimmed by a robust rule. The last windows are all bits off against all bits on (six
+each), compared with a Welch test; that is the number to read for what the combination gives, and it need not equal the
+sum of the single effects, because the optimizations can compete for the same time or the next thread in line takes over
+as the limit. The table says where each effect shows (frame, main, render, recorder, all guest threads).
+
+Verdicts: `resolved` is 3 or more standard errors, `probable` is 2 or more, anything else is `within noise`.
+
+Honest limits (from a simulation with a known truth, `tools/test_ab_play.py`: 192 of 192 recovered effects were within 3
+standard errors, 0 of 96 false positives, 64 of 72 large effects resolved): the smallest effect it can see is about 0.25
+to 0.35 ms of frame time. An optimization worth less than that reads as `within noise`, which says only that it could not
+be resolved here, not that it does nothing. Expect bits 16, 256 and 512 to resolve if they save what is estimated;
+1024 and 2048 will probably not (about 0.5 ms together). Bit 512 changes the picture during its windows; `--no-visual`
+leaves it out (the plan then has seven switches). The scene should stay busy and about the same: stand somewhere with
+plenty to draw, keep the camera moving, stay out of menus and loading.
+
+Commands:
+
+```sh
+python3 tools/swr_ab.py --port 7790 --dry-run        # the plan, the time, nothing else
+python3 tools/swr_ab.py --port 7790                  # the session; saves build/swr_ab_<time>.json
+python3 tools/swr_ab.py --analyze build/swr_ab_X.json  # fit a saved session again, connects to nothing
+```
+
+Options: `--window`, `--settle`, `--warmup`, `--passes`, `--confirm`, `--bits 16,256`, `--no-visual`, `--seed`, `--out`.
+
+Game side: the control port and the bench counters have to be on, the profiler off, and the frame limiter and vsync set
+above the fps you expect (a cap hides the saving):
+
+```sh
+SAVAGEWIND_CONTROL=7790 SAVAGEWIND_VK_CPU_BENCH=1 SAVAGEWIND_VK_CPU_OPTS=0 savagewind.exe
+```
+
+The play build is the usual PGO one. The profile was recorded without these bits, so functions the bits touch may be laid
+out for the old paths; the session measures this build's difference between mask settings, which is what a player gets.
+A run with the old binary for comparison is worth a few minutes.
+
+Checks: `tools/test_dispatch_cache.py --self-check` compiles the real `dispatch.c` against stubs and runs a model of the
+table (implemented and unimplemented host targets, overrides including one at an odd address, a CPU context with no
+thread, the unwind flag, preemption, the flag switched live, four threads calling at once, and every table entry
+inspected after each phase); eight seeded bugs must be caught. `tools/test_cb_registry.py --self-check` does the same for
+`cbreg.h` (a buffer at either end, in the middle, the only one, one removed twice, one never added, NULL, either unlink
+mode chosen per call); six seeded bugs. `tools/test_vk_stage_prepare.py` covers the mirror of the
+mask into the two globals. `tools/test_ab_play.py` simulates a game with a slow scene component and menu pauses and runs
+the whole tool over a fake socket.
 
 ## Running the harness
 
