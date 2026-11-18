@@ -327,8 +327,48 @@ void plat_thread_realtime(uint64_t period_ns) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 }
 
+// Cores of two kinds (Intel 12th Gen and later, Core Ultra: P- and E-cores): different efficiency classes or, where
+// Windows gives every core the same class, cores with two logical processors (Hyper-Threading) beside cores with one.
+// An Intel laptop processor with 12 cores and 16 logical processors was taken for a plain one there (#891) and run on
+// one logical processor per core, the E-cores included, which is what hybrid processors are kept from.
+static bool cores_mixed(BYTE min_eff, BYTE max_eff, int min_lp, int max_lp) {
+    return min_eff != max_eff || (min_lp == 1 && max_lp >= 2);
+}
+
+// Whether the processor is hybrid (cores_mixed). Asked once.
+static bool cpu_hybrid(void) {
+    static int hybrid = -1;
+    if (hybrid >= 0) return hybrid;
+    hybrid = 0;
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
+    char *buf = len ? malloc(len) : NULL;
+    BYTE min_eff = 255, max_eff = 0;
+    int min_lp = 64, max_lp = 0, cores = 0;
+    if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (void *)buf, &len))
+        for (DWORD o = 0; o < len;) {
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (void *)(buf + o);
+            int lp = __builtin_popcountll((unsigned long long)e->Processor.GroupMask[0].Mask);
+            if (e->Processor.EfficiencyClass < min_eff) min_eff = e->Processor.EfficiencyClass;
+            if (e->Processor.EfficiencyClass > max_eff) max_eff = e->Processor.EfficiencyClass;
+            if (lp < min_lp) min_lp = lp;
+            if (lp > max_lp) max_lp = lp;
+            cores++;
+            o += e->Size;
+        }
+    free(buf);
+    hybrid = cores > 0 && cores_mixed(min_eff, max_eff, min_lp, max_lp);
+    return hybrid;
+}
+
+// Above normal on hybrid processors only, where it keeps the latency-critical threads (the game's main thread, the
+// render thread, the recorder) on P-cores (#650). Elsewhere it starved the game's other threads: with SMT and one
+// logical processor per core (plat_cpu_placement), Ryzen 7 7800X3D / 5700X3D players got frames of 0.3-1.2 s,
+// also standing still, which SAVAGEWIND_ONE_PER_CORE=0 removed (#883). SAVAGEWIND_THREAD_ELEVATE=1/0: always / never.
 void plat_thread_elevate(void) {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_THREAD_ELEVATE") ? atoi(getenv("SAVAGEWIND_THREAD_ELEVATE")) != 0 : cpu_hybrid();
+    if (on) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 }
 
 // ---- process
@@ -368,12 +408,18 @@ static void require_cpu(void) {
     ExitProcess(1);
 }
 
+// What the error box says under "no usable GPU" (the line above it names each GPU found and what its driver lacks).
+static const char *plat_gpu_need_text(void) {
+    return "Savage Wind needs a graphics driver with Vulkan 1.3, or with Vulkan 1.2 and these extensions: VK_KHR_dynamic_rendering, VK_KHR_synchronization2, VK_EXT_extended_dynamic_state and VK_EXT_extended_dynamic_state2. Install the latest driver "
+           "for the graphics card named above. If its latest driver still lacks them, that card cannot run Savage Wind.";
+}
+
 // Fatal error (rt_fatal_trace): the last FATAL / exception line of the log in a message box, when there is no console.
 void plat_fatal_notice(void) {
     plat_accessibility_shortcuts(true);  // (the shortcuts as they were: the process ends)
     if (!g_log_path[0]) return;
     fflush(stderr);
-    char text[1024] = "Savage Wind stopped because of an error.";
+    char text[1600] = "Savage Wind stopped because of an error.";
     FILE *f = fopen(g_log_path, "rb");
     if (f) {
         static char tail[16384];
@@ -402,10 +448,14 @@ void plat_fatal_notice(void) {
                          "PC's RAM, and Savage Wind keeps the game's 3 GB of memory available to the GPU: with integrated "
                          "graphics it needs 16 GB of RAM. Close other programs and lower Video > Shadow resolution and the "
                          "upscaler quality; with a dedicated GPU, update its driver.");
-            } else if (strstr(line, "Vulkan 1.3") || strstr(line, "vkCreateInstance")) {  // (no driver, or too old)
+            } else if (strstr(line, "no usable GPU")) {  // (device.c pick_device: the line names each GPU and what it lacks)
                 size_t l = strlen(text);
-                snprintf(text + l, sizeof text - l, "\n\nSavage Wind needs a graphics driver with Vulkan 1.3: install the "
-                         "latest driver for your GPU (NVIDIA, AMD or Intel).");
+                snprintf(text + l, sizeof text - l, "\n\n%s", plat_gpu_need_text());
+            } else if (strstr(line, "vkCreateInstance") || strstr(line, "no Vulkan device")) {  // (no driver at all)
+                size_t l = strlen(text);
+                snprintf(text + l, sizeof text - l, "\n\nNo Vulkan graphics driver was found. Install the latest driver "
+                         "for your GPU from NVIDIA, AMD or Intel: the one Windows installs by itself often has no Vulkan. "
+                         "Savage Wind needs Vulkan 1.3, or 1.2 with the extensions the FAQ lists.");
             } else if (strstr(line, "Vulkan") || strstr(line, "VK_") || strstr(line, "vk")) {  // (any other driver error)
                 size_t l = strlen(text);
                 snprintf(text + l, sizeof text - l, "\n\nThe graphics driver reported an error. Updating the driver for "
@@ -455,6 +505,7 @@ void plat_cpu_placement(void) {
     GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
     char *buf = len ? malloc(len) : NULL;
     BYTE min_eff = 255, max_eff = 0;
+    int min_lp = 64, max_lp = 0;
     if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (void *)buf, &len))
         for (DWORD o = 0; o < len;) {
             SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (void *)(buf + o);
@@ -465,11 +516,14 @@ void plat_cpu_placement(void) {
                 BYTE eff = e->Processor.EfficiencyClass;
                 if (eff < min_eff) min_eff = eff;
                 if (eff > max_eff) max_eff = eff;
+                int lp = __builtin_popcountll((unsigned long long)e->Processor.GroupMask[0].Mask);  // (the core's own)
+                if (lp < min_lp) min_lp = lp;
+                if (lp > max_lp) max_lp = lp;
             }
             o += e->Size;
         }
     free(buf);
-    bool hybrid = (cores > 0 && min_eff != max_eff);
+    bool hybrid = cores > 0 && cores_mixed(min_eff, max_eff, min_lp, max_lp);
     const char *x = getenv("SAVAGEWIND_ONE_PER_CORE");
     bool on = one && (x ? atoi(x) != 0 : !wine && !hybrid && plat_one_per_core_default(cores, logical));
     fprintf(stderr, "[cpu] %d cores%s, %d logical processors: %s%s\n", cores,

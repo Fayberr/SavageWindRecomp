@@ -35,6 +35,7 @@ typedef struct {
     uint32_t qfam, qfam_count;
     VmaAllocator vma;
     VkPhysicalDeviceProperties props;
+    bool api12;                // a Vulkan 1.2 driver with the extensions 1.3 made core (device.c api12_usable, vk13.h)
     bool is_mali;              // Arm Mali (vendor 0x13B5): the Mali-only paths' default (tiler / non-coherent workarounds)
     VkPipelineCache pcache;
     VkPipelineCache pcache_pre;  // the precompiled shaders' libraries (cache/vk_precompiled.bin; read only while playing)
@@ -130,6 +131,7 @@ typedef struct TexBackend {
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
     TexWW ww;
     bool scalable, presented;
+    bool cleared_new;            // made zeroed (create_image): float, scaled and depth targets
     bool native_post;           // shader-identified bloom target: never inherit a scene scale
     bool hdr_upgraded;           // the game's linear 10-bit final image, made RGBA16F for HDR (hdr.c)
     uint8_t rs_group;            // RS_*: which output scale its allocation follows (textures.c)
