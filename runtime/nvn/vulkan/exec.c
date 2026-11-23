@@ -1360,11 +1360,13 @@ const char *renderer_stats(void) {
 static uint64_t vbuf_gen = 1;
 static uint64_t ubuf_gen[6] = {1, 1, 1, 1, 1, 1};
 static uint64_t rt_gen = 1, tex_gen[6] = {1, 1, 1, 1, 1, 1};
+static uint64_t sbuf_gen[6] = {1, 1, 1, 1, 1, 1};  // (st.sbuf[stage] changed: cbuf_info's driver constants)
 
 static void st_defaults(void) {
     memset(&st, 0, sizeof st);
     vbuf_gen++;
     for (int i = 0; i < 6; i++) ubuf_gen[i]++;
+    for (int i = 0; i < 6; i++) sbuf_gen[i]++;
     rt_gen++;
     for (int i = 0; i < 6; i++) tex_gen[i]++;
     for (int i = 0; i < 16; i++) {
@@ -5282,7 +5284,18 @@ static struct { uint64_t addr[16]; VkDescriptorBufferInfo bi; } gsnap_cs;
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
     if (k == 0) {
-        uint32_t drv[0x800 / 4] = {0};
+        // A graphics stage's driver constants are its 16 storage-buffer ranges and nothing else, the same copy for
+        // every draw until a bind changes them (or the submission, whose transient memory holds the copy): building,
+        // zeroing (2 KB) and comparing them again for each stage of each draw (~8000 a frame in the open world) was a
+        // share of the translation thread's time. Compute's also hold the group counts and gsnap_cs: built each time.
+        static struct { uint64_t gen, seq, size; VkDescriptorBufferInfo bi; } drv_memo[5];
+        uint32_t drv[0x800 / 4];
+        uint64_t size = si->cbuf_size[0] > sizeof drv ? sizeof drv : (si->cbuf_size[0] ? si->cbuf_size[0] : 256);
+        if (size < 0x500 && stage == 5) size = 0x500;
+        uint64_t seq = vk_pending_seq();
+        if (stage != 5 && drv_memo[stage].gen == sbuf_gen[stage] && drv_memo[stage].seq == seq && drv_memo[stage].size == size)
+            return drv_memo[stage].bi;
+        memset(drv, 0, sizeof drv);
         if (stage == 5) {
             drv[0x200 / 4] = gx; drv[0x204 / 4] = gy; drv[0x208 / 4] = gz;
             for (int i = 0; i < 16; i++) {
@@ -5301,9 +5314,12 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                 e[2] = (uint32_t)st.sbuf[stage][i].size;
             }
         }
-        uint64_t size = si->cbuf_size[0] > sizeof drv ? sizeof drv : (si->cbuf_size[0] ? si->cbuf_size[0] : 256);
-        if (size < 0x500 && stage == 5) size = 0x500;
-        return ubo_span(copy_dedupe(stage == 5 ? DEDUPE_DRV_C : stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, drv, size, 256), size);
+        VkDescriptorBufferInfo d = ubo_span(copy_dedupe(stage == 5 ? DEDUPE_DRV_C : stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, drv, size, 256), size);
+        if (stage != 5) {
+            drv_memo[stage].gen = sbuf_gen[stage]; drv_memo[stage].seq = seq; drv_memo[stage].size = size;
+            drv_memo[stage].bi = d;
+        }
+        return d;
     }
     if (k == 1) {  // compiler constants stored after the shader code
         NvnShaderStage *ss = &st.program->stages[stage];
@@ -11968,7 +11984,10 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         case CMD_BIND_STORAGE_BUFFERS:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 16 && r->x[0] < 6; i++)
-                memcpy(&st.sbuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
+                if (memcmp(&st.sbuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16)) {
+                    memcpy(&st.sbuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
+                    sbuf_gen[r->x[0]]++;
+                }
             break;
         case CMD_BIND_TEXTURES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
