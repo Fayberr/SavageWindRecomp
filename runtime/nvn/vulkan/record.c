@@ -9,8 +9,11 @@
 //
 // Shared state and how it is protected (T = the translating thread(s), one at a time under gpu_lock; R = the recorder):
 //   ring bytes          written by T before `head` is published (release), read by R after it loads `head`
-//                       (acquire); reused by T only past `tail` (R's release store after each packet, T's acquire)
-//   head / tail         _Atomic; the only hand-off. `wpos` (T's unpublished end) is T's alone
+//                       (acquire); reused by T only past `tail` (R's release store every 64 KB and at batch end,
+//                       T's acquire cached in `rec_t.cached_tail`)
+//   head / tail         _Atomic; the only hand-off, placed on separate 64-byte cache lines from each other and
+//                       from T's private state (`wpos`, `published`, `cached_tail`, `st`) so T and R do not
+//                       false-share on every packet
 //   wake-up             R sets `asleep` under `mu` and re-checks `head` before waiting on cv_work (seq_cst stores and
 //                       loads on both sides: no lost wake-up); T signals only when it sees `asleep`
 //   submitted           _Atomic, stored by R after vkQueueSubmit2 returns (release); anyone reads it
@@ -47,22 +50,53 @@ typedef void (*PktFn)(const void *args);
 typedef struct { PktFn fn; uint32_t size; uint32_t pad; } PktHdr;  // fn NULL: skip to the ring's start
 #define PKT_ALIGN 16
 #define PUBLISH_EVERY (4u << 10)  // bytes queued before T publishes them (and at every submission and wait)
+#define TAIL_PUBLISH_EVERY (64u << 10)  // bytes R consumes before publishing tail mid-batch (and always at batch end)
+#define REC_CACHELINE 64
 
 static uint8_t *ring;
 static uint64_t ring_cap;  // (a power of two)
-static _Atomic uint64_t head;  // (T) published end
-static _Atomic uint64_t tail;  // (R) recorded end
-static uint64_t wpos, published;  // (T) written end, the end last published
-static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t cv_work = PTHREAD_COND_INITIALIZER, cv_done = PTHREAD_COND_INITIALIZER;
-static _Atomic int asleep;
-static _Atomic int done_waiters;  // threads inside a cv_done wait (WAIT_DONE): R broadcasts only when there are any
-static _Atomic uint64_t submitted;
 static int on = -1;  // 1: the thread records, 0: calls at once, -1: not started
 static bool prof, prof_enq;  // SAVAGEWIND_VK_PROF; the time queuing each packet only when it isn't 2 (two clock reads a packet)
-static RecStats st_t;  // T's counters
-static _Atomic uint64_t r_busy_ns, r_wakeups, r_submit_ns;
-static _Atomic uint64_t a_seq_waits, a_seq_wait_ns;  // (waits from any thread)
+
+// Cache-line isolated ownership groups so T (per-packet writes) and R (per-batch / spinning reads and writes)
+// never false-share:
+//   rec_t    T-private hot fields (written on every packet under gpu_lock; never touched by R)
+//   rec_head T -> R batch hand-off (written by T once per publish_every bytes; polled by R)
+//   rec_r    R-owned progress and counters (written by R; read by T only on ring wrap, drain, or stats)
+//   rec_sync Cold sleep/wait coordination (asleep/done_waiters kept off active head/tail cache lines)
+static struct {
+    _Alignas(REC_CACHELINE) uint64_t wpos;
+    uint64_t published;
+    uint64_t cached_tail;
+    RecStats st;
+} rec_t;
+
+static struct {
+    _Alignas(REC_CACHELINE) _Atomic uint64_t head;
+} rec_head;
+
+static struct {
+    _Alignas(REC_CACHELINE) _Atomic uint64_t tail;
+    _Atomic uint64_t submitted;
+    _Atomic uint64_t busy_ns, wakeups, submit_ns;
+} rec_r;
+
+static struct {
+    _Alignas(REC_CACHELINE) pthread_mutex_t mu;
+    pthread_cond_t cv_work, cv_done;
+    _Atomic int asleep;
+    _Atomic int done_waiters;  // threads inside a cv_done wait (WAIT_DONE): R broadcasts only when there are any
+    _Atomic uint64_t seq_waits, seq_wait_ns;  // (waits from any thread)
+} rec_sync = {
+    .mu = PTHREAD_MUTEX_INITIALIZER,
+    .cv_work = PTHREAD_COND_INITIALIZER,
+    .cv_done = PTHREAD_COND_INITIALIZER,
+};
+
+_Static_assert(sizeof(rec_t) % REC_CACHELINE == 0, "rec_t must occupy full cache lines");
+_Static_assert(sizeof(rec_head) % REC_CACHELINE == 0, "rec_head must occupy full cache lines");
+_Static_assert(sizeof(rec_r) % REC_CACHELINE == 0, "rec_r must occupy full cache lines");
+_Static_assert(sizeof(rec_sync) % REC_CACHELINE == 0, "rec_sync must occupy full cache lines");
 
 bool rec_on(void) { return on > 0; }
 static __thread bool is_recorder;
@@ -77,53 +111,56 @@ static void timed_wait(pthread_cond_t *cv, uint64_t ns) {  // (mu held)
     ts.tv_nsec += (long)(ns % 1000000000ull);
     ts.tv_sec += (time_t)(ns / 1000000000ull);
     if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
-    pthread_cond_timedwait(cv, &mu, &ts);
+    pthread_cond_timedwait(cv, &rec_sync.mu, &ts);
 }
 
 // A wait on cv_done (mu held): re-checks `cond` after announcing itself, so a broadcast R skips for want of waiters
 // can't be one this waiter needed (R stores tail / submitted, then reads done_waiters, both seq_cst)
-#define WAIT_DONE(cond, ns)                                                         \
-    for (;;) {                                                                      \
-        atomic_fetch_add_explicit(&done_waiters, 1, memory_order_seq_cst);          \
-        if (!(cond)) { atomic_fetch_sub_explicit(&done_waiters, 1, memory_order_seq_cst); break; } \
-        timed_wait(&cv_done, (ns));                                                 \
-        atomic_fetch_sub_explicit(&done_waiters, 1, memory_order_seq_cst);          \
+#define WAIT_DONE(cond, ns)                                                              \
+    for (;;) {                                                                           \
+        atomic_fetch_add_explicit(&rec_sync.done_waiters, 1, memory_order_seq_cst);      \
+        if (!(cond)) { atomic_fetch_sub_explicit(&rec_sync.done_waiters, 1, memory_order_seq_cst); break; } \
+        timed_wait(&rec_sync.cv_done, (ns));                                             \
+        atomic_fetch_sub_explicit(&rec_sync.done_waiters, 1, memory_order_seq_cst);      \
     }
 
 // R: wake whoever waits for a submission, a drain or ring room (nothing to do, and no syscall, when nobody waits)
 static void notify_done(void) {
     atomic_thread_fence(memory_order_seq_cst);
-    if (!atomic_load_explicit(&done_waiters, memory_order_seq_cst)) return;
-    pthread_mutex_lock(&mu);
-    pthread_cond_broadcast(&cv_done);
-    pthread_mutex_unlock(&mu);
+    if (!atomic_load_explicit(&rec_sync.done_waiters, memory_order_seq_cst)) return;
+    pthread_mutex_lock(&rec_sync.mu);
+    pthread_cond_broadcast(&rec_sync.cv_done);
+    pthread_mutex_unlock(&rec_sync.mu);
 }
 
 // T: what it wrote so far is the recorder's to run
 static void publish(void) {
-    if (published == wpos) return;
-    published = wpos;
-    atomic_store_explicit(&head, wpos, memory_order_seq_cst);
-    if (atomic_load_explicit(&asleep, memory_order_seq_cst)) {
-        pthread_mutex_lock(&mu);
-        pthread_cond_signal(&cv_work);
-        pthread_mutex_unlock(&mu);
+    if (rec_t.published == rec_t.wpos) return;
+    rec_t.published = rec_t.wpos;
+    atomic_store_explicit(&rec_head.head, rec_t.wpos, memory_order_seq_cst);
+    if (__builtin_expect(atomic_load_explicit(&rec_sync.asleep, memory_order_seq_cst), 0)) {
+        pthread_mutex_lock(&rec_sync.mu);
+        pthread_cond_signal(&rec_sync.cv_work);
+        pthread_mutex_unlock(&rec_sync.mu);
     }
 }
 
 static void slow_wait(const char *what, uint64_t ns);
 // T: room for `need` bytes at wpos (the recorder frees room as it records; a full ring means it is behind by its
-// whole size, 16 MB of packets, so the wait is rare)
+// whole size, 16 MB of packets, so the wait is rare). cached_tail avoids an atomic load of tail on every packet.
 static void wait_room(uint64_t need) {
-    if (wpos + need - atomic_load_explicit(&tail, memory_order_acquire) <= ring_cap) return;
+    if (__builtin_expect(rec_t.wpos + need - rec_t.cached_tail <= ring_cap, 1)) return;
+    rec_t.cached_tail = atomic_load_explicit(&rec_r.tail, memory_order_acquire);
+    if (__builtin_expect(rec_t.wpos + need - rec_t.cached_tail <= ring_cap, 1)) return;
     publish();
     SW_ZONE("recorder ring full");
     uint64_t t0 = NOW();
-    pthread_mutex_lock(&mu);
-    WAIT_DONE(wpos + need - atomic_load_explicit(&tail, memory_order_acquire) > ring_cap, 1000000);
-    pthread_mutex_unlock(&mu);
-    st_t.full_waits++;
-    st_t.full_ns += NOW() - t0;
+    pthread_mutex_lock(&rec_sync.mu);
+    WAIT_DONE(rec_t.wpos + need - atomic_load_explicit(&rec_r.tail, memory_order_acquire) > ring_cap, 1000000);
+    pthread_mutex_unlock(&rec_sync.mu);
+    rec_t.cached_tail = atomic_load_explicit(&rec_r.tail, memory_order_acquire);
+    rec_t.st.full_waits++;
+    rec_t.st.full_ns += NOW() - t0;
     slow_wait("room in the ring", NOW() - t0);
 }
 
@@ -132,29 +169,29 @@ static void wait_room(uint64_t need) {
 static void *push(PktFn fn, size_t args, size_t extra) {
     uint64_t need = (sizeof(PktHdr) + ((args + PKT_ALIGN - 1) & ~(size_t)(PKT_ALIGN - 1)) + extra + PKT_ALIGN - 1) & ~(uint64_t)(PKT_ALIGN - 1);
     if (need > ring_cap / 4) FATAL("[vk] recorder: a packet of %llu bytes does not fit the ring\n", (unsigned long long)need);
-    uint64_t at = wpos & (ring_cap - 1);
+    uint64_t at = rec_t.wpos & (ring_cap - 1);
     if (at + need > ring_cap) {  // no room before the end: a skip packet, the real one at the start
         uint64_t skip = ring_cap - at;
         wait_room(skip);
         PktHdr *s = (PktHdr *)(ring + at);
         s->fn = NULL;
         s->size = (uint32_t)skip;
-        wpos += skip;
+        rec_t.wpos += skip;
         at = 0;
     }
     wait_room(need);
     PktHdr *h = (PktHdr *)(ring + at);
     h->fn = fn;
     h->size = (uint32_t)need;
-    wpos += need;
-    st_t.packets++;
-    st_t.bytes += need;
+    rec_t.wpos += need;
+    rec_t.st.packets++;
+    rec_t.st.bytes += need;
     SW_TALLY("vk packets");
     return h + 1;
 }
 static uint64_t publish_every = PUBLISH_EVERY;  // (rec_init: 64 KB where R doesn't spin)
 static void commit(void) {
-    if (wpos - published >= publish_every) publish();
+    if (rec_t.wpos - rec_t.published >= publish_every) publish();
 }
 // (the arrays of a packet: after its arguments, 16-aligned)
 #define AL16(n) (((n) + 15) & ~(size_t)15)
@@ -176,7 +213,7 @@ static uint64_t spin_ns;
 static uint64_t spin_for_work(uint64_t t) {  // the published end once it moves past t, else t
     uint64_t t0 = NOW(), h;
     for (unsigned i = 1;; i++) {
-        if ((h = atomic_load_explicit(&head, memory_order_acquire)) != t) return h;
+        if ((h = atomic_load_explicit(&rec_head.head, memory_order_acquire)) != t) return h;
         RELAX();
         if (!(i & 31) && NOW() - t0 > spin_ns) return t;
     }
@@ -191,26 +228,34 @@ static void *run(void *arg) {
     control_prof_thread("recorder");
     uint64_t t = 0;
     for (;;) {
-        uint64_t h = atomic_load_explicit(&head, memory_order_acquire);
+        uint64_t h = atomic_load_explicit(&rec_head.head, memory_order_acquire);
         if (h == t && spin_ns && (h = spin_for_work(t)) != t) {
             // work came while spinning: no sleep, no wake-up syscall on T's side
         } else if (h == t) {
-            pthread_mutex_lock(&mu);
-            atomic_store_explicit(&asleep, 1, memory_order_seq_cst);
-            while ((h = atomic_load_explicit(&head, memory_order_seq_cst)) == t) pthread_cond_wait(&cv_work, &mu);
-            atomic_store_explicit(&asleep, 0, memory_order_relaxed);
-            pthread_mutex_unlock(&mu);
-            ADD(r_wakeups, 1);
+            pthread_mutex_lock(&rec_sync.mu);
+            atomic_store_explicit(&rec_sync.asleep, 1, memory_order_seq_cst);
+            while ((h = atomic_load_explicit(&rec_head.head, memory_order_seq_cst)) == t)
+                pthread_cond_wait(&rec_sync.cv_work, &rec_sync.mu);
+            atomic_store_explicit(&rec_sync.asleep, 0, memory_order_relaxed);
+            pthread_mutex_unlock(&rec_sync.mu);
+            ADD(rec_r.wakeups, 1);
         }
         uint64_t t0 = prof ? NOW() : 0;
         SW_ZONE("record packets");
+        uint64_t last_tail = t;
         while (t != h) {
             const PktHdr *p = (const PktHdr *)(ring + (t & (ring_cap - 1)));
             if (p->fn) p->fn(p + 1);
             t += p->size;
-            atomic_store_explicit(&tail, t, memory_order_release);
+            if (t - last_tail >= TAIL_PUBLISH_EVERY) {
+                atomic_store_explicit(&rec_r.tail, t, memory_order_release);
+                last_tail = t;
+                if (__builtin_expect(atomic_load_explicit(&rec_sync.done_waiters, memory_order_relaxed), 0))
+                    notify_done();
+            }
         }
-        if (prof) ADD(r_busy_ns, NOW() - t0);
+        if (t != last_tail) atomic_store_explicit(&rec_r.tail, t, memory_order_release);
+        if (prof) ADD(rec_r.busy_ns, NOW() - t0);
         notify_done();  // caught up: drains and waiters
     }
     return NULL;
@@ -281,52 +326,56 @@ static void slow_wait(const char *what, uint64_t ns) {
     if (atomic_fetch_add_explicit(&n, 1, memory_order_relaxed) < 20) LOG("[vk] recorder: a wait for %s took %llu ms\n", what, (unsigned long long)(ns / 1000000));
 }
 
-uint64_t rec_submitted(void) { return atomic_load_explicit(&submitted, memory_order_acquire); }
+uint64_t rec_submitted(void) { return atomic_load_explicit(&rec_r.submitted, memory_order_acquire); }
 
 void rec_wait_submitted(uint64_t seq) {
     if (on <= 0 || rec_submitted() >= seq) return;
     SW_ZONE("wait for recorder submit");
     uint64_t t0 = NOW();
-    pthread_mutex_lock(&mu);
+    pthread_mutex_lock(&rec_sync.mu);
     WAIT_DONE(rec_submitted() < seq, 2000000);
-    pthread_mutex_unlock(&mu);
+    pthread_mutex_unlock(&rec_sync.mu);
     uint64_t dt = NOW() - t0;
-    ADD(a_seq_waits, 1);
-    ADD(a_seq_wait_ns, dt);
+    ADD(rec_sync.seq_waits, 1);
+    ADD(rec_sync.seq_wait_ns, dt);
     slow_wait("a submission", dt);
 }
 
 void rec_drain(void) {
     if (on <= 0) return;
     publish();
-    uint64_t upto = wpos;
-    if (atomic_load_explicit(&tail, memory_order_acquire) >= upto) return;
+    uint64_t upto = rec_t.wpos;
+    if (atomic_load_explicit(&rec_r.tail, memory_order_acquire) >= upto) {
+        rec_t.cached_tail = upto;
+        return;
+    }
     SW_ZONE("recorder drain");
     uint64_t t0 = NOW();
-    pthread_mutex_lock(&mu);
-    WAIT_DONE(atomic_load_explicit(&tail, memory_order_acquire) < upto, 2000000);
-    pthread_mutex_unlock(&mu);
+    pthread_mutex_lock(&rec_sync.mu);
+    WAIT_DONE(atomic_load_explicit(&rec_r.tail, memory_order_acquire) < upto, 2000000);
+    pthread_mutex_unlock(&rec_sync.mu);
+    rec_t.cached_tail = upto;
     uint64_t dt = NOW() - t0;
-    st_t.drains++;
-    st_t.drain_ns += dt;
+    rec_t.st.drains++;
+    rec_t.st.drain_ns += dt;
     slow_wait("a drain", dt);
 }
 
 // ================================================================== stats
 void rec_stats_take(RecStats *o) {
-    *o = st_t;
-    memset(&st_t, 0, sizeof st_t);
-    o->busy_ns = atomic_exchange_explicit(&r_busy_ns, 0, memory_order_relaxed);
-    o->wakeups = atomic_exchange_explicit(&r_wakeups, 0, memory_order_relaxed);
-    o->submit_ns = atomic_exchange_explicit(&r_submit_ns, 0, memory_order_relaxed);
-    o->seq_waits = atomic_exchange_explicit(&a_seq_waits, 0, memory_order_relaxed);
-    o->seq_wait_ns = atomic_exchange_explicit(&a_seq_wait_ns, 0, memory_order_relaxed);
+    *o = rec_t.st;
+    memset(&rec_t.st, 0, sizeof rec_t.st);
+    o->busy_ns = atomic_exchange_explicit(&rec_r.busy_ns, 0, memory_order_relaxed);
+    o->wakeups = atomic_exchange_explicit(&rec_r.wakeups, 0, memory_order_relaxed);
+    o->submit_ns = atomic_exchange_explicit(&rec_r.submit_ns, 0, memory_order_relaxed);
+    o->seq_waits = atomic_exchange_explicit(&rec_sync.seq_waits, 0, memory_order_relaxed);
+    o->seq_wait_ns = atomic_exchange_explicit(&rec_sync.seq_wait_ns, 0, memory_order_relaxed);
 }
 
 // (T) time spent queuing: around every rec_* that queues, when profiling in detail
 // (and, in the profiler's capture (runtime/prof.h), added up under one name)
 #define ENQ_T0() SW_ACC("vk enqueue"); uint64_t enq_t0_ = prof_enq ? NOW() : 0
-#define ENQ_END() do { if (prof_enq) st_t.enqueue_ns += NOW() - enq_t0_; } while (0)
+#define ENQ_END() do { if (prof_enq) rec_t.st.enqueue_ns += NOW() - enq_t0_; } while (0)
 
 // ================================================================== descriptor writes
 static bool write_is_image(const VkWriteDescriptorSet *w) {
@@ -408,14 +457,14 @@ static void submit_run(const void *p) {
     VkResult r = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
     pthread_mutex_unlock(&g_vk_queue_lock);
     uint64_t dt = NOW() - t0;
-    if (prof) ADD(r_submit_ns, dt);
+    if (prof) ADD(rec_r.submit_ns, dt);
     if (dt > 50000000) {  // (a driver stall: a slow wait on the recorder shows where it was)
         static int n;
         if (n++ < 20) LOG("[vk] vkQueueSubmit2 of submission %llu took %llu ms\n", (unsigned long long)a->seq, (unsigned long long)(dt / 1000000));
     }
     if (r == VK_ERROR_DEVICE_LOST) { extern void vk_devlost_dump(void); vk_devlost_dump(); }
     VK_CHECK(r);
-    atomic_store_explicit(&submitted, a->seq, memory_order_release);
+    atomic_store_explicit(&rec_r.submitted, a->seq, memory_order_release);
     if (on > 0) notify_done();
 }
 void rec_QueueSubmit2(const VkSubmitInfo2 *si, uint64_t seq) {
@@ -637,20 +686,22 @@ CMD_ARGS(CmdPushConstantsMvec, VkPipelineLayout layout; uint32_t seq;)
 // pushing all MVEC_PUSH bytes for each was ~0.17 ms a frame of the recorder (RTX 3060, 1080p). Such a draw pushes only
 // mflag, and none at all when the last push in this render pass was a zero mflag with the same layout. Any other
 // push, a new render pass or another command buffer starts over (push_mvec_forget).
-static VkCommandBuffer mv_cb;
-static VkPipelineLayout mv_layout;
-static void push_mvec_forget(void) { mv_cb = VK_NULL_HANDLE; }
+static struct {
+    _Alignas(REC_CACHELINE) VkCommandBuffer cb;
+    VkPipelineLayout layout;
+} mv_state;
+static void push_mvec_forget(void) { mv_state.cb = VK_NULL_HANDLE; }
 static void push_mvec(VkCommandBuffer cb, VkPipelineLayout layout, uint32_t seq) {
     uint32_t pc[MVEC_PUSH / 4];
     mvec_resolve(seq, pc);
     if (pc[0]) {
         vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, MVEC_PUSH, pc);
-        mv_cb = VK_NULL_HANDLE;
+        mv_state.cb = VK_NULL_HANDLE;
         return;
     }
-    if (cb == mv_cb && layout == mv_layout) return;
+    if (cb == mv_state.cb && layout == mv_state.layout) return;
     vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof pc[0], pc);
-    mv_cb = cb, mv_layout = layout;
+    mv_state.cb = cb, mv_state.layout = layout;
 }
 static void CmdPushConstantsMvec_run(const void *p) { const CmdPushConstantsMvecArgs *a = p; push_mvec(a->cb, a->layout, a->seq); }
 void rec_CmdPushConstantsMvec(VkCommandBuffer cb, VkPipelineLayout layout, uint32_t seq) {
@@ -834,7 +885,9 @@ void rec_CmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo *di) {
 CMD_ARGS(CmdBeginRendering, VkRenderingInfo ri; VkRenderingAttachmentInfo depth, stencil; uint8_t has_depth, has_stencil; uint16_t fbl;)  // then colour[]
 // The rendering info being handed to vkCmdBeginRendering, for a crash inside the driver: Intel's Windows driver for
 // UHD 620 / HD 630 read 0x298 there in 0.4.1, in the first minute of play (#332), and the log didn't say which pass.
-static const VkRenderingInfo *volatile begin_cur;
+static struct {
+    _Alignas(REC_CACHELINE) const VkRenderingInfo *volatile cur;
+} begin_state;
 void vk_view_describe(VkImageView v, char *s, size_t n);  // textures.c
 static void begin_note_attachment(const char *what, const VkRenderingAttachmentInfo *at) {
     char d[160];
@@ -843,7 +896,7 @@ static void begin_note_attachment(const char *what, const VkRenderingAttachmentI
             (int)at->loadOp, (int)at->storeOp, at->pNext ? ", feedback loop" : "");
 }
 static void begin_note(void) {
-    const VkRenderingInfo *ri = begin_cur;
+    const VkRenderingInfo *ri = begin_state.cur;
     if (!ri) return;
     fprintf(stderr, "in vkCmdBeginRendering: area %dx%d at %d,%d, %u layers, %u color attachments%s%s\n",
             (int)ri->renderArea.extent.width, (int)ri->renderArea.extent.height, ri->renderArea.offset.x, ri->renderArea.offset.y,
@@ -858,10 +911,10 @@ static void begin_note(void) {
 }
 static void begin_rendering(VkCommandBuffer cb, const VkRenderingInfo *ri) {
     rt_crash_note = begin_note;
-    begin_cur = ri;
+    begin_state.cur = ri;
     push_mvec_forget();
     vkCmdBeginRendering(cb, ri);
-    begin_cur = NULL;
+    begin_state.cur = NULL;
 }
 
 static void CmdBeginRendering_run(const void *p) {

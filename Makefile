@@ -950,6 +950,19 @@ test-simd-fz: $(B)/test_simd_fz
 
 .PHONY: test-simd-fz
 
+ifneq ($(PLATFORM),macos)
+$(B)/test_record_ring: tests/test_record_ring.c runtime/nvn/vulkan/record.c $(RT_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -Wall -Wno-unused-function -ffunction-sections -fdata-sections $(OSFLAGS) $(DEPINC) -Iruntime -Iruntime/nvn -isystem third_party \
+	    -o $@ tests/test_record_ring.c -fuse-ld=lld -Wl,--gc-sections \
+	    $(if $(filter windows,$(PLATFORM)),-Wl$(comma)--exclude-all-symbols) -lpthread
+
+test-record-ring: $(B)/test_record_ring
+	$(B)/test_record_ring
+
+.PHONY: test-record-ring
+endif
+
 $(B)/test_ui_layout: tests/test_ui_layout.c runtime/ui_layout.c runtime/ui_layout.h runtime/nvn/cmdbuf.c runtime/nvn/nvn.h runtime/nvn/hud_scale.h
 	@mkdir -p $(dir $@)
 	$(CC) -O1 -ffunction-sections -fdata-sections $(DEPINC) -Iruntime -o $@ $< -fuse-ld=lld -Wl,--gc-sections -lpthread -lm
