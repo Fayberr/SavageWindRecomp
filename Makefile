@@ -941,6 +941,15 @@ test-quick-drop: test-quick-drop-native $(B)/test_quick_drop_input
 .PHONY: test-quick-drop test-quick-drop-native
 endif
 
+$(B)/test_simd_fz: tests/test_simd_fz.c runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h
+	@mkdir -p $(dir $@)
+	$(CC) $(GENFLAGS) -o $@ $< -lm
+
+test-simd-fz: $(B)/test_simd_fz
+	$(B)/test_simd_fz
+
+.PHONY: test-simd-fz
+
 $(B)/test_ui_layout: tests/test_ui_layout.c runtime/ui_layout.c runtime/ui_layout.h runtime/nvn/cmdbuf.c runtime/nvn/nvn.h runtime/nvn/hud_scale.h
 	@mkdir -p $(dir $@)
 	$(CC) -O1 -ffunction-sections -fdata-sections $(DEPINC) -Iruntime -o $@ $< -fuse-ld=lld -Wl,--gc-sections -lpthread -lm

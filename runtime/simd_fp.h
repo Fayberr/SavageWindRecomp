@@ -21,7 +21,15 @@ SI int FN(iszero)(U u) { return !(u & ~SGN); }
 // on x86-64 - makes true for denormals, so they were kept instead of flushed.)
 SI int FN(isden)(U u) { return !(u & EXPM) && (u & (MINN - 1)); }
 SI T FN(flush)(T x) { U u = FN(fb)(x); return FN(isden)(u) ? FN(fv)(u & SGN) : x; }
-SI T FN(fz)(Cpu *c, T x) { return __builtin_expect(c->fpcr & FPCR_FZ, 0) ? FN(flush)(x) : x; }
+// BOTW sets FPCR.FZ on every guest thread, so predict FZ=1 on paths that still flush in software.
+SI T FN(fz)(Cpu *c, T x) { return __builtin_expect((c->fpcr & FPCR_FZ) != 0, 1) ? FN(flush)(x) : x; }
+// On x86-64, rt_fpcr_write() mirrors FPCR.FZ into MXCSR.DAZ and MXCSR.FTZ, so FP instructions that obey DAZ
+// (UCOMISS/SD, CMPPS/PD, ROUNDSS/SD/PS/PD, ADDSS/PS, MULSS/SD, CVTSS2SD/SD2SS) flush denormal inputs in hardware.
+#if defined(__x86_64__)
+SI T FN(fz_hw)(Cpu *c, T x) { (void)c; return x; }
+#else
+SI T FN(fz_hw)(Cpu *c, T x) { return FN(fz)(c, x); }
+#endif
 SI T FN(neg)(T x) { return FN(fv)(FN(fb)(x) ^ SGN); }
 
 // FPProcessNaN(s): first signalling NaN (quietened), else first quiet NaN, else (invalid op) default NaN
@@ -186,13 +194,18 @@ SN VT FN(vslow)(Cpu *c, int op, VT a, VT b, VT d) {
 SI VTU FN(vsel)(VTS m, VTU x, VTU y) { return (x & (VTU)m) | (y & ~(VTU)m); }
 
 SI VT FN(vfz)(Cpu *c, VT a) {
-    if (__builtin_expect(c->fpcr & FPCR_FZ, 0)) {
+    if (__builtin_expect((c->fpcr & FPCR_FZ) != 0, 1)) {
         VTU u = (VTU)a;
         VTS den = ((u & (MINN - 1)) != 0) & ((u & EXPM) == 0);  // (fraction bits: as isden)
         a = (VT)FN(vsel)(den, u & SGN, u);
     }
     return a;
 }
+#if defined(__x86_64__)
+SI VT FN(vfz_hw)(Cpu *c, VT a) { (void)c; return a; }
+#else
+SI VT FN(vfz_hw)(Cpu *c, VT a) { return FN(vfz)(c, a); }
+#endif
 
 // Vector FP op: native lanes, any NaN (or an FPCR_SLOW setting) reruns all lanes through the scalar path.
 SI VT FN(vop)(Cpu *c, int op, VT a, VT b, VT d) {
@@ -215,12 +228,12 @@ SI VT FN(vop)(Cpu *c, int op, VT a, VT b, VT d) {
 
 // ---- compares
 SI uint64_t FN(cmp)(Cpu *c, T a, T b) { // FCMP NZCV
-    a = FN(fz)(c, a), b = FN(fz)(c, b);
+    a = FN(fz_hw)(c, a), b = FN(fz_hw)(c, b);
     return a == b ? 0x60000000ull : a < b ? 0x80000000ull : a > b ? 0x20000000ull : 0x30000000ull;
 }
 // FCMEQ/FCMGE/FCMGT/FACGE/FACGT (op 0..4)
 SI VTU FN(vcmp)(Cpu *c, int op, VT a, VT b) {
-    a = FN(vfz)(c, a), b = FN(vfz)(c, b);
+    a = FN(vfz_hw)(c, a), b = FN(vfz_hw)(c, b);
     if (op >= 3) a = __builtin_elementwise_abs(a), b = __builtin_elementwise_abs(b);
     switch (op) {
     case 0: return (VTU)(a == b);
@@ -241,14 +254,14 @@ SI T FN(rnd)(T x, int rm) {
     }
 }
 SI T FN(frint)(Cpu *c, T x, int rm) {
-    x = FN(fz)(c, x);
+    x = FN(fz_hw)(c, x);
     if (rm >= 5) rm = (int)((c->fpcr >> 22) & 3);
     T r = FN(rnd)(x, rm);
     if (__builtin_expect(r != r, 0)) r = FN(nan1)(c, x);
     return r;
 }
 SI VT FN(vfrint)(Cpu *c, VT x, int rm) {
-    x = FN(vfz)(c, x);
+    x = FN(vfz_hw)(c, x);
     if (rm >= 5) rm = (int)((c->fpcr >> 22) & 3);
     VT r;
     switch (rm) {
@@ -266,7 +279,7 @@ SI VT FN(vfrint)(Cpu *c, VT x, int rm) {
 
 // ---- FP -> integer (FCVT[NPMZA][SU], fixed point): saturating, NaN -> 0. ib = 32/64.
 SI uint64_t FN(toint)(Cpu *c, T x, int rm, int fbits, int ib, int uns) {
-    x = FN(fz)(c, x);
+    x = FN(fz_hw)(c, x);
     if (fbits) x = x * (T)(1ull << (fbits - 1)) * K(2);
     T r = FN(rnd)(x, rm);
     if (r != r) return 0;

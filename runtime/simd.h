@@ -306,12 +306,12 @@ extern int simd_fma_unfused;
 
 // ---- precision conversions (FCVT, FCVTL/N, FCVTXN); FZ flushes single/double inputs, never halves
 SI double simd_s2d(Cpu *c, float x) {
-    uint32_t u = fb_s(fz_s(c, x));
-    if (isnan_s(u)) {
+    if (__builtin_expect(x != x, 0)) {
+        uint32_t u = fb_s(x);
         if (c->fpcr & FPCR_DN) return fv_d(0x7ff8000000000000ull);
         return fv_d(((uint64_t)(u >> 31) << 63) | 0x7ff8000000000000ull | ((uint64_t)(u & 0x3fffff) << 29));
     }
-    return (double)fv_s(u);
+    return (double)fz_hw_s(c, x);
 }
 SN float simd_d2s_slow(Cpu *c, double x) {
 #pragma STDC FENV_ACCESS ON
@@ -325,14 +325,15 @@ SN float simd_d2s_slow(Cpu *c, double x) {
     return r;
 }
 SI float simd_d2s(Cpu *c, double x) {
-    uint64_t u = fb_d(fz_d(c, x));
-    if (isnan_d(u)) {
+    if (__builtin_expect(x != x, 0)) {
+        uint64_t u = fb_d(x);
         if (c->fpcr & FPCR_DN) return fv_s(0x7fc00000u);
         return fv_s((uint32_t)(u >> 63) << 31 | 0x7fc00000u | (uint32_t)((u >> 29) & 0x3fffff));
     }
-    x = fv_d(u);
+    x = fz_hw_d(c, x);
     if (__builtin_expect(c->fpcr & FPCR_SLOW, 0)) {
-        if ((c->fpcr & FPCR_FZ) && __builtin_fabs(x) < 0x1p-126 && x != 0) return fv_s((uint32_t)(u >> 63) << 31);
+        if ((c->fpcr & FPCR_FZ) && __builtin_fabs(x) < 0x1p-126 && x != 0)
+            return fv_s((uint32_t)(fb_d(x) >> 63) << 31);
         return simd_d2s_slow(c, x);
     }
     return (float)x;
