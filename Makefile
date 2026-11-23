@@ -806,6 +806,24 @@ bench-textures: $(B)/test_textures_format
 	$(B)/test_textures_format --bench
 
 .PHONY: test-textures bench-textures
+
+# The Vulkan recorder thread's ring (record.c) with its real thread and no device: every packet recorded once, in
+# order, intact, through a ring that wraps and fills; once spinning for work, once sleeping. bench-record-ring: the
+# translating thread's cost per packet.
+$(B)/test_record_ring: tests/test_record_ring.c runtime/nvn/vulkan/record.c runtime/prof.c runtime/prof_sampler.c $(RT_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -std=gnu11 -Wall -ffunction-sections -fdata-sections $(OSFLAGS) $(DEPINC) -Iruntime -Iruntime/nvn -isystem third_party -isystem third_party/stb \
+	    -o $@ tests/test_record_ring.c runtime/nvn/vulkan/record.c runtime/prof.c runtime/prof_sampler.c -fuse-ld=lld -Wl,--gc-sections \
+	    $(if $(filter windows,$(PLATFORM)),-Wl$(comma)--exclude-all-symbols) -lpthread -lm
+
+test-record-ring: $(B)/test_record_ring
+	env -u SAVAGEWIND_VK_RECORDER_SPIN $(B)/test_record_ring
+	env SAVAGEWIND_VK_RECORDER_SPIN=0 $(B)/test_record_ring
+
+bench-record-ring: $(B)/test_record_ring
+	$(B)/test_record_ring --bench
+
+.PHONY: test-record-ring bench-record-ring
 endif
 
 # Real Options routing + binding capture, using synthetic guest rows rather than game assets.
